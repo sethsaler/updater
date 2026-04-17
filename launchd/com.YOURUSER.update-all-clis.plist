@@ -37,5 +37,12 @@
 
 	<key>KeepAlive</key>
 	<false/>
+
+	<!-- No GUI dialog for scheduled runs (manual runs use Terminal TTY) -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
+		<string>1</string>
+	</dict>
 </dict>
 </plist>

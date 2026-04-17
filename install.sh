@@ -22,6 +22,7 @@ install_script() {
   mkdir -p "$INSTALL_DIR"
   cp "$SCRIPT_DIR/update_all_clis.sh" "$INSTALL_DIR/"
   cp "$SCRIPT_DIR/tool_config.json" "$INSTALL_DIR/"
+  cp "$SCRIPT_DIR/lib_update_all_clis.py" "$INSTALL_DIR/"
   chmod +x "$INSTALL_DIR/update_all_clis.sh"
   info "Installed. Run with: $INSTALL_DIR/update_all_clis.sh"
 }
@@ -83,6 +84,11 @@ write_plist_daily() {
 	<false/>
 	<key>KeepAlive</key>
 	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
+		<string>1</string>
+	</dict>
 </dict>
 </plist>
 EOF
@@ -114,6 +120,11 @@ write_plist_interval() {
 	<true/>
 	<key>KeepAlive</key>
 	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
+		<string>1</string>
+	</dict>
 </dict>
 </plist>
 EOF
@@ -151,6 +162,11 @@ write_plist_weekly() {
 	<false/>
 	<key>KeepAlive</key>
 	<false/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
+		<string>1</string>
+	</dict>
 </dict>
 </plist>
 EOF

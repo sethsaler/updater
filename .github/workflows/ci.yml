@@ -1,4 +1,4 @@
-name: ShellCheck
+name: CI
 
 on:
   push:
@@ -16,4 +16,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck update_all_clis.sh install.sh
+        run: shellcheck update_all_clis.sh install.sh scripts/ci_fixture.sh
+
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fixture smoke test
+        run: bash scripts/ci_fixture.sh

@@ -2,30 +2,44 @@
 # =============================================================================
 # update-all-clis: Dynamic discovery + update all CLIs and package managers
 #
-# Auto-discovers everything installed on your system, determines how to update
-# each tool, and runs the right command. Results are cached for speed.
-#
-# Usage: ./update_all_clis.sh [--rescan] [--no-scan] [--skip=tool1,tool2] [--quiet] [--dry-run]
-#   --rescan   Force a fresh discovery scan (default: use cache if < 24h old; wins over --no-scan)
-#   --no-scan  Use existing cache even if older than 24h (fails if no cache)
-#   --skip=    Comma-separated list of tool names to skip (overrides $SKIP)
-#   --quiet    Only show errors
-#   --dry-run  Show what would be updated without running
-#   --list     Show discovered tools and exit
+# Usage: ./update_all_clis.sh [options]
+#   --rescan          Force a fresh discovery scan
+#   --no-scan         Use existing cache (even if older than TTL)
+#   --skip=a,b        Skip known tools (overrides $SKIP)
+#   --only-origins=   Only run bulk/known matching these origins or names
+#   --skip-origins=   Skip bulk (and known) for these origins
+#   --scan-path       Also scan directories on $PATH (origin: path)
+#   --parallel=N      Run up to N updates concurrently (default 1)
+#   --json-summary    Print JSON ok/failed counts on stdout after run
+#   --list --json     Machine-readable tool list (with --list)
+#   --trace           Trace shell commands (bash -x)
+#   --dry-run         Show commands without running
+#   --version         Print version and exit
 # =============================================================================
+
+UAC_VERSION="0.2.0"
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_SCRIPT="${LIB_SCRIPT:-$SCRIPT_DIR/lib_update_all_clis.py}"
 CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/tool_config.json}"
+CONFIG_LOCAL_FILE="${CONFIG_LOCAL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/config.local.json}"
 
 CACHE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/cache.json"
 LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
 
+CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-24}"
+CACHE_TTL_SECONDS=$((CACHE_TTL_HOURS * 3600))
+
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
 SKIP="${SKIP:-}"
+ONLY_ORIGINS="${ONLY_ORIGINS:-}"
+SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
+LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
+SCAN_PATH=""; PARALLEL_JOBS=1
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -49,15 +63,25 @@ is_skipped() {
 # Argument parsing
 # -------------------------------------------------------------------
 SKIP_CLI=""
+ONLY_CLI=""
+SKIP_ORIGINS_CLI=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip=*)     SKIP_CLI="${1#*=}"; shift ;;
-    --quiet|-q)   QUIET=1; shift ;;
-    --dry-run|-n) DRY_RUN=1; shift ;;
-    --rescan|-r)  RESCAN=1; shift ;;
-    --list|-l)    LIST_MODE=1; shift ;;
-    --no-scan)    NO_SCAN=1; shift ;;
-    --help|-h)    grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
+    --skip=*)          SKIP_CLI="${1#*=}"; shift ;;
+    --only-origins=*)  ONLY_CLI="${1#*=}"; shift ;;
+    --skip-origins=*)  SKIP_ORIGINS_CLI="${1#*=}"; shift ;;
+    --parallel=*)      PARALLEL_JOBS="${1#*=}"; shift ;;
+    --quiet|-q)        QUIET=1; shift ;;
+    --dry-run|-n)      DRY_RUN=1; shift ;;
+    --rescan|-r)       RESCAN=1; shift ;;
+    --list|-l)         LIST_MODE=1; shift ;;
+    --json)            LIST_JSON=1; shift ;;
+    --no-scan)         NO_SCAN=1; shift ;;
+    --json-summary)    JSON_SUMMARY=1; shift ;;
+    --trace)           TRACE=1; shift ;;
+    --scan-path)       SCAN_PATH=1; shift ;;
+    --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
+    --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
       echo "Try --help for usage." >&2
@@ -67,6 +91,33 @@ while [[ $# -gt 0 ]]; do
 done
 
 SKIP="${SKIP_CLI:-$SKIP}"
+ONLY_ORIGINS="${ONLY_CLI:-$ONLY_ORIGINS}"
+SKIP_ORIGINS="${SKIP_ORIGINS_CLI:-$SKIP_ORIGINS}"
+
+[[ -n "$LIST_JSON" ]] && LIST_MODE=1
+
+if ! [[ "$PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]] && ! [[ "$PARALLEL_JOBS" == "0" ]]; then
+  echo "Invalid --parallel value (use a non-negative integer): $PARALLEL_JOBS" >&2
+  exit 1
+fi
+if [[ "$PARALLEL_JOBS" == "0" ]]; then
+  echo "--parallel must be at least 1" >&2
+  exit 1
+fi
+
+# -------------------------------------------------------------------
+# macOS: show summary dialog only for manual (TTY) runs unless overridden.
+# Scheduled LaunchAgent sets UPDATE_ALL_CLIS_NO_NOTIFY=1 in the plist.
+# -------------------------------------------------------------------
+_want_notify_popup() {
+  [[ "$(uname)" != "Darwin" ]] && return 1
+  [[ "${UPDATE_ALL_CLIS_NO_NOTIFY:-}" == "1" ]] && return 1
+  case "${UPDATE_ALL_CLIS_NOTIFY:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [[ -t 1 ]]
+}
 
 # -------------------------------------------------------------------
 # Glob-based directory scanner — pure bash, accumulates into TOOLS_RAW
@@ -83,7 +134,6 @@ scan_dir() {
     local name
     name="$(basename "$bin")"
 
-    # Filter noise
     [[ "$name" != .* ]] || continue
     case "$name" in
       npm|npx|node|python|python3|ruby|perl|lua|bash|zsh|sh|sh.dist|npm-cli|npx-cli) continue ;;
@@ -116,7 +166,6 @@ full_scan() {
   scan_dir "$HOME/.rbenv/shims"               "rbenv"
   scan_dir "$HOME/.pyenv/shims"               "pyenv"
 
-  # npm global
   local npm_prefix
   npm_prefix=$(npm config get prefix 2>/dev/null || true)
   if [[ -n "$npm_prefix" ]] && [[ -d "$npm_prefix/lib/node_modules/.bin" ]]; then
@@ -125,7 +174,6 @@ full_scan() {
     scan_dir "$HOME/.npm-global/lib/node_modules/.bin" "npm"
   fi
 
-  # Homebrew Cellar
   if [[ "$(uname)" == "Darwin" ]]; then
     local brew_prefix
     brew_prefix=$(brew --prefix 2>/dev/null || true)
@@ -135,14 +183,12 @@ full_scan() {
     [[ -d "/opt/homebrew/bin" ]] && scan_dir "/opt/homebrew/bin" "brew"
   fi
 
-  # User gem bins
   local gem_home
   gem_home=$(gem env home 2>/dev/null || true)
   if [[ -n "$gem_home" ]] && [[ -d "$gem_home/bin" ]]; then
     scan_dir "$gem_home/bin" "gem"
   fi
 
-  # SDKMAN candidates
   if [[ -d "$HOME/.sdkman/candidates" ]]; then
     local cand
     for cand in "$HOME/.sdkman/candidates"/*/current/bin/*; do
@@ -154,19 +200,23 @@ full_scan() {
     done
   fi
 
-  # uv venvs
   [[ -d "$HOME/.local/share/venv" ]] && scan_tree "$HOME/.local/share/venv" "uv/venv"
 
-  # /usr/local/bin
   [[ -d "/usr/local/bin" ]] && scan_dir "/usr/local/bin" "manual"
 
-  # ~/.opencode/bin — opencode
   [[ -d "$HOME/.opencode/bin" ]] && scan_dir "$HOME/.opencode/bin" "opencode"
 
-  # fnm marker
   [[ -d "$HOME/.fnm" ]] && TOOLS_RAW="${TOOLS_RAW}fnm|fnm"$'\n'
 
-  # Write cache via Python (avoids bash subshell issues)
+  if [[ -n "$SCAN_PATH" ]]; then
+    local pdir
+    IFS=':' read -ra _path_dirs <<< "${PATH:-}"
+    for pdir in "${_path_dirs[@]}"; do
+      [[ -n "$pdir" ]] || continue
+      [[ -d "$pdir" ]] && scan_dir "$pdir" "path"
+    done
+  fi
+
   local tmpfile="${CACHE_FILE}.tmp.$$"
   local scanned_at
   scanned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -214,7 +264,7 @@ ensure_cache() {
     cache_age=$((now - modified))
   fi
 
-  if [[ -f "$CACHE_FILE" ]] && ((cache_age < 86400)) && [[ -z "$RESCAN" ]]; then
+  if [[ -f "$CACHE_FILE" ]] && ((cache_age < CACHE_TTL_SECONDS)) && [[ -z "$RESCAN" ]]; then
     return 0
   fi
 
@@ -223,7 +273,7 @@ ensure_cache() {
 }
 
 # -------------------------------------------------------------------
-# Run an update command
+# Run an update command (bash -c instead of eval)
 # -------------------------------------------------------------------
 run_update() {
   local group="$1"
@@ -237,14 +287,94 @@ run_update() {
   [[ -z "$QUIET" ]] && log "  ${BOLD}→${NC} $cmd"
 
   local output ec=0
-  output=$(eval "$cmd" 2>&1) || ec=$?
+  if [[ -n "$TRACE" ]] && [[ -z "${SUPPRESS_TRACE:-}" ]]; then
+    output=$(bash -x -c "$cmd" 2>&1) || ec=$?
+  else
+    output=$(bash -c "$cmd" 2>&1) || ec=$?
+  fi
 
   if [[ $ec -eq 0 ]]; then
     ok "$group"
   else
     warn "$group failed (exit $ec)"
     [[ -z "$QUIET" ]] && echo "$output" | grep -v "^npm warn" | grep -v "^brew warn" | head -3 | sed 's/^/   /'
+    return 1
   fi
+  return 0
+}
+
+# -------------------------------------------------------------------
+# Run emit lines (skip lines do not count toward ok/fail)
+# -------------------------------------------------------------------
+_run_one_emit_line() {
+  local line="$1"
+  local cmd_type name cmd
+  IFS='|' read -r cmd_type name cmd <<< "$line"
+  case "$cmd_type" in
+    skip) return 3 ;;
+    bulk)
+      info "Updating all $name..."
+      run_update "$name" "$cmd"
+      ;;
+    known)
+      if is_skipped "$name"; then
+        log "${BLUE}-- $name skipped${NC}"
+        return 3
+      fi
+      info "Updating $name..."
+      run_update "$name" "$cmd"
+      ;;
+  esac
+}
+
+run_updates_sequential() {
+  local line
+  for line in "$@"; do
+    [[ -z "$line" ]] && continue
+    _run_one_emit_line "$line"
+    local ec=$?
+    case "$ec" in
+      0) ((UPDATE_OK++)) || true ;;
+      3) ;;
+      *) ((UPDATE_FAIL++)) || true ;;
+    esac
+  done
+}
+
+run_updates_parallel() {
+  local max="$1"
+  shift
+  local pids=()
+  local line
+  local ec
+
+  for line in "$@"; do
+    [[ -z "$line" ]] && continue
+    while (( ${#pids[@]} >= max )); do
+      wait "${pids[0]}"
+      ec=$?
+      case "$ec" in
+        0) ((UPDATE_OK++)) || true ;;
+        3) ;;
+        *) ((UPDATE_FAIL++)) || true ;;
+      esac
+      pids=("${pids[@]:1}")
+    done
+    (
+      SUPPRESS_TRACE=1
+      _run_one_emit_line "$line"
+    ) &
+    pids+=($!)
+  done
+  for _pid in "${pids[@]}"; do
+    wait "$_pid"
+    ec=$?
+    case "$ec" in
+      0) ((UPDATE_OK++)) || true ;;
+      3) ;;
+      *) ((UPDATE_FAIL++)) || true ;;
+    esac
+  done
 }
 
 # -------------------------------------------------------------------
@@ -255,6 +385,16 @@ main() {
     echo "Missing config: $CONFIG_FILE" >&2
     exit 1
   fi
+  if [[ ! -f "$LIB_SCRIPT" ]]; then
+    echo "Missing library: $LIB_SCRIPT (install update-all-clis from the repo or copy lib_update_all_clis.py next to this script)" >&2
+    exit 1
+  fi
+
+  UPDATE_OK=0
+  UPDATE_FAIL=0
+
+  # Machine-readable list must be the only thing on stdout
+  [[ -n "$LIST_JSON" ]] && QUIET=1
 
   mkdir -p "$(dirname "$CACHE_FILE")"
   mkdir -p "$LOG_DIR"
@@ -265,6 +405,10 @@ main() {
   ensure_cache
 
   if [[ -n "$LIST_MODE" ]]; then
+    if [[ -n "$LIST_JSON" ]]; then
+      python3 "$LIB_SCRIPT" list-json "$CACHE_FILE"
+      exit 0
+    fi
     log "${BOLD}Discovered tools:${NC}"
     python3 -c "
 import json, sys
@@ -283,65 +427,63 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   log "${BOLD}=== Running updates ===${NC}"
   log ""
 
-  # Python reads cache + tool_config.json, deduplicates by group, emits shell commands.
-  # Each line: "cmd_type|name|command"
   export CONFIG_FILE
-  python3 -c "
-import json, os, sys
+  export CONFIG_LOCAL_FILE
+  export ONLY_ORIGINS
+  export SKIP_ORIGINS
 
-config_path = os.environ['CONFIG_FILE']
-with open(config_path) as f:
-    cfg = json.load(f)
-SELF_CMD = cfg['known']
-BULK_ORIGINS = cfg['bulk']
-KNOWN = set(SELF_CMD.keys())
+  local emit_tmp
+  emit_tmp=$(mktemp)
+  local -a lines=()
+  if ! python3 "$LIB_SCRIPT" emit "$CACHE_FILE" > "$emit_tmp" 2>&1; then
+    cat "$emit_tmp" >&2
+    rm -f "$emit_tmp"
+    exit 1
+  fi
+  while IFS= read -r line; do
+    lines+=("$line")
+  done < "$emit_tmp"
+  rm -f "$emit_tmp"
 
-with open('$CACHE_FILE') as f:
-    data = json.load(f)
+  local _emit_snap="" _before_snap="" _after_snap=""
+  if _want_notify_popup && [[ -z "$DRY_RUN" ]]; then
+    _emit_snap=$(mktemp)
+    _before_snap=$(mktemp)
+    _after_snap=$(mktemp)
+    printf '%s\n' "${lines[@]}" > "$_emit_snap"
+    python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" > "$_before_snap" 2>/dev/null || true
+  fi
 
-tools = [t for t in data if 'name' in t]
-seen_bulk = set()
-for t in tools:
-    name   = t['name']
-    origin = t.get('origin', '?')
+  if (( PARALLEL_JOBS < 2 )); then
+    run_updates_sequential "${lines[@]}"
+  else
+    run_updates_parallel "$PARALLEL_JOBS" "${lines[@]}"
+  fi
 
-    if name in KNOWN:
-        cmd = SELF_CMD[name]
-        sys.stdout.write(f'known|{name}|{cmd}\n')
-        seen_bulk.add(origin)
-        continue
-
-    if origin in BULK_ORIGINS and origin not in seen_bulk:
-        seen_bulk.add(origin)
-        sys.stdout.write(f'bulk|{origin}|{BULK_ORIGINS[origin]}\n')
-        continue
-
-    sys.stdout.write(f'skip|{name}|\n')
-" 2>/dev/null | \
-  while IFS='|' read -r cmd_type name cmd; do
-
-    case "$cmd_type" in
-      skip) continue ;;
-      bulk)
-        info "Updating all $name..."
-        run_update "$name" "$cmd"
-        ;;
-      known)
-        if is_skipped "$name"; then
-          log "${BLUE}-- $name skipped${NC}"
-          continue
-        fi
-        info "Updating $name..."
-        run_update "$name" "$cmd"
-        ;;
-    esac
-  done
+  if [[ -n "$_emit_snap" ]]; then
+    python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" > "$_after_snap" 2>/dev/null || true
+    python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" 2>/dev/null || true
+    rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
+  fi
 
   log ""
   log "${BOLD}=== Done! ===${NC}"
+  log "Summary: ${UPDATE_OK} ok, ${UPDATE_FAIL} failed"
   log "Cache: $CACHE_FILE"
   log "Run './update_all_clis.sh --rescan' to force a fresh discovery scan."
   log "Run './update_all_clis.sh --list' to see all discovered tools."
+
+  if [[ -n "$JSON_SUMMARY" ]]; then
+    python3 -c "import json; print(json.dumps({'ok': $UPDATE_OK, 'failed': $UPDATE_FAIL}))"
+  fi
+
+  if [[ -n "$DRY_RUN" ]]; then
+    exit 0
+  fi
+  if (( UPDATE_FAIL > 0 )); then
+    exit 1
+  fi
+  exit 0
 }
 
 main
