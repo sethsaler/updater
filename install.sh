@@ -8,11 +8,11 @@
 #   --dir <path>     Custom install directory (default: ~/update-all-clis)
 # =============================================================================
 
-set -e
+set -eu
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/update-all-clis}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="$HOME/.hermes/logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
 
 info() { echo -e "==> $*"; }
 warn() { echo -e "!! $*"; }
@@ -21,6 +21,7 @@ install_script() {
   info "Installing to $INSTALL_DIR..."
   mkdir -p "$INSTALL_DIR"
   cp "$SCRIPT_DIR/update_all_clis.sh" "$INSTALL_DIR/"
+  cp "$SCRIPT_DIR/tool_config.json" "$INSTALL_DIR/"
   chmod +x "$INSTALL_DIR/update_all_clis.sh"
   info "Installed. Run with: $INSTALL_DIR/update_all_clis.sh"
 }
@@ -35,7 +36,7 @@ ask_frequency() {
   echo "  [4] Weekly (Sunday at 8:00 AM)"
   echo "  [5] Manual — just install, no schedule"
   echo ""
-  read -p "Enter choice [1-5, default 1]: " choice
+  read -r -p "Enter choice [1-5, default 1]: " choice
   choice="${choice:-1}"
   echo ""
 }
@@ -212,7 +213,10 @@ main() {
       --launchd|-l) do_launchd=true; shift ;;
       --dir) INSTALL_DIR="$2"; shift 2 ;;
       --help|-h) usage ;;
-      *) shift ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage
+        ;;
     esac
   done
 

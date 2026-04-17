@@ -1,0 +1,40 @@
+{
+  "known": {
+    "hermes": "hermes update",
+    "agent": "agent update",
+    "opencode": "opencode upgrade",
+    "uv": "uv self update && uv tool update-all",
+    "firecrawl": "npm update -g firecrawl-cli",
+    "mmx": "npm update -g mmx-cli",
+    "mmx-cli": "npm update -g mmx-cli",
+    "codex": "npm update -g codex-cli",
+    "codex-cli": "npm update -g codex-cli",
+    "dev-browser": "npm update -g dev-browser",
+    "tinyfish": "npm update -g tinyfish",
+    "cline": "npm update -g cline",
+    "ollama": "ollama update 2>/dev/null || true",
+    "warp": "warp-cli update 2>/dev/null || true",
+    "gh": "gh auth refresh 2>/dev/null || gh upgrade 2>/dev/null || true",
+    "goose": "goose update 2>/dev/null || true",
+    "kimi": "kimi update 2>/dev/null || true",
+    "kimi-cli": "kimi update 2>/dev/null || true"
+  },
+  "bulk": {
+    "npm": "npm update -g --ignore-scripts 2>&1 | grep -v 'cline-4g5O6Ovb' | grep -v 'npm warn' || true",
+    "cargo": "cargo install-update -a 2>/dev/null || cargo update",
+    "gem": "gem update --user-install 2>&1 | grep -v -E 'BUILD_RUBY_PLATFORM|fiddle|compiling|make:|error:|Error:|warnings generated' || true",
+    "brew": "brew update && brew upgrade",
+    "manual": "brew upgrade 2>/dev/null || true",
+    "conda": "conda update --all -y",
+    "uv": "uv self update && uv tool update-all",
+    "uv/pip": "uv self update && uv tool update-all",
+    "uv/venv": "uv self update && uv tool update-all",
+    "fnm": "fnm update 2>/dev/null || true",
+    "bun": "bun update 2>/dev/null || true",
+    "deno": "deno upgrade 2>/dev/null || true",
+    "pyenv": "pyenv update 2>/dev/null || true",
+    "rbenv": "brew upgrade rbenv ruby-build 2>/dev/null || true",
+    "sdkman": "bash -lc 'test -s \"$HOME/.sdkman/bin/sdkman-init.sh\" && . \"$HOME/.sdkman/bin/sdkman-init.sh\" && sdk selfupdate'",
+    "opencode": "opencode upgrade 2>/dev/null || true"
+  }
+}

@@ -5,6 +5,8 @@
   Copy this to ~/Library/LaunchAgents/
   Edit the ProgramArguments path to match your installation location.
   Then load with: launchctl load ~/Library/LaunchAgents/com.YOURUSER.update-all-clis.plist
+
+  Logs: ~/.config/update-all-clis/logs/update-all-clis.log (and .err)
 -->
 <plist version="1.0">
 <dict>
@@ -13,8 +15,8 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<!-- EDIT THIS LINE: set the full path to update_all_clis.sh on your system -->
-		<string>/FULL/PATH/TO/update-all-clis/scripts/update_all_clis.sh</string>
+		<!-- EDIT: full path to update_all_clis.sh (install.sh defaults to ~/update-all-clis/) -->
+		<string>/FULL/PATH/TO/update-all-clis/update_all_clis.sh</string>
 	</array>
 
 	<key>StartCalendarInterval</key>
@@ -25,13 +27,11 @@
 		<integer>0</integer>
 	</dict>
 
-	<!-- Logs stdout/stderr to files -->
 	<key>StandardOutPath</key>
-	<string>/Users/YOURUSER/.hermes/logs/update-all-clis.log</string>
+	<string>/Users/YOURUSER/.config/update-all-clis/logs/update-all-clis.log</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/YOURUSER/.hermes/logs/update-all-clis.err</string>
+	<string>/Users/YOURUSER/.config/update-all-clis/logs/update-all-clis.err</string>
 
-	<!-- Don't run on login; only at the scheduled time -->
 	<key>RunAtLoad</key>
 	<false/>
 
