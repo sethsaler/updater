@@ -24,6 +24,14 @@ install_script() {
   cp "$SCRIPT_DIR/tool_config.json" "$INSTALL_DIR/"
   cp "$SCRIPT_DIR/lib_update_all_clis.py" "$INSTALL_DIR/"
   chmod +x "$INSTALL_DIR/update_all_clis.sh"
+  if [[ -d "$SCRIPT_DIR/scripts" ]]; then
+    mkdir -p "$INSTALL_DIR/scripts"
+    for f in "$SCRIPT_DIR/scripts"/*.sh; do
+      [[ -f "$f" ]] || continue
+      cp "$f" "$INSTALL_DIR/scripts/"
+      chmod +x "$INSTALL_DIR/scripts/$(basename "$f")"
+    done
+  fi
   info "Installed. Run with: $INSTALL_DIR/update_all_clis.sh"
 }
 

@@ -101,6 +101,19 @@ On **macOS**, after a real update run (not `--dry-run`), the script can show a *
 - **`UPDATE_ALL_CLIS_NOTIFY=1`** — always try to show the dialog (even without a TTY).
 - **`UPDATE_ALL_CLIS_NOTIFY=0`** — never show the dialog.
 
+### Email digest (Hermes Agent + optional Agent Mail)
+
+To get a **daily email** about what changed (scheduled runs, not only the macOS dialog), set **`UPDATE_ALL_CLIS_SUMMARY_FILE`** so each successful run writes a **full plain-text summary** (same structure as the dialog, not truncated) to that path:
+
+```bash
+export UPDATE_ALL_CLIS_SUMMARY_FILE="$HOME/.config/update-all-clis/last-run-summary.txt"
+./update_all_clis.sh
+```
+
+**Hermes Agent (built-in email):** [Hermes](https://github.com/NousResearch/hermes-agent) can deliver cron output over **email** when the **gateway** is running and Email is configured (`hermes gateway setup` → Email, or `~/.hermes/.env` — see the [Email docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/email)). Create a daily job that reads the summary file (or the log under `~/.config/update-all-clis/logs/`) and uses **`--deliver email`**. Example commands are in [`scripts/hermes_cron_daily_update_example.sh`](scripts/hermes_cron_daily_update_example.sh).
+
+**Agent Mail (API):** If you use [Agent Mail](https://agentmail.to) instead, install the [official CLI](https://www.npmjs.com/package/agentmail-cli), set `AGENTMAIL_API_KEY` and an inbox id, then after the updater runs call [`scripts/agentmail_send_update_summary.sh`](scripts/agentmail_send_update_summary.sh) (see comments in that script for env vars).
+
 Version lines are **best effort**; some tools do not expose a parseable version or may report `?`.
 
 ### Exit status

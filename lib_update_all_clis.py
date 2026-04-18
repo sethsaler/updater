@@ -204,11 +204,14 @@ def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
     return {"known": known, "bulk": bulk}
 
 
-def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
-    if sys.platform != "darwin":
-        return
-    lines_out: list[str] = [f"Summary: {ok} ok, {fail} failed", ""]
-    lines_out.append("Known tools:")
+def format_run_summary(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> str:
+    """Plain-text summary of a run (known tools + bulk env lines, before → after)."""
+    lines_out: list[str] = [
+        "update-all-clis",
+        f"Steps: {ok} ok, {fail} failed",
+        "",
+        "Known tools:",
+    ]
     kn = set(before.get("known", {})) | set(after.get("known", {}))
     if not kn:
         lines_out.append("  (none)")
@@ -231,7 +234,13 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
             lines_out.append(f"  {name}: {a}")
         else:
             lines_out.append(f"  {name}: {b} → {a}")
-    body = "\n".join(lines_out)
+    return "\n".join(lines_out) + "\n"
+
+
+def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
+    if sys.platform != "darwin":
+        return
+    body = format_run_summary(before, after, ok, fail).rstrip("\n")
     if len(body) > 950:
         body = body[:947] + "\n…"
     fd, path = tempfile.mkstemp(suffix=".txt", text=True)
@@ -264,7 +273,7 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff …",
+            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff|run-summary …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -293,6 +302,10 @@ def main() -> None:
         before = json.load(open(sys.argv[2], encoding="utf-8"))
         after = json.load(open(sys.argv[3], encoding="utf-8"))
         notify_macos_dialog(before, after, int(sys.argv[4]), int(sys.argv[5]))
+    elif cmd == "run-summary":
+        before = json.load(open(sys.argv[2], encoding="utf-8"))
+        after = json.load(open(sys.argv[3], encoding="utf-8"))
+        sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5])))
     else:
         print("unknown command", file=sys.stderr)
         sys.exit(2)

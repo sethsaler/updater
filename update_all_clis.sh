@@ -258,10 +258,16 @@ ensure_cache() {
   local cache_age=99999
   if [[ -f "$CACHE_FILE" ]]; then
     local modified
-    modified=$(stat -f "%m" "$CACHE_FILE" 2>/dev/null || stat -c "%Y" "$CACHE_FILE" 2>/dev/null)
+    if [[ "$(uname)" == "Darwin" ]]; then
+      modified=$(stat -f "%m" "$CACHE_FILE" 2>/dev/null)
+    else
+      modified=$(stat -c "%Y" "$CACHE_FILE" 2>/dev/null)
+    fi
     local now
     now=$(date +%s)
-    cache_age=$((now - modified))
+    if [[ -n "${modified:-}" ]] && [[ "$modified" =~ ^[0-9]+$ ]]; then
+      cache_age=$((now - modified))
+    fi
   fi
 
   if [[ -f "$CACHE_FILE" ]] && ((cache_age < CACHE_TTL_SECONDS)) && [[ -z "$RESCAN" ]]; then
@@ -446,7 +452,7 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   rm -f "$emit_tmp"
 
   local _emit_snap="" _before_snap="" _after_snap=""
-  if _want_notify_popup && [[ -z "$DRY_RUN" ]]; then
+  if [[ -z "$DRY_RUN" ]] && { _want_notify_popup || [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; }; then
     _emit_snap=$(mktemp)
     _before_snap=$(mktemp)
     _after_snap=$(mktemp)
@@ -462,7 +468,12 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
 
   if [[ -n "$_emit_snap" ]]; then
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" > "$_after_snap" 2>/dev/null || true
-    python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" 2>/dev/null || true
+    if _want_notify_popup; then
+      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" 2>/dev/null || true
+    fi
+    if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
+      python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+    fi
     rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
   fi
 
