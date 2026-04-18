@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# Send the latest update-all-clis run summary via Agent Mail (https://agentmail.to).
+# Send update-all-clis output via Agent Mail (https://agentmail.to).
 # Requires: npm install -g agentmail-cli, AGENTMAIL_API_KEY, and an inbox id.
+#
+# Body file (first match wins):
+#   1) First argument: ./scripts/agentmail_send_update_summary.sh /path/to/file.txt
+#   2) UPDATE_ALL_CLIS_AGENTMAIL_TEXT_FILE — e.g. raw log: .../logs/update-all-clis.log
+#   3) UPDATE_ALL_CLIS_SUMMARY_FILE — structured summary from the updater
+#   4) Default: ~/.config/update-all-clis/last-run-summary.txt
 #
 # Usage:
 #   export AGENTMAIL_API_KEY=am_us_xxx
 #   export UPDATE_ALL_CLIS_AGENTMAIL_INBOX_ID=inb_xxx
 #   export UPDATE_ALL_CLIS_EMAIL_TO=you@example.com
-#   ./scripts/agentmail_send_update_summary.sh [path-to-summary.txt]
+#   ./scripts/agentmail_send_update_summary.sh
 #
-# Default summary path: ~/.config/update-all-clis/last-run-summary.txt
+# Send the full run log instead of the summary:
+#   export UPDATE_ALL_CLIS_AGENTMAIL_TEXT_FILE="$HOME/.config/update-all-clis/logs/update-all-clis.log"
+#   ./scripts/agentmail_send_update_summary.sh
 
 set -euo pipefail
 
-SUMMARY_FILE="${1:-${UPDATE_ALL_CLIS_SUMMARY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/last-run-summary.txt}}"
+SUMMARY_FILE="${1:-${UPDATE_ALL_CLIS_AGENTMAIL_TEXT_FILE:-${UPDATE_ALL_CLIS_SUMMARY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/last-run-summary.txt}}}"
 INBOX_ID="${UPDATE_ALL_CLIS_AGENTMAIL_INBOX_ID:-${AGENTMAIL_INBOX_ID:-}}"
 TO_ADDR="${UPDATE_ALL_CLIS_EMAIL_TO:-}"
 
 if [[ ! -f "$SUMMARY_FILE" ]]; then
-  echo "No summary file at $SUMMARY_FILE — run update_all_clis.sh with UPDATE_ALL_CLIS_SUMMARY_FILE set first." >&2
+  echo "No file at $SUMMARY_FILE — run the updater first (and/or set UPDATE_ALL_CLIS_SUMMARY_FILE / UPDATE_ALL_CLIS_AGENTMAIL_TEXT_FILE)." >&2
   exit 1
 fi
 

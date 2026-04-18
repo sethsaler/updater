@@ -16,7 +16,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck update_all_clis.sh install.sh scripts/ci_fixture.sh scripts/agentmail_send_update_summary.sh scripts/hermes_cron_daily_update_example.sh
+        run: shellcheck update_all_clis.sh install.sh scripts/ci_fixture.sh scripts/agentmail_send_update_summary.sh scripts/agentmail_daily_example.sh
 
   fixture:
     runs-on: ubuntu-latest

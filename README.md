@@ -101,18 +101,26 @@ On **macOS**, after a real update run (not `--dry-run`), the script can show a *
 - **`UPDATE_ALL_CLIS_NOTIFY=1`** — always try to show the dialog (even without a TTY).
 - **`UPDATE_ALL_CLIS_NOTIFY=0`** — never show the dialog.
 
-### Email digest (Hermes Agent + optional Agent Mail)
+### Email via Agent Mail CLI
 
-To get a **daily email** about what changed (scheduled runs, not only the macOS dialog), set **`UPDATE_ALL_CLIS_SUMMARY_FILE`** so each successful run writes a **full plain-text summary** (same structure as the dialog, not truncated) to that path:
+You do not need another agent: install the [Agent Mail CLI](https://www.npmjs.com/package/agentmail-cli), set `AGENTMAIL_API_KEY` and an inbox id, then after each run send the digest with [`scripts/agentmail_send_update_summary.sh`](scripts/agentmail_send_update_summary.sh). Cron-friendly examples are in [`scripts/agentmail_daily_example.sh`](scripts/agentmail_daily_example.sh).
+
+**What to email**
+
+- **Structured summary (recommended)** — set **`UPDATE_ALL_CLIS_SUMMARY_FILE`** so each real run writes a **full plain-text summary** (known tools + bulk origins, before → after; same idea as the macOS dialog, not truncated):
 
 ```bash
 export UPDATE_ALL_CLIS_SUMMARY_FILE="$HOME/.config/update-all-clis/last-run-summary.txt"
 ./update_all_clis.sh
+# then: scripts/agentmail_send_update_summary.sh
 ```
 
-**Hermes Agent (built-in email):** [Hermes](https://github.com/NousResearch/hermes-agent) can deliver cron output over **email** when the **gateway** is running and Email is configured (`hermes gateway setup` → Email, or `~/.hermes/.env` — see the [Email docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/email)). Create a daily job that reads the summary file (or the log under `~/.config/update-all-clis/logs/`) and uses **`--deliver email`**. Example commands are in [`scripts/hermes_cron_daily_update_example.sh`](scripts/hermes_cron_daily_update_example.sh).
+- **Raw log** — if you redirect stdout/stderr to `~/.config/update-all-clis/logs/update-all-clis.log`, point the mailer at that file:
 
-**Agent Mail (API):** If you use [Agent Mail](https://agentmail.to) instead, install the [official CLI](https://www.npmjs.com/package/agentmail-cli), set `AGENTMAIL_API_KEY` and an inbox id, then after the updater runs call [`scripts/agentmail_send_update_summary.sh`](scripts/agentmail_send_update_summary.sh) (see comments in that script for env vars).
+```bash
+export UPDATE_ALL_CLIS_AGENTMAIL_TEXT_FILE="$HOME/.config/update-all-clis/logs/update-all-clis.log"
+scripts/agentmail_send_update_summary.sh
+```
 
 Version lines are **best effort**; some tools do not expose a parseable version or may report `?`.
 
