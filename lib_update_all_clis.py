@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,25 @@ def _parse_csv(s: Optional[str]) -> set[str]:
     if not s or not str(s).strip():
         return set()
     return {x.strip() for x in str(s).split(",") if x.strip()}
+
+
+def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
+    """If the binary is a symlink into a known package-manager tree, return that origin."""
+    if origin not in ("manual", "path", "?"):
+        return None
+    path = shutil.which(name)
+    if not path:
+        return None
+    if not os.path.islink(path):
+        return None
+    target = os.path.realpath(path)
+    if "node_modules" in target:
+        return "npm"
+    if ".cargo" in target or "cargo" in target:
+        return "cargo"
+    if ".dotnet" in target:
+        return "dotnet"
+    return None
 
 
 def emit_lines(
@@ -82,11 +102,22 @@ def emit_lines(
             seen_bulk.add(origin)
             continue
 
+        inferred = _infer_origin_from_symlink(name, origin)
+        if inferred:
+            origin = inferred
+
         if origin in bulk_origins and origin not in seen_bulk:
             if not should_emit_bulk(origin):
                 continue
+            cmd = bulk_origins[origin]
+            if not cmd or not cmd.strip():
+                seen_bulk.add(origin)
+                continue
             seen_bulk.add(origin)
-            sys.stdout.write(f"bulk|{origin}|{bulk_origins[origin]}\n")
+            sys.stdout.write(f"bulk|{origin}|{cmd}\n")
+            continue
+
+        if origin in bulk_origins:
             continue
 
         sys.stdout.write(f"skip|{name}|\n")
@@ -128,6 +159,22 @@ def probe_known(name: str) -> str:
     return "?"
 
 
+def _probe_single(cmd: tuple[str, ...]) -> str:
+    try:
+        r = subprocess.run(
+            list(cmd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        if r.stdout:
+            return r.stdout.strip().split("\n")[0].strip()[:220]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "?"
+
+
 def probe_bulk(origin: str) -> str:
     plans: dict[str, Any] = {
         "brew": ("brew", "--version"),
@@ -146,6 +193,10 @@ def probe_bulk(origin: str) -> str:
         "conda": ("conda", "--version"),
         "opencode": ("opencode", "--version"),
         "manual": ("brew", "--version"),
+        "go": ("go", "version"),
+        "dotnet": ("dotnet", "--version"),
+        "krew": ("kubectl", "krew", "version"),
+        "mise": ("mise", "--version"),
         "path": (),
     }
     if origin == "path":
@@ -202,6 +253,39 @@ def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
             seen_bulk.add(name)
             bulk[name] = probe_bulk(name)
     return {"known": known, "bulk": bulk}
+
+
+def suggest_config(cache_path: str, cfg: dict) -> None:
+    with open(cache_path, encoding="utf-8") as f:
+        data = json.load(f)
+    tools = [t for t in data if "name" in t]
+    self_cmd = cfg["known"]
+    bulk_origins = cfg["bulk"]
+    known = set(self_cmd.keys())
+    unknown: list[dict] = []
+    for t in tools:
+        name = t["name"]
+        origin = t.get("origin", "?")
+        if name in known:
+            continue
+        if origin in bulk_origins:
+            continue
+        inferred = _infer_origin_from_symlink(name, origin)
+        if inferred and inferred in bulk_origins:
+            continue
+        unknown.append(t)
+    if not unknown:
+        print("All discovered tools have a known update path already.", file=sys.stderr)
+        return
+    unknown.sort(key=lambda x: x["name"])
+    print("Discovered tools with no update command:\n")
+    for t in unknown:
+        print(f'  "{t["name"]}": "UPDATE_COMMAND_HERE",  # origin: {t.get("origin", "?")}')
+    print()
+    print("Copy the entries above into ~/.config/update-all-clis/config.local.json")
+    print("under the \"known\" section, replacing UPDATE_COMMAND_HERE with the actual")
+    print("update command (e.g. \"brew upgrade <tool>\", \"cargo install <tool>\", etc.).")
+    print()
 
 
 def format_run_summary(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> str:
@@ -273,7 +357,7 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff|run-summary …",
+            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff|run-summary|suggest …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -306,6 +390,15 @@ def main() -> None:
         before = json.load(open(sys.argv[2], encoding="utf-8"))
         after = json.load(open(sys.argv[3], encoding="utf-8"))
         sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5])))
+    elif cmd == "suggest":
+        cache_path = sys.argv[2]
+        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        suggest_config(cache_path, cfg)
     else:
         print("unknown command", file=sys.stderr)
         sys.exit(2)

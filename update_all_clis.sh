@@ -8,7 +8,7 @@
 #   --skip=a,b        Skip known tools (overrides $SKIP)
 #   --only-origins=   Only run bulk/known matching these origins or names
 #   --skip-origins=   Skip bulk (and known) for these origins
-#   --scan-path       Also scan directories on $PATH (origin: path)
+#   --no-scan-path    Skip scanning directories on $PATH (origin: path)
 #   --parallel=N      Run up to N updates concurrently (default 1)
 #   --json-summary    Print JSON ok/failed counts on stdout after run
 #   --list --json     Machine-readable tool list (with --list)
@@ -17,7 +17,7 @@
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.2.0"
+UAC_VERSION="0.3.0"
 
 set -uo pipefail
 
@@ -39,7 +39,7 @@ ONLY_ORIGINS="${ONLY_ORIGINS:-}"
 SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
-SCAN_PATH=""; PARALLEL_JOBS=1
+SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=1
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -80,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     --json-summary)    JSON_SUMMARY=1; shift ;;
     --trace)           TRACE=1; shift ;;
     --scan-path)       SCAN_PATH=1; shift ;;
+    --no-scan-path)    NO_SCAN_PATH=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -170,8 +171,50 @@ full_scan() {
   npm_prefix=$(npm config get prefix 2>/dev/null || true)
   if [[ -n "$npm_prefix" ]] && [[ -d "$npm_prefix/lib/node_modules/.bin" ]]; then
     scan_dir "$npm_prefix/lib/node_modules/.bin" "npm"
-  elif [[ -d "$HOME/.npm-global/lib/node_modules/.bin" ]]; then
+  fi
+  if [[ -d "$HOME/.npm-global/lib/node_modules/.bin" ]]; then
     scan_dir "$HOME/.npm-global/lib/node_modules/.bin" "npm"
+  fi
+
+  local npm_root
+  npm_root=$(npm root -g 2>/dev/null || true)
+  if [[ -n "$npm_root" ]] && [[ -d "$npm_root/.bin" ]]; then
+    local _npm_bin_dir="$npm_root/.bin"
+    local _prefix_bin_dir=""
+    [[ -n "$npm_prefix" ]] && _prefix_bin_dir="$npm_prefix/lib/node_modules/.bin"
+    if [[ "$_npm_bin_dir" != "$_prefix_bin_dir" ]]; then
+      scan_dir "$_npm_bin_dir" "npm"
+    fi
+  fi
+
+  local npm_globals
+  npm_globals=$(npm ls -g --depth=0 --json 2>/dev/null || true)
+  if [[ -n "$npm_globals" ]]; then
+    local npm_global_dir
+    npm_global_dir=$(echo "$npm_globals" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    deps = data.get('dependencies', {})
+    for name, info in deps.items():
+        rp = info.get('resolved', info.get('path', ''))
+        if rp:
+            print(rp, end='|')
+except Exception:
+    pass
+" 2>/dev/null)
+    if [[ -n "$npm_global_dir" ]]; then
+      IFS='|' read -ra pkg_dirs <<< "$npm_global_dir"
+      for pkg_dir in "${pkg_dirs[@]}"; do
+        [[ -n "$pkg_dir" ]] || continue
+        local bin_dir="${pkg_dir}/.bin"
+        [[ -d "$bin_dir" ]] || continue
+        case "$bin_dir" in
+          "$HOME/.npm-global/lib/node_modules/.bin"|"$npm_prefix/lib/node_modules/.bin"|"$npm_root/.bin") continue ;;
+        esac
+        scan_dir "$bin_dir" "npm"
+      done
+    fi
   fi
 
   if [[ "$(uname)" == "Darwin" ]]; then
@@ -206,14 +249,63 @@ full_scan() {
 
   [[ -d "$HOME/.opencode/bin" ]] && scan_dir "$HOME/.opencode/bin" "opencode"
 
+  scan_dir "$HOME/bin"                          "manual"
+
+  if [[ -n "${PNPM_HOME:-}" ]] && [[ -d "$PNPM_HOME" ]]; then
+    scan_dir "$PNPM_HOME" "npm"
+  elif [[ -d "$HOME/.local/share/pnpm/bin" ]]; then
+    scan_dir "$HOME/.local/share/pnpm/bin" "npm"
+  fi
+
+  local _npm_packages="$HOME/.npm-packages/bin"
+  if [[ -d "$_npm_packages" ]]; then
+    npm_global_prefix=$(npm config get prefix 2>/dev/null || echo "")
+    if [[ -n "$npm_global_prefix" ]] && [[ "${npm_global_prefix}/lib/node_modules/.bin" != "$_npm_packages" ]]; then
+      scan_dir "$_npm_packages" "npm"
+    fi
+  fi
+
+  [[ -d "$HOME/.config/yarn/global/node_modules/.bin" ]] && scan_dir "$HOME/.config/yarn/global/node_modules/.bin" "npm"
+
+  local gopath="${GOPATH:-$HOME/go}"
+  [[ -d "$gopath/bin" ]] && scan_dir "$gopath/bin" "go"
+
+  [[ -d "$HOME/.dotnet/tools" ]] && scan_dir "$HOME/.dotnet/tools" "dotnet"
+
+  [[ -d "$HOME/.krew/bin" ]] && scan_dir "$HOME/.krew/bin" "krew"
+
+  if [[ -d "$HOME/.local/share/mise/shims" ]]; then
+    scan_dir "$HOME/.local/share/mise/shims" "mise"
+  fi
+  if [[ -d "$HOME/.local/share/mise/installs" ]]; then
+    local mise_tool_bin
+    for mise_tool_bin in "$HOME/.local/share/mise/installs"/*/bin; do
+      [[ -d "$mise_tool_bin" ]] && scan_dir "$mise_tool_bin" "mise"
+    done
+  fi
+
+  [[ -d "/opt/local/bin" ]] && scan_dir "/opt/local/bin" "manual"
+  [[ -d "$HOME/.wasmtime/bin" ]] && scan_dir "$HOME/.wasmtime/bin" "manual"
+  [[ -d "$HOME/.wasmer/bin" ]] && scan_dir "$HOME/.wasmer/bin" "manual"
+
   [[ -d "$HOME/.fnm" ]] && TOOLS_RAW="${TOOLS_RAW}fnm|fnm"$'\n'
 
-  if [[ -n "$SCAN_PATH" ]]; then
+  if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
     local pdir
+    local -a _already_scanned=( "$HOME/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/.bun/install/cache/bin" "$HOME/.rbenv/shims" "$HOME/.pyenv/shims" "$HOME/.opencode/bin" "/opt/homebrew/bin" "/usr/local/bin" )
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue
-      [[ -d "$pdir" ]] && scan_dir "$pdir" "path"
+      [[ -d "$pdir" ]] || continue
+      case "$pdir" in
+        /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
+      esac
+      local _skip=0
+      for _scanned in "${_already_scanned[@]}"; do
+        [[ "$pdir" == "$_scanned" ]] && { _skip=1; break; }
+      done
+      [[ $_skip -eq 1 ]] && continue
+      scan_dir "$pdir" "path"
     done
   fi
 
