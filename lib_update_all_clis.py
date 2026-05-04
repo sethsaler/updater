@@ -329,7 +329,9 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
         body = body[:947] + "\n…"
     fd, path = tempfile.mkstemp(suffix=".txt", text=True)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # AppleScript "read … as Unicode text" expects UTF-16; UTF-8 bytes
+        # mis-decode as CJK mojibake in the dialog.
+        with os.fdopen(fd, "w", encoding="utf-16") as f:
             f.write(body)
         path_esc = path.replace("\\", "\\\\").replace('"', '\\"')
         subprocess.run(
