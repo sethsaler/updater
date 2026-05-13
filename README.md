@@ -32,34 +32,56 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 ### Known tools (individual commands)
 
 | Tool | Update command |
-|---|---|
-| Hermes | `hermes update` |
+|------|---------------|
 | Cursor Agent | `agent update` |
-| OpenCode | `opencode upgrade` |
-| uv (self + tools) | `uv self update && uv tool upgrade --all` |
-| GitHub CLI | `gh auth refresh` / `gh upgrade` |
-| Ollama | `ollama update` |
-| Goose | `goose update` |
-| Kimi | `kimi update` |
-| Warp | `warp-cli update` |
-| Mise | `mise self-update` |
-| Starship | `starship self-update` |
-| Zoxide | `zoxide update` / `zoxide self-update` |
 | Atuin | `atuin update` |
-| Just | `cargo install just --locked` |
-| fzf | `brew upgrade fzf` |
-| lazygit | `brew upgrade lazygit` |
 | bat | `brew upgrade bat` |
-| eza | `cargo install eza --locked` |
-| ripgrep | `brew upgrade ripgrep` |
-| fd | `brew upgrade fd` |
-| yazi | `brew upgrade yazi` |
-| Firecrawl | `npm update -g firecrawl-cli` |
-| mmx | `npm update -g mmx-cli` |
-| Codex | `npm update -g codex-cli` |
-| dev-browser | `npm update -g dev-browser` |
-| TinyFish | `npm update -g tinyfish` |
+| Browserbase (bb) | `npm update -g @browserbasehq/cli` |
+| Browserbase Browse (browse) | `npm update -g @browserbasehq/browse-cli` |
+| Claude Code | `claude update` |
 | cline | `npm update -g cline` |
+| Codex CLI | `npm update -g codex-cli` |
+| Composio | `composio upgrade` |
+| dev-browser | `npm update -g dev-browser` |
+| Devin | `devin update` |
+| ElevenLabs | `npm update -g @elevenlabs/cli` |
+| ESPN PP CLI | `go install github.com/mvanhorn/printing-press-library/library/media-and-entertainment/espn/cmd/espn-pp-cli@latest` |
+| expect-cli | `npm update -g expect-cli` |
+| eza | `cargo install eza --locked` |
+| fd | `brew upgrade fd` |
+| FieldTheory | `npm update -g fieldtheory` |
+| Firecrawl | `npm update -g firecrawl-cli` |
+| Flight Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/travel/flight-goat/cmd/flight-goat-pp-cli@latest` |
+| fzf | `brew upgrade fzf` |
+| Gemini CLI | `npm update -g @google/gemini-cli` |
+| Genspark | `npm update -g @genspark/cli` |
+| GitHub CLI (gh) | `gh auth refresh` / `gh upgrade` |
+| Goose | `goose update` |
+| Hermes | `hermes update` |
+| just | `cargo install just --locked` |
+| kanban | `npm update -g kanban` |
+| Kimi | `kimi update` |
+| lazygit | `brew upgrade lazygit` |
+| mcp-remote | `npm update -g mcp-remote` |
+| Mem0 | `npm update -g @mem0/cli` |
+| mise | `mise self-update` |
+| mmx | `npm update -g mmx-cli` |
+| Movie Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/media-and-entertainment/movie-goat/cmd/movie-goat-pp-cli@latest` |
+| ntn | `ntn update` |
+| Ollama | `ollama update` |
+| 1Password CLI (op) | `op update` |
+| OpenClaw | `npm update -g openclaw` |
+| OpenCode | `opencode upgrade` |
+| Printing Press | `go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest` |
+| Readwise | `npm update -g @readwise/cli` |
+| Recipe Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/food-and-dining/recipe-goat/cmd/recipe-goat-pp-cli@latest` |
+| ripgrep (rg) | `brew upgrade ripgrep` |
+| Starship | `starship self-update` |
+| TinyFish | `npm update -g tinyfish` |
+| uv | `uv self update && uv tool upgrade --all` |
+| Warp | `warp-cli update` |
+| yazi | `brew upgrade yazi` |
+| zoxide | `zoxide update` / `zoxide self-update` |
 
 Tools not found on your system are silently skipped. Unknown tools are skipped silently. The script never updates things it can't update.
 
@@ -186,6 +208,65 @@ After a discovery scan, run the **suggest** command to see which discovered tool
 ```bash
 python3 lib_update_all_clis.py suggest ~/.config/update-all-clis/cache.json
 ```
+
+## CLI version status
+
+| CLI | Last Modified | Version |
+|-----|---------------|---------|
+| agent | 2026-05-09 15:34:16 | 2026.05.09-0afadcc |
+| atuin | not installed |  |
+| bat | not installed |  |
+| bb | 2026-03-20 13:37:52 | 0.5.7 |
+| browse | 2026-03-20 13:37:52 | 0.6.0 |
+| claude | 2026-05-11 19:12:44 | 2.1.139 (Claude Code) |
+| cline | 2026-05-13 13:52:21 | 3.0.2 |
+| codex | 2026-05-13 13:52:21 | codex-cli 0.130.0 |
+| codex-cli | not installed |  |
+| composio | 2026-05-13 13:52:33 | 0.2.22 |
+| dev-browser | 2026-05-13 13:52:21 | ? |
+| devin | 2026-05-12 18:06:50 | devin 2026.5.6-7 (fb272f6) |
+| elevenlabs | 2026-05-13 13:52:21 | 0.5.2 |
+| espn-pp-cli | 2026-05-08 11:53:58 | espn-pp-cli 1.0.0 |
+| expect-cli | 2026-05-13 13:52:24 | 0.1.3 |
+| eza | not installed |  |
+| fd | not installed |  |
+| fieldtheory | 2026-05-13 13:52:25 | 1.3.19 |
+| firecrawl | 2026-05-13 13:53:03 | 1.16.2 |
+| flight-goat-pp-cli | 2026-05-08 11:54:04 | flight-goat-pp-cli 1.0.0 |
+| fzf | 2026-04-26 05:04:37 | 0.72.0 (Homebrew) |
+| gemini | 2026-05-13 13:52:33 | 0.42.0 |
+| genspark | 2026-05-13 13:52:22 | 1.0.15 |
+| gh | 2026-04-28 06:16:54 | gh version 2.92.0 (2026-04-28) |
+| goose | 2025-01-28 00:19:13 | 1.0.0 |
+| hermes | 2026-05-13 13:53:07 | Hermes Agent v0.13.0 (2026.5.7) |
+| just | not installed |  |
+| kanban | 2026-05-13 13:52:28 | 0.1.68 |
+| kimi | 2026-05-13 13:54:28 | kimi, version 1.43.0 |
+| kimi-cli | 2026-05-13 13:54:28 | kimi, version 1.43.0 |
+| lazygit | not installed |  |
+| mcp-remote | 2026-05-13 13:52:23 | ? |
+| mem0 | 2026-05-13 13:52:23 | ◆ Mem0 CLI v0.2.4 |
+| mise | not installed |  |
+| mmx | 2026-05-13 13:53:06 | mmx 1.0.13 |
+| mmx-cli | not installed |  |
+| movie-goat-pp-cli | 2026-05-08 11:54:10 | movie-goat-pp-cli 1.0.0 |
+| ntn | 2026-05-13 13:45:31 | ntn 0.13.2 |
+| ollama | not installed |  |
+| op | 2026-04-16 17:24:41 | 2.34.0 |
+| openclaw | 2026-05-13 13:52:37 | OpenClaw 2026.5.7 (eeef486) |
+| opencode | 2026-05-10 21:47:45 | 1.14.48 |
+| printing-press | 2026-05-08 11:55:00 | printing-press 4.0.6 |
+| readwise | 2026-05-13 13:52:22 | 0.5.6 |
+| recipe-goat-pp-cli | 2026-05-08 11:54:15 | recipe-goat-pp-cli 1.0.0 |
+| rg | 2026-02-26 13:19:47 | ripgrep 15.1.0 |
+| starship | not installed |  |
+| tinyfish | 2026-05-13 13:52:23 | 0.1.6 |
+| uv | 2026-05-12 13:40:40 | uv 0.11.14 (3fdfdc7d4 2026-05-12 aarch64-apple-darwin) |
+| warp | not installed |  |
+| yazi | not installed |  |
+| zoxide | not installed |  |
+
+Last modified is the file timestamp of the binary on disk (when it was last installed or updated). Regenerate with `python3 scripts/generate_cli_report.py`.
 
 ## Requirements
 

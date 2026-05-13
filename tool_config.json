@@ -9,6 +9,7 @@
     "cline": "npm update -g cline",
     "codex": "npm update -g codex-cli",
     "codex-cli": "npm update -g codex-cli",
+    "composio": "composio upgrade 2>/dev/null || true",
     "devin": "devin update 2>/dev/null || true",
     "dev-browser": "npm update -g dev-browser",
     "elevenlabs": "npm update -g @elevenlabs/cli 2>/dev/null || true",
