@@ -288,6 +288,130 @@ def suggest_config(cache_path: str, cfg: dict) -> None:
     print()
 
 
+# Path for the unknown tools log (persistent across runs)
+UNKNOWN_LOG_DEFAULT = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "update-all-clis",
+    "unknown_tools.json",
+)
+
+
+def log_unknowns(cache_path: str, cfg: dict, unknown_log_path: str) -> None:
+    """Scan cache for tools with no update path and persist them to a log file.
+
+    Each tool is tracked by name with first_seen, last_seen, and times_seen
+    counters so users can spot recurring unknown tools across runs.
+    """
+    with open(cache_path, encoding="utf-8") as f:
+        data = json.load(f)
+    tools = [t for t in data if "name" in t]
+    meta = next((t for t in data if "scanned_at" in t), None)
+    scanned_at = meta.get("scanned_at") if meta else None
+
+    known = set(cfg["known"].keys())
+    bulk = set(cfg["bulk"].keys())
+
+    existing: dict = {}
+    if os.path.isfile(unknown_log_path):
+        try:
+            with open(unknown_log_path, encoding="utf-8") as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    existing_tools = existing.get("tools", {})
+
+    for t in tools:
+        name = t["name"]
+        origin = t.get("origin", "?")
+
+        if name in known:
+            continue
+        if origin in bulk:
+            continue
+        inferred = _infer_origin_from_symlink(name, origin)
+        if inferred and inferred in bulk:
+            continue
+
+        if name in existing_tools:
+            existing_tools[name]["last_seen"] = (
+                scanned_at or existing_tools[name].get("last_seen")
+            )
+            existing_tools[name]["times_seen"] += 1
+        else:
+            existing_tools[name] = {
+                "name": name,
+                "origin": origin,
+                "first_seen": scanned_at,
+                "last_seen": scanned_at,
+                "times_seen": 1,
+                "acknowledged": False,
+            }
+
+    output = {
+        "scanned_at": scanned_at,
+        "tools": existing_tools,
+    }
+    os.makedirs(os.path.dirname(unknown_log_path), exist_ok=True)
+    with open(unknown_log_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+
+
+def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
+    """Print a report of unknown (no update path) tools from the persistent log."""
+    if not os.path.isfile(unknown_log_path):
+        print("No unknown tools log found.", file=sys.stderr)
+        return
+    with open(unknown_log_path, encoding="utf-8") as f:
+        data = json.load(f)
+    tools = data.get("tools", {})
+
+    unhandled = [t for t in tools.values() if t["times_seen"] >= min_times and not t.get("acknowledged")]
+    acked = [t for t in tools.values() if t.get("acknowledged")]
+
+    if not unhandled and not acked:
+        print("No unknown tools recorded.")
+        return
+
+    if unhandled:
+        unhandled.sort(key=lambda x: (-x["times_seen"], x["name"]))
+        print("Tools with no update path (seen in recent scans):")
+        print()
+        for t in unhandled:
+            flag = ""
+            if t["times_seen"] >= 2:
+                flag = f"  (run with --ack-unknown={t['name']} to dismiss)"
+            print(f'  {t["name"]}  [origin: {t["origin"]}]  '
+                  f'(seen {t["times_seen"]}x, last: {t["last_seen"]}){flag}')
+            print(f'    add to known: "{t["name"]}": "UPDATE_COMMAND_HERE",')
+            print()
+        print("Tip: Add entries above to ~/.config/update-all-clis/config.local.json")
+        print("under the \"known\" section to give them an update path.")
+        print()
+
+    if acked:
+        print("Acknowledged (dismissed from report):")
+        for t in acked:
+            print(f'  {t["name"]}  (seen {t["times_seen"]}x, last: {t["last_seen"]})')
+
+
+def ack_unknown(unknown_log_path: str, name: str) -> None:
+    """Mark a tool as acknowledged so it no longer appears in reports."""
+    if not os.path.isfile(unknown_log_path):
+        print(f"No unknown tools log found at {unknown_log_path}.", file=sys.stderr)
+        sys.exit(1)
+    with open(unknown_log_path, encoding="utf-8") as f:
+        data = json.load(f)
+    tools = data.get("tools", {})
+    if name not in tools:
+        print(f"Tool '{name}' not found in unknown tools log.", file=sys.stderr)
+        sys.exit(1)
+    tools[name]["acknowledged"] = True
+    with open(unknown_log_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"Acknowledged '{name}' — it will no longer appear in reports.")
+
+
 def format_run_summary(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> str:
     """Plain-text summary of a run (known tools + bulk env lines, before → after)."""
     lines_out: list[str] = [
@@ -359,7 +483,8 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff|run-summary|suggest …",
+            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff|"
+            "run-summary|suggest|log-unknowns|report-unknown|ack-unknown …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -401,6 +526,25 @@ def main() -> None:
         cfg = load_merge(base, local or None)
         validate(cfg)
         suggest_config(cache_path, cfg)
+    elif cmd == "log-unknowns":
+        cache_path = sys.argv[2]
+        unknown_log = os.environ.get("UNKNOWN_LOG_FILE", UNKNOWN_LOG_DEFAULT)
+        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        log_unknowns(cache_path, cfg, unknown_log)
+    elif cmd == "report-unknown":
+        unknown_log = sys.argv[2] if len(sys.argv) > 2 else UNKNOWN_LOG_DEFAULT
+        min_times = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+        report_unknown(unknown_log, min_times)
+    elif cmd == "ack-unknown":
+        if len(sys.argv) < 4:
+            print("usage: lib_update_all_clis.py ack-unknown UNKNOWN_LOG TOOL_NAME", file=sys.stderr)
+            sys.exit(2)
+        ack_unknown(sys.argv[2], sys.argv[3])
     else:
         print("unknown command", file=sys.stderr)
         sys.exit(2)

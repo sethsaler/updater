@@ -12,12 +12,14 @@
 #   --parallel=N      Run up to N updates concurrently (default 1)
 #   --json-summary    Print JSON ok/failed counts on stdout after run
 #   --list --json     Machine-readable tool list (with --list)
+#   --report-unknown  Show tools discovered with no update path
+#   --ack-unknown=X   Dismiss a tool from the unknown report
 #   --trace           Trace shell commands (bash -x)
 #   --dry-run         Show commands without running
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.3.0"
+UAC_VERSION="0.4.0"
 
 set -uo pipefail
 
@@ -28,6 +30,7 @@ CONFIG_LOCAL_FILE="${CONFIG_LOCAL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update
 
 CACHE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/cache.json"
 LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
+UNKNOWN_LOG_FILE="${UNKNOWN_LOG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/unknown_tools.json}"
 
 CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-24}"
 CACHE_TTL_SECONDS=$((CACHE_TTL_HOURS * 3600))
@@ -40,6 +43,7 @@ SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=1
+REPORT_UNKNOWN=""; ACK_UNKNOWN=""
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -78,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --json)            LIST_JSON=1; shift ;;
     --no-scan)         NO_SCAN=1; shift ;;
     --json-summary)    JSON_SUMMARY=1; shift ;;
+    --report-unknown)  REPORT_UNKNOWN=1; shift ;;
+    --ack-unknown=*)   ACK_UNKNOWN="${1#*=}"; shift ;;
     --trace)           TRACE=1; shift ;;
     --scan-path)       SCAN_PATH=1; shift ;;
     --no-scan-path)    NO_SCAN_PATH=1; shift ;;
@@ -495,10 +501,21 @@ main() {
   [[ -n "$LIST_JSON" ]] && QUIET=1
 
   mkdir -p "$(dirname "$CACHE_FILE")"
+  mkdir -p "$(dirname "$UNKNOWN_LOG_FILE")"
   mkdir -p "$LOG_DIR"
 
   log "${BOLD}update-all-clis${NC} — dynamic discovery and update"
   log ""
+
+  if [[ -n "$REPORT_UNKNOWN" ]]; then
+    python3 "$LIB_SCRIPT" report-unknown "$UNKNOWN_LOG_FILE"
+    exit 0
+  fi
+
+  if [[ -n "$ACK_UNKNOWN" ]]; then
+    python3 "$LIB_SCRIPT" ack-unknown "$UNKNOWN_LOG_FILE" "$ACK_UNKNOWN"
+    exit 0
+  fi
 
   ensure_cache
 
@@ -542,6 +559,10 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     lines+=("$line")
   done < "$emit_tmp"
   rm -f "$emit_tmp"
+
+  log "${BOLD}=== Logging unknown tools ===${NC}"
+  export UNKNOWN_LOG_FILE
+  python3 "$LIB_SCRIPT" log-unknowns "$CACHE_FILE" 2>/dev/null || true
 
   local _emit_snap="" _before_snap="" _after_snap=""
   if [[ -z "$DRY_RUN" ]] && { _want_notify_popup || [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; }; then
