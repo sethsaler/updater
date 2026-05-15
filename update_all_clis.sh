@@ -255,6 +255,8 @@ except Exception:
 
   [[ -d "$HOME/.opencode/bin" ]] && scan_dir "$HOME/.opencode/bin" "opencode"
 
+  [[ -d "$HOME/.grok/bin" ]] && scan_dir "$HOME/.grok/bin" "grok"
+
   scan_dir "$HOME/bin"                          "manual"
 
   if [[ -n "${PNPM_HOME:-}" ]] && [[ -d "$PNPM_HOME" ]]; then
@@ -272,9 +274,6 @@ except Exception:
   fi
 
   [[ -d "$HOME/.config/yarn/global/node_modules/.bin" ]] && scan_dir "$HOME/.config/yarn/global/node_modules/.bin" "npm"
-
-  local gopath="${GOPATH:-$HOME/go}"
-  [[ -d "$gopath/bin" ]] && scan_dir "$gopath/bin" "go"
 
   [[ -d "$HOME/.dotnet/tools" ]] && scan_dir "$HOME/.dotnet/tools" "dotnet"
 
@@ -298,7 +297,7 @@ except Exception:
 
   if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
     local pdir
-    local -a _already_scanned=( "$HOME/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/.bun/install/cache/bin" "$HOME/.rbenv/shims" "$HOME/.pyenv/shims" "$HOME/.opencode/bin" "/opt/homebrew/bin" "/usr/local/bin" )
+    local -a _already_scanned=( "$HOME/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/.bun/install/cache/bin" "$HOME/.rbenv/shims" "$HOME/.pyenv/shims" "$HOME/.opencode/bin" "$HOME/.grok/bin" "/opt/homebrew/bin" "/usr/local/bin" )
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue

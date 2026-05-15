@@ -73,7 +73,8 @@ def emit_lines(
     tools = [t for t in data if "name" in t]
     self_cmd = cfg["known"]
     bulk_origins = cfg["bulk"]
-    known = set(self_cmd.keys())
+    known_names = set(self_cmd.keys())
+    seen_names: set[str] = set()
     seen_bulk: set[str] = set()
 
     def origin_allowed_for_known(origin: str, name: str) -> bool:
@@ -92,14 +93,23 @@ def emit_lines(
         name = t["name"]
         origin = t.get("origin", "?")
 
-        if name in known:
+        if name in known_names:
+            if name in seen_names:
+                continue
             if origin in skip:
                 continue
             if not origin_allowed_for_known(origin, name):
                 continue
             cmd = self_cmd[name]
+            if not cmd or not cmd.strip():
+                seen_names.add(name)
+                continue
+            seen_names.add(name)
             sys.stdout.write(f"known|{name}|{cmd}\n")
             seen_bulk.add(origin)
+            continue
+
+        if name in seen_names:
             continue
 
         inferred = _infer_origin_from_symlink(name, origin)
@@ -115,11 +125,14 @@ def emit_lines(
                 continue
             seen_bulk.add(origin)
             sys.stdout.write(f"bulk|{origin}|{cmd}\n")
+            seen_names.add(name)
             continue
 
         if origin in bulk_origins:
+            seen_names.add(name)
             continue
 
+        seen_names.add(name)
         sys.stdout.write(f"skip|{name}|\n")
 
 
@@ -193,7 +206,6 @@ def probe_bulk(origin: str) -> str:
         "conda": ("conda", "--version"),
         "opencode": ("opencode", "--version"),
         "manual": ("brew", "--version"),
-        "go": ("go", "version"),
         "dotnet": ("dotnet", "--version"),
         "krew": ("kubectl", "krew", "version"),
         "mise": ("mise", "--version"),
