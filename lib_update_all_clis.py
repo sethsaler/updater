@@ -10,6 +10,9 @@ import sys
 import tempfile
 from typing import Any, Optional
 
+_UV_ORIGINS = frozenset({"uv", "uv/pip", "uv/venv"})
+EMIT_SEP = "\x1e"
+
 
 def load_merge(base_path: str, local_path: Optional[str]) -> dict:
     with open(base_path, encoding="utf-8") as f:
@@ -39,6 +42,34 @@ def _parse_csv(s: Optional[str]) -> set[str]:
     return {x.strip() for x in str(s).split(",") if x.strip()}
 
 
+def lock_group_for(origin: str, cmd: str, name: str) -> str:
+    """Package-manager lock key for parallel runs (serialize same manager)."""
+    if origin in _UV_ORIGINS:
+        return "uv"
+    if origin and origin not in ("manual", "path", "?", "go"):
+        return origin
+    lowered = cmd.lower()
+    if "npm " in lowered or "npm update" in lowered or "npm install" in lowered:
+        return "npm"
+    if "brew " in lowered:
+        return "brew"
+    if "cargo " in lowered:
+        return "cargo"
+    if "gem " in lowered:
+        return "gem"
+    if "go install" in lowered:
+        return "go"
+    if "uv " in lowered:
+        return "uv"
+    if "pipx " in lowered:
+        return "pipx"
+    if "conda " in lowered:
+        return "conda"
+    if "dotnet " in lowered:
+        return "dotnet"
+    return name
+
+
 def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
     """If the binary is a symlink into a known package-manager tree, return that origin."""
     if origin not in ("manual", "path", "?"):
@@ -55,15 +86,17 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
         return "cargo"
     if ".dotnet" in target:
         return "dotnet"
+    if ".pipx" in target:
+        return "pipx"
     return None
 
 
-def emit_lines(
+def collect_emit_lines(
     cache_path: str,
     cfg: dict,
     only_origins: Optional[str],
     skip_origins: Optional[str],
-) -> None:
+) -> list[str]:
     only = _parse_csv(only_origins)
     skip = _parse_csv(skip_origins)
 
@@ -76,6 +109,7 @@ def emit_lines(
     known_names = set(self_cmd.keys())
     seen_names: set[str] = set()
     seen_bulk: set[str] = set()
+    lines: list[str] = []
 
     def origin_allowed_for_known(origin: str, name: str) -> bool:
         if not only:
@@ -88,6 +122,10 @@ def emit_lines(
         if only and origin not in only:
             return False
         return True
+
+    def write_line(kind: str, name: str, cmd: str, origin: str) -> None:
+        lock = lock_group_for(origin, cmd, name)
+        lines.append(f"{kind}{EMIT_SEP}{name}{EMIT_SEP}{cmd}{EMIT_SEP}{lock}")
 
     for t in tools:
         name = t["name"]
@@ -105,7 +143,7 @@ def emit_lines(
                 seen_names.add(name)
                 continue
             seen_names.add(name)
-            sys.stdout.write(f"known|{name}|{cmd}\n")
+            write_line("known", name, cmd, origin)
             seen_bulk.add(origin)
             continue
 
@@ -122,9 +160,11 @@ def emit_lines(
             cmd = bulk_origins[origin]
             if not cmd or not cmd.strip():
                 seen_bulk.add(origin)
+                seen_names.add(name)
+                lines.append(f"skip{EMIT_SEP}{name}{EMIT_SEP}{EMIT_SEP}")
                 continue
             seen_bulk.add(origin)
-            sys.stdout.write(f"bulk|{origin}|{cmd}\n")
+            write_line("bulk", origin, cmd, origin)
             seen_names.add(name)
             continue
 
@@ -133,7 +173,39 @@ def emit_lines(
             continue
 
         seen_names.add(name)
-        sys.stdout.write(f"skip|{name}|\n")
+        lines.append(f"skip{EMIT_SEP}{name}{EMIT_SEP}{EMIT_SEP}")
+
+    return lines
+
+
+def emit_lines(
+    cache_path: str,
+    cfg: dict,
+    only_origins: Optional[str],
+    skip_origins: Optional[str],
+) -> None:
+    for line in collect_emit_lines(cache_path, cfg, only_origins, skip_origins):
+        sys.stdout.write(line + "\n")
+
+
+def emit_plan_json(
+    cache_path: str,
+    cfg: dict,
+    only_origins: Optional[str],
+    skip_origins: Optional[str],
+) -> None:
+    plan: list[dict[str, str]] = []
+    for line in collect_emit_lines(cache_path, cfg, only_origins, skip_origins):
+        parts = line.split(EMIT_SEP, 3)
+        if len(parts) < 3:
+            continue
+        kind, name, cmd = parts[0], parts[1], parts[2]
+        lock = parts[3] if len(parts) > 3 else name
+        entry: dict[str, str] = {"type": kind, "name": name, "command": cmd}
+        if lock:
+            entry["lock_group"] = lock
+        plan.append(entry)
+    print(json.dumps({"plan": plan, "count": len(plan)}, indent=2))
 
 
 def list_json(cache_path: str) -> None:
@@ -149,9 +221,8 @@ def list_json(cache_path: str) -> None:
     print(json.dumps(out, indent=2))
 
 
-def probe_known(name: str) -> str:
-    import shutil
-
+def probe_version(name: str) -> str:
+    """Best-effort version string for a CLI on PATH."""
     if not shutil.which(name):
         return "?"
     for args in ((name, "--version"), (name, "-V"), (name, "version")):
@@ -170,6 +241,10 @@ def probe_known(name: str) -> str:
         except (OSError, subprocess.TimeoutExpired):
             pass
     return "?"
+
+
+def probe_known(name: str) -> str:
+    return probe_version(name)
 
 
 def _probe_single(cmd: tuple[str, ...]) -> str:
@@ -209,6 +284,8 @@ def probe_bulk(origin: str) -> str:
         "dotnet": ("dotnet", "--version"),
         "krew": ("kubectl", "krew", "version"),
         "mise": ("mise", "--version"),
+        "pipx": ("pipx", "--version"),
+        "grok": ("grok", "--version"),
         "path": (),
     }
     if origin == "path":
@@ -231,15 +308,9 @@ def probe_bulk(origin: str) -> str:
             )
             out = (r.stdout or r.stderr or "").strip().split("\n")[0]
             return out[:220] if out else "?"
-        r = subprocess.run(
-            list(cmd),
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-        if r.stdout:
-            return r.stdout.strip().split("\n")[0].strip()[:220]
+        if not cmd:
+            return f"({origin})"
+        return _probe_single(cmd)
     except (OSError, subprocess.TimeoutExpired):
         pass
     return "?"
@@ -253,10 +324,10 @@ def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
         line = line.strip()
         if not line:
             continue
-        parts = line.split("|", 2)
+        parts = line.split(EMIT_SEP, 3)
         if len(parts) < 3:
             continue
-        kind, name, _ = parts[0], parts[1], parts[2]
+        kind, name = parts[0], parts[1]
         if kind == "skip":
             continue
         if kind == "known":
@@ -300,7 +371,6 @@ def suggest_config(cache_path: str, cfg: dict) -> None:
     print()
 
 
-# Path for the unknown tools log (persistent across runs)
 UNKNOWN_LOG_DEFAULT = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "update-all-clis",
@@ -309,11 +379,6 @@ UNKNOWN_LOG_DEFAULT = os.path.join(
 
 
 def log_unknowns(cache_path: str, cfg: dict, unknown_log_path: str) -> None:
-    """Scan cache for tools with no update path and persist them to a log file.
-
-    Each tool is tracked by name with first_seen, last_seen, and times_seen
-    counters so users can spot recurring unknown tools across runs.
-    """
     with open(cache_path, encoding="utf-8") as f:
         data = json.load(f)
     tools = [t for t in data if "name" in t]
@@ -370,7 +435,6 @@ def log_unknowns(cache_path: str, cfg: dict, unknown_log_path: str) -> None:
 
 
 def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
-    """Print a report of unknown (no update path) tools from the persistent log."""
     if not os.path.isfile(unknown_log_path):
         print("No unknown tools log found.", file=sys.stderr)
         return
@@ -408,7 +472,6 @@ def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
 
 
 def ack_unknown(unknown_log_path: str, name: str) -> None:
-    """Mark a tool as acknowledged so it no longer appears in reports."""
     if not os.path.isfile(unknown_log_path):
         print(f"No unknown tools log found at {unknown_log_path}.", file=sys.stderr)
         sys.exit(1)
@@ -425,7 +488,6 @@ def ack_unknown(unknown_log_path: str, name: str) -> None:
 
 
 def format_run_summary(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> str:
-    """Plain-text summary of a run (known tools + bulk env lines, before → after)."""
     lines_out: list[str] = [
         "update-all-clis",
         f"Steps: {ok} ok, {fail} failed",
@@ -465,8 +527,6 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
         body = body[:947] + "\n…"
     fd, path = tempfile.mkstemp(suffix=".txt", text=True)
     try:
-        # AppleScript "read … as Unicode text" expects UTF-16; UTF-8 bytes
-        # mis-decode as CJK mojibake in the dialog.
         with os.fdopen(fd, "w", encoding="utf-16") as f:
             f.write(body)
         path_esc = path.replace("\\", "\\\\").replace('"', '\\"')
@@ -492,11 +552,37 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
             pass
 
 
+def notify_linux(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
+    if sys.platform == "linux" and shutil.which("notify-send"):
+        body = format_run_summary(before, after, ok, fail).rstrip("\n")
+        if len(body) > 500:
+            body = body[:497] + "…"
+        subprocess.run(
+            [
+                "notify-send",
+                "update-all-clis",
+                body,
+            ],
+            check=False,
+            timeout=10,
+        )
+
+
+def notify_diff(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
+    notify_macos_dialog(before, after, ok, fail)
+    notify_linux(before, after, ok, fail)
+
+
+def _load_json(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "usage: lib_update_all_clis.py emit|list-json|snapshot-versions|notify-diff|"
-            "run-summary|suggest|log-unknowns|report-unknown|ack-unknown …",
+            "usage: lib_update_all_clis.py emit|emit-json|list-json|snapshot-versions|"
+            "notify-diff|run-summary|suggest|log-unknowns|report-unknown|ack-unknown …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -513,6 +599,18 @@ def main() -> None:
             os.environ.get("ONLY_ORIGINS"),
             os.environ.get("SKIP_ORIGINS"),
         )
+    elif cmd == "emit-json":
+        cache_path = sys.argv[2]
+        base = os.environ.get("CONFIG_FILE", "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        emit_plan_json(
+            cache_path,
+            cfg,
+            os.environ.get("ONLY_ORIGINS"),
+            os.environ.get("SKIP_ORIGINS"),
+        )
     elif cmd == "list-json":
         cache_path = sys.argv[2]
         list_json(cache_path)
@@ -522,12 +620,12 @@ def main() -> None:
             snap = snapshot_versions(f.read().splitlines())
         print(json.dumps(snap))
     elif cmd == "notify-diff":
-        before = json.load(open(sys.argv[2], encoding="utf-8"))
-        after = json.load(open(sys.argv[3], encoding="utf-8"))
-        notify_macos_dialog(before, after, int(sys.argv[4]), int(sys.argv[5]))
+        before = _load_json(sys.argv[2])
+        after = _load_json(sys.argv[3])
+        notify_diff(before, after, int(sys.argv[4]), int(sys.argv[5]))
     elif cmd == "run-summary":
-        before = json.load(open(sys.argv[2], encoding="utf-8"))
-        after = json.load(open(sys.argv[3], encoding="utf-8"))
+        before = _load_json(sys.argv[2])
+        after = _load_json(sys.argv[3])
         sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5])))
     elif cmd == "suggest":
         cache_path = sys.argv[2]

@@ -51,9 +51,20 @@ fi
 
 SUBJECT="${UPDATE_ALL_CLIS_EMAIL_SUBJECT:-update-all-clis $(date -u +%Y-%m-%d)}"
 
+# Avoid oversized CLI arguments (Agent Mail / shell limits).
+MAX_EMAIL_BYTES="${UPDATE_ALL_CLIS_EMAIL_MAX_BYTES:-100000}"
+BODY_FILE="$(mktemp)"
+trap 'rm -f "$BODY_FILE"' EXIT
+if [[ "$(wc -c < "$SUMMARY_FILE")" -gt "$MAX_EMAIL_BYTES" ]]; then
+  head -c "$MAX_EMAIL_BYTES" "$SUMMARY_FILE" > "$BODY_FILE"
+  printf '\n\n[truncated — full log on disk: %s]\n' "$SUMMARY_FILE" >> "$BODY_FILE"
+else
+  cp "$SUMMARY_FILE" "$BODY_FILE"
+fi
+
 # shellcheck disable=SC2016
 agentmail inboxes:messages send \
   --inbox-id "$INBOX_ID" \
   --to "$TO_ADDR" \
   --subject "$SUBJECT" \
-  --text "$(cat "$SUMMARY_FILE")"
+  --text "$(cat "$BODY_FILE")"

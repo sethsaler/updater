@@ -211,6 +211,11 @@ python3 lib_update_all_clis.py suggest ~/.config/update-all-clis/cache.json
 
 ## CLI version status
 
+See [`CLI_LAST_UPDATED.md`](CLI_LAST_UPDATED.md) for per-tool versions (regenerate with `python3 scripts/generate_cli_report.py`).
+
+<details>
+<summary>Legacy inline table (may be stale)</summary>
+
 | CLI | Last Modified | Version |
 |-----|---------------|---------|
 | agent | 2026-05-09 15:34:16 | 2026.05.09-0afadcc |

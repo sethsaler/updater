@@ -221,20 +221,72 @@ setup_launchd() {
   info "  launchctl remove  $plist_dst   # remove entirely"
 }
 
+setup_systemd() {
+  local script_path="$INSTALL_DIR/update_all_clis.sh"
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  local service_file="$unit_dir/update-all-clis.service"
+  local timer_file="$unit_dir/update-all-clis.timer"
+
+  mkdir -p "$LOG_DIR"
+  mkdir -p "$unit_dir"
+
+  cat > "$service_file" << EOF
+[Unit]
+Description=update-all-clis — update installed CLIs and package managers
+
+[Service]
+Type=oneshot
+Environment=UPDATE_ALL_CLIS_NO_NOTIFY=1
+Environment=UPDATE_ALL_CLIS_SUMMARY_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/last-run-summary.txt
+ExecStart=${script_path}
+StandardOutput=append:${LOG_DIR}/update-all-clis.log
+StandardError=append:${LOG_DIR}/update-all-clis.err
+
+[Install]
+WantedBy=default.target
+EOF
+
+  cat > "$timer_file" << EOF
+[Unit]
+Description=Daily update-all-clis run at 8:00 AM
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now update-all-clis.timer 2>/dev/null || true
+    info "systemd user timer installed (daily 8:00 AM)."
+    info "  systemctl --user status update-all-clis.timer"
+    info "  journalctl --user -u update-all-clis.service"
+  else
+    warn "systemctl not found — unit files written to $unit_dir"
+    warn "Enable with: systemctl --user enable --now update-all-clis.timer"
+  fi
+}
+
 usage() {
-  echo "Usage: $0 [--launchd] [--dir <path>]"
+  echo "Usage: $0 [--launchd] [--systemd] [--dir <path>]"
   echo ""
   echo "  --launchd    Set up a macOS LaunchAgent (interactive)"
+  echo "  --systemd    Set up a Linux systemd user timer (daily 8:00 AM)"
   echo "  --dir <path> Install to a custom directory"
   exit 1
 }
 
 main() {
   local do_launchd=false
+  local do_systemd=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --launchd|-l) do_launchd=true; shift ;;
+      --systemd|-s) do_systemd=true; shift ;;
       --dir) INSTALL_DIR="$2"; shift 2 ;;
       --help|-h) usage ;;
       *)
@@ -249,13 +301,24 @@ main() {
   if $do_launchd; then
     if [[ "$(uname)" != "Darwin" ]]; then
       warn "LaunchAgent is macOS-only. skipping."
-      return 0
+    else
+      setup_launchd
     fi
-    setup_launchd
-  else
+  fi
+
+  if $do_systemd; then
+    if [[ "$(uname)" != "Linux" ]]; then
+      warn "systemd timer is Linux-only. skipping."
+    else
+      setup_systemd
+    fi
+  fi
+
+  if ! $do_launchd && ! $do_systemd; then
     echo ""
-    echo "To also set up the LaunchAgent, run:"
-    echo "  ./install.sh --launchd"
+    echo "To schedule automatic runs:"
+    echo "  macOS:  ./install.sh --launchd"
+    echo "  Linux:  ./install.sh --systemd"
   fi
 }
 

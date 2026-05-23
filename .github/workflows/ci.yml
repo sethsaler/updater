@@ -23,5 +23,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fixture smoke test
+      - name: Fixture smoke test and unit tests
         run: bash scripts/ci_fixture.sh
+
+  config-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tool_config.json against schema
+        run: |
+          python3 -c "
+          import json
+          with open('tool_config.json') as f:
+              cfg = json.load(f)
+          with open('tool_config.schema.json') as f:
+              schema = json.load(f)
+          assert set(schema['required']).issubset(cfg.keys())
+          assert isinstance(cfg['known'], dict)
+          assert isinstance(cfg['bulk'], dict)
+          for section in ('known', 'bulk'):
+              for k, v in cfg[section].items():
+                  assert isinstance(v, str), f'{section}.{k} must be string'
+          print('config schema: ok')
+          "
