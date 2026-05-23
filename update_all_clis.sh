@@ -16,10 +16,11 @@
 #   --ack-unknown=X   Dismiss a tool from the unknown report
 #   --trace           Trace shell commands (bash -x)
 #   --dry-run         Show commands without running
+#   --json-plan       Print planned updates as JSON and exit
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.4.0"
+UAC_VERSION="0.5.0"
 
 set -uo pipefail
 
@@ -31,6 +32,7 @@ CONFIG_LOCAL_FILE="${CONFIG_LOCAL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update
 CACHE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/cache.json"
 LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
 UNKNOWN_LOG_FILE="${UNKNOWN_LOG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/unknown_tools.json}"
+LOCK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/locks"
 
 CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-24}"
 CACHE_TTL_SECONDS=$((CACHE_TTL_HOURS * 3600))
@@ -44,6 +46,7 @@ QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=1
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""
+JSON_PLAN=""
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -87,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     --trace)           TRACE=1; shift ;;
     --scan-path)       SCAN_PATH=1; shift ;;
     --no-scan-path)    NO_SCAN_PATH=1; shift ;;
+    --json-plan)       JSON_PLAN=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -113,11 +117,10 @@ if [[ "$PARALLEL_JOBS" == "0" ]]; then
 fi
 
 # -------------------------------------------------------------------
-# macOS: show summary dialog only for manual (TTY) runs unless overridden.
-# Scheduled LaunchAgent sets UPDATE_ALL_CLIS_NO_NOTIFY=1 in the plist.
+# Desktop summary for manual (TTY) runs unless overridden.
+# Scheduled LaunchAgent/systemd set UPDATE_ALL_CLIS_NO_NOTIFY=1.
 # -------------------------------------------------------------------
 _want_notify_popup() {
-  [[ "$(uname)" != "Darwin" ]] && return 1
   [[ "${UPDATE_ALL_CLIS_NO_NOTIFY:-}" == "1" ]] && return 1
   case "${UPDATE_ALL_CLIS_NOTIFY:-}" in
     1) return 0 ;;
@@ -223,13 +226,41 @@ except Exception:
     fi
   fi
 
-  if [[ "$(uname)" == "Darwin" ]]; then
+  local go_bin_dir=""
+  if command -v brew >/dev/null 2>&1; then
     local brew_prefix
     brew_prefix=$(brew --prefix 2>/dev/null || true)
     if [[ -n "$brew_prefix" ]] && [[ -d "$brew_prefix/opt" ]]; then
       scan_tree "$brew_prefix/opt" "brew"
     fi
-    [[ -d "/opt/homebrew/bin" ]] && scan_dir "/opt/homebrew/bin" "brew"
+  fi
+  [[ -d "/opt/homebrew/bin" ]] && scan_dir "/opt/homebrew/bin" "brew"
+  [[ -d "/home/linuxbrew/.linuxbrew/bin" ]] && scan_dir "/home/linuxbrew/.linuxbrew/bin" "brew"
+
+  if command -v go >/dev/null 2>&1; then
+    go_bin_dir="$(go env GOPATH 2>/dev/null)/bin"
+    [[ -d "$go_bin_dir" ]] && scan_dir "$go_bin_dir" "go"
+  fi
+  [[ -n "${GOBIN:-}" && -d "$GOBIN" ]] && scan_dir "$GOBIN" "go"
+  [[ -d "$HOME/go/bin" ]] && scan_dir "$HOME/go/bin" "go"
+
+  local conda_base
+  for conda_base in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/mambaforge" "$HOME/miniforge3" "$HOME/micromamba"; do
+    [[ -d "$conda_base/bin" ]] && scan_dir "$conda_base/bin" "conda"
+  done
+
+  if [[ -d "$HOME/.nvm/versions/node" ]]; then
+    local nvm_bin
+    for nvm_bin in "$HOME/.nvm/versions/node"/*/bin; do
+      [[ -d "$nvm_bin" ]] && scan_dir "$nvm_bin" "npm"
+    done
+  fi
+
+  if [[ -d "$HOME/.local/pipx/venvs" ]]; then
+    local pipx_bin
+    for pipx_bin in "$HOME/.local/pipx/venvs"/*/bin; do
+      [[ -d "$pipx_bin" ]] && scan_dir "$pipx_bin" "pipx"
+    done
   fi
 
   local gem_home
@@ -297,7 +328,9 @@ except Exception:
 
   if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
     local pdir
-    local -a _already_scanned=( "$HOME/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/.bun/install/cache/bin" "$HOME/.rbenv/shims" "$HOME/.pyenv/shims" "$HOME/.opencode/bin" "$HOME/.grok/bin" "/opt/homebrew/bin" "/usr/local/bin" )
+    local -a _already_scanned=( "$HOME/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/.bun/install/cache/bin" "$HOME/.rbenv/shims" "$HOME/.pyenv/shims" "$HOME/.opencode/bin" "$HOME/.grok/bin" "/opt/homebrew/bin" "/home/linuxbrew/.linuxbrew/bin" "/usr/local/bin" "$HOME/go/bin" )
+    [[ -n "${go_bin_dir:-}" ]] && _already_scanned+=( "$go_bin_dir" )
+    [[ -n "${GOBIN:-}" ]] && _already_scanned+=( "$GOBIN" )
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue
@@ -409,10 +442,20 @@ run_update() {
 # -------------------------------------------------------------------
 # Run emit lines (skip lines do not count toward ok/fail)
 # -------------------------------------------------------------------
-_run_one_emit_line() {
+_parse_emit_line() {
   local line="$1"
-  local cmd_type name cmd
-  IFS='|' read -r cmd_type name cmd <<< "$line"
+  local rest="${line#*$'\x1e'}"
+  EMIT_NAME="${rest%%$'\x1e'*}"
+  rest="${rest#*$'\x1e'}"
+  EMIT_CMD="${rest%%$'\x1e'*}"
+  EMIT_LOCK="${rest#*$'\x1e'}"
+  EMIT_TYPE="${line%%$'\x1e'*}"
+}
+
+_run_one_emit_line_core() {
+  local cmd_type="$1"
+  local name="$2"
+  local cmd="$3"
   case "$cmd_type" in
     skip) return 3 ;;
     bulk)
@@ -428,6 +471,23 @@ _run_one_emit_line() {
       run_update "$name" "$cmd"
       ;;
   esac
+}
+
+_run_one_emit_line() {
+  local line="$1"
+  local cmd_type name cmd lock_group
+  _parse_emit_line "$line"
+  cmd_type="$EMIT_TYPE"
+  name="$EMIT_NAME"
+  cmd="$EMIT_CMD"
+  lock_group="${EMIT_LOCK:-$name}"
+
+  if (( PARALLEL_JOBS >= 2 )) && [[ "$cmd_type" != "skip" ]] && [[ -n "$lock_group" ]]; then
+    mkdir -p "$LOCK_DIR"
+    { flock -x 200; _run_one_emit_line_core "$cmd_type" "$name" "$cmd"; } 200>"$LOCK_DIR/${lock_group}.lock"
+  else
+    _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
+  fi
 }
 
 run_updates_sequential() {
@@ -496,8 +556,8 @@ main() {
   UPDATE_OK=0
   UPDATE_FAIL=0
 
-  # Machine-readable list must be the only thing on stdout
-  [[ -n "$LIST_JSON" ]] && QUIET=1
+  # Machine-readable output must be the only thing on stdout
+  [[ -n "$LIST_JSON" || -n "$JSON_PLAN" ]] && QUIET=1
 
   mkdir -p "$(dirname "$CACHE_FILE")"
   mkdir -p "$(dirname "$UNKNOWN_LOG_FILE")"
@@ -513,6 +573,16 @@ main() {
 
   if [[ -n "$ACK_UNKNOWN" ]]; then
     python3 "$LIB_SCRIPT" ack-unknown "$UNKNOWN_LOG_FILE" "$ACK_UNKNOWN"
+    exit 0
+  fi
+
+  if [[ -n "$JSON_PLAN" ]]; then
+    ensure_cache
+    export CONFIG_FILE
+    export CONFIG_LOCAL_FILE
+    export ONLY_ORIGINS
+    export SKIP_ORIGINS
+    python3 "$LIB_SCRIPT" emit-json "$CACHE_FILE"
     exit 0
   fi
 

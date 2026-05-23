@@ -2,43 +2,30 @@
 """Generate CLI_LAST_UPDATED.md — last-modified time + version for every known CLI."""
 import json
 import os
-import shutil
-import subprocess
+import sys
 from datetime import datetime
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+
+from lib_update_all_clis import probe_version  # noqa: E402
+
 CONFIG_PATH = os.path.join(REPO_ROOT, "tool_config.json")
 OUTPUT_PATH = os.path.join(REPO_ROOT, "CLI_LAST_UPDATED.md")
 
-with open(CONFIG_PATH) as f:
+with open(CONFIG_PATH, encoding="utf-8") as f:
     cfg = json.load(f)
 
 rows = []
 for name in sorted(cfg["known"].keys()):
-    path = shutil.which(name)
+    path = __import__("shutil").which(name)
     if not path:
         rows.append((name, "not installed", ""))
         continue
 
     mtime = os.path.getmtime(path)
     mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-
-    ver = "?"
-    for args in ((name, "--version"), (name, "-V"), (name, "version")):
-        try:
-            r = subprocess.run(
-                list(args),
-                capture_output=True,
-                text=True,
-                timeout=15,
-                env={**os.environ, "LC_ALL": "C"},
-            )
-            if r.stdout:
-                ver = r.stdout.strip().split("\n")[0].strip()[:120]
-                break
-        except Exception:
-            pass
-
+    ver = probe_version(name)
     rows.append((name, mtime_str, ver))
 
 lines = [
@@ -52,7 +39,7 @@ for name, mtime, ver in rows:
     lines.append(f"| {name} | {mtime} | {ver} |")
 lines.append("")
 
-with open(OUTPUT_PATH, "w") as f:
+with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
     f.write("\n".join(lines))
 
 print(f"Written: {OUTPUT_PATH}")

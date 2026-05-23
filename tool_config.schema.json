@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sethsaler/updater/tool_config.schema.json",
+  "title": "update-all-clis tool configuration",
+  "type": "object",
+  "required": ["known", "bulk"],
+  "additionalProperties": false,
+  "properties": {
+    "known": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "description": "Shell command to update this tool"
+      }
+    },
+    "bulk": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "description": "Shell command to update all tools from this origin"
+      }
+    }
+  }
+}
