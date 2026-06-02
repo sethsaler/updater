@@ -39,6 +39,11 @@ CACHE_TTL_SECONDS=$((CACHE_TTL_HOURS * 3600))
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
+# Color output configuration
+if [[ -n "${NO_COLOR:-}" ]] || [[ "${TERM:-}" == "dumb" ]]; then
+  GREEN='' YELLOW='' BLUE='' BOLD='' NC=''
+fi
+
 SKIP="${SKIP:-}"
 ONLY_ORIGINS="${ONLY_ORIGINS:-}"
 SKIP_ORIGINS="${SKIP_ORIGINS:-}"
@@ -46,7 +51,7 @@ QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=1
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""
-JSON_PLAN=""
+JSON_PLAN=""; VERBOSE=""
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -55,6 +60,7 @@ log()   { [[ -z "$QUIET" ]] && echo -e "$@"; }
 info()  { log "${BOLD}==>${NC} $*"; }
 ok()    { log "${GREEN}✓${NC} $*"; }
 warn()  { log "${YELLOW}!!${NC} $*"; }
+debug() { [[ -n "$VERBOSE" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2; }
 
 is_skipped() {
   [[ -z "$SKIP" ]] && return 1
@@ -91,6 +97,9 @@ while [[ $# -gt 0 ]]; do
     --scan-path)       SCAN_PATH=1; shift ;;
     --no-scan-path)    NO_SCAN_PATH=1; shift ;;
     --json-plan)       JSON_PLAN=1; shift ;;
+    --verbose|-v)      VERBOSE=1; shift ;;
+    --no-color)        export NO_COLOR=1; GREEN='' YELLOW='' BLUE='' BOLD='' NC=''; shift ;;
+    --health-check)    HEALTH_CHECK=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -130,14 +139,15 @@ _want_notify_popup() {
 }
 
 # -------------------------------------------------------------------
-# Glob-based directory scanner — pure bash, accumulates into TOOLS_RAW
+# Glob-based directory scanner — pure bash, accumulates into TOOLS_ARRAY
 # -------------------------------------------------------------------
-TOOLS_RAW=""
+declare -a TOOLS_ARRAY=()
 
 scan_dir() {
   local dir="$1"; local origin="$2"
   [[ -d "$dir" ]] && [[ -r "$dir" ]] || return 0
 
+  debug "Scanning directory: $dir (origin: $origin)"
   local bin
   for bin in "$dir"/*; do
     [[ -f "$bin" && -x "$bin" ]] || continue
@@ -150,7 +160,7 @@ scan_dir() {
       corepack|corepack.exe|yarn|yarn.js|pnpm|pnpm.js|git|git-*) continue ;;
     esac
 
-    TOOLS_RAW="${TOOLS_RAW}${name}|${origin}"$'\n'
+    TOOLS_ARRAY+=("${name}|${origin}")
   done
 }
 
@@ -167,7 +177,8 @@ scan_tree() {
 # Full filesystem scan
 # -------------------------------------------------------------------
 full_scan() {
-  TOOLS_RAW=""
+  TOOLS_ARRAY=()
+  debug "Starting full filesystem scan"
 
   scan_dir "$HOME/.local/bin"                  "uv/pip"
   scan_dir "$HOME/.cargo/bin"                  "cargo"
@@ -176,8 +187,14 @@ full_scan() {
   scan_dir "$HOME/.rbenv/shims"               "rbenv"
   scan_dir "$HOME/.pyenv/shims"               "pyenv"
 
-  local npm_prefix
-  npm_prefix=$(npm config get prefix 2>/dev/null || true)
+  # Combine npm calls into single subprocess for efficiency
+  local npm_info
+  npm_info=$(npm config get prefix 2>/dev/null; npm root -g 2>/dev/null; npm ls -g --depth=0 --json 2>/dev/null || true)
+  local npm_prefix npm_root npm_globals
+  npm_prefix=$(echo "$npm_info" | head -1)
+  npm_root=$(echo "$npm_info" | head -2 | tail -1)
+  npm_globals=$(echo "$npm_info" | tail -n +3)
+
   if [[ -n "$npm_prefix" ]] && [[ -d "$npm_prefix/lib/node_modules/.bin" ]]; then
     scan_dir "$npm_prefix/lib/node_modules/.bin" "npm"
   fi
@@ -185,8 +202,6 @@ full_scan() {
     scan_dir "$HOME/.npm-global/lib/node_modules/.bin" "npm"
   fi
 
-  local npm_root
-  npm_root=$(npm root -g 2>/dev/null || true)
   if [[ -n "$npm_root" ]] && [[ -d "$npm_root/.bin" ]]; then
     local _npm_bin_dir="$npm_root/.bin"
     local _prefix_bin_dir=""
@@ -196,22 +211,9 @@ full_scan() {
     fi
   fi
 
-  local npm_globals
-  npm_globals=$(npm ls -g --depth=0 --json 2>/dev/null || true)
   if [[ -n "$npm_globals" ]]; then
     local npm_global_dir
-    npm_global_dir=$(echo "$npm_globals" | python3 -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    deps = data.get('dependencies', {})
-    for name, info in deps.items():
-        rp = info.get('resolved', info.get('path', ''))
-        if rp:
-            print(rp, end='|')
-except Exception:
-    pass
-" 2>/dev/null)
+    npm_global_dir=$(echo "$npm_globals" | python3 "$LIB_SCRIPT" parse-npm-globals 2>/dev/null)
     if [[ -n "$npm_global_dir" ]]; then
       IFS='|' read -ra pkg_dirs <<< "$npm_global_dir"
       for pkg_dir in "${pkg_dirs[@]}"; do
@@ -276,7 +278,7 @@ except Exception:
       local name
       name="$(basename "$cand")"
       [[ "$name" != .* ]] || continue
-      TOOLS_RAW="${TOOLS_RAW}${name}|sdkman"$'\n'
+      TOOLS_ARRAY+=("${name}|sdkman")
     done
   fi
 
@@ -324,13 +326,26 @@ except Exception:
   [[ -d "$HOME/.wasmtime/bin" ]] && scan_dir "$HOME/.wasmtime/bin" "manual"
   [[ -d "$HOME/.wasmer/bin" ]] && scan_dir "$HOME/.wasmer/bin" "manual"
 
-  [[ -d "$HOME/.fnm" ]] && TOOLS_RAW="${TOOLS_RAW}fnm|fnm"$'\n'
+  [[ -d "$HOME/.fnm" ]] && TOOLS_ARRAY+=("fnm|fnm")
 
   if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
     local pdir
-    local -a _already_scanned=( "$HOME/bin" "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.deno/bin" "$HOME/.bun/install/cache/bin" "$HOME/.rbenv/shims" "$HOME/.pyenv/shims" "$HOME/.opencode/bin" "$HOME/.grok/bin" "/opt/homebrew/bin" "/home/linuxbrew/.linuxbrew/bin" "/usr/local/bin" "$HOME/go/bin" )
-    [[ -n "${go_bin_dir:-}" ]] && _already_scanned+=( "$go_bin_dir" )
-    [[ -n "${GOBIN:-}" ]] && _already_scanned+=( "$GOBIN" )
+    declare -A _already_scanned
+    _already_scanned["$HOME/bin"]=1
+    _already_scanned["$HOME/.local/bin"]=1
+    _already_scanned["$HOME/.cargo/bin"]=1
+    _already_scanned["$HOME/.deno/bin"]=1
+    _already_scanned["$HOME/.bun/install/cache/bin"]=1
+    _already_scanned["$HOME/.rbenv/shims"]=1
+    _already_scanned["$HOME/.pyenv/shims"]=1
+    _already_scanned["$HOME/.opencode/bin"]=1
+    _already_scanned["$HOME/.grok/bin"]=1
+    _already_scanned["/opt/homebrew/bin"]=1
+    _already_scanned["/home/linuxbrew/.linuxbrew/bin"]=1
+    _already_scanned["/usr/local/bin"]=1
+    _already_scanned["$HOME/go/bin"]=1
+    [[ -n "${go_bin_dir:-}" ]] && _already_scanned["$go_bin_dir"]=1
+    [[ -n "${GOBIN:-}" ]] && _already_scanned["$GOBIN"]=1
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue
@@ -338,11 +353,7 @@ except Exception:
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
       esac
-      local _skip=0
-      for _scanned in "${_already_scanned[@]}"; do
-        [[ "$pdir" == "$_scanned" ]] && { _skip=1; break; }
-      done
-      [[ $_skip -eq 1 ]] && continue
+      [[ -n "${_already_scanned[$pdir]:-}" ]] && continue
       scan_dir "$pdir" "path"
     done
   fi
@@ -354,20 +365,11 @@ except Exception:
   mkdir -p "$(dirname "$CACHE_FILE")"
   mkdir -p "$LOG_DIR"
 
-  echo "$TOOLS_RAW" | grep -v '^$' | sort -u | python3 -c "
-import sys, json
-lines = [l.strip() for l in sys.stdin if '|' in l]
-tools = []
-for line in lines:
-    parts = line.split('|', 1)
-    if len(parts) == 2:
-        tools.append({'name': parts[0], 'origin': parts[1]})
-tools.append({'scanned_at': '$scanned_at', 'count': len(tools)})
-with open('$tmpfile', 'w') as f:
-    json.dump(tools, f, indent=2)
-" 2>/dev/null
+  debug "Converting ${#TOOLS_ARRAY[@]} tools to JSON format"
+  printf '%s\n' "${TOOLS_ARRAY[@]}" | sort -u | python3 "$LIB_SCRIPT" convert-tools-array "$scanned_at" > "$tmpfile" 2>/dev/null
 
   mv "$tmpfile" "$CACHE_FILE"
+  debug "Cache written to: $CACHE_FILE"
 }
 
 # -------------------------------------------------------------------
@@ -388,6 +390,7 @@ ensure_cache() {
   local cache_age=99999
   if [[ -f "$CACHE_FILE" ]]; then
     local modified
+    # Use single stat call with cross-platform syntax
     if [[ "$(uname)" == "Darwin" ]]; then
       modified=$(stat -f "%m" "$CACHE_FILE" 2>/dev/null)
     else
@@ -514,14 +517,22 @@ run_updates_parallel() {
   for line in "$@"; do
     [[ -z "$line" ]] && continue
     while (( ${#pids[@]} >= max )); do
-      wait "${pids[0]}"
+      wait -n 2>/dev/null
       ec=$?
       case "$ec" in
         0) ((UPDATE_OK++)) || true ;;
         3) ;;
+        127) ;;  # wait -n not supported, fall back to wait
         *) ((UPDATE_FAIL++)) || true ;;
       esac
-      pids=("${pids[@]:1}")
+      # Remove completed PID from array
+      local new_pids=()
+      for pid in "${pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+          new_pids+=("$pid")
+        fi
+      done
+      pids=("${new_pids[@]}")
     done
     (
       SUPPRESS_TRACE=1
@@ -544,6 +555,12 @@ run_updates_parallel() {
 # Main
 # -------------------------------------------------------------------
 main() {
+  # Cleanup trap for lock files
+  cleanup_locks() {
+    [[ -d "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+  }
+  trap cleanup_locks EXIT INT TERM
+
   if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Missing config: $CONFIG_FILE" >&2
     exit 1
@@ -565,6 +582,11 @@ main() {
 
   log "${BOLD}update-all-clis${NC} — dynamic discovery and update"
   log ""
+
+  if [[ -n "$HEALTH_CHECK" ]]; then
+    python3 "$LIB_SCRIPT" health-check
+    exit $?
+  fi
 
   if [[ -n "$REPORT_UNKNOWN" ]]; then
     python3 "$LIB_SCRIPT" report-unknown "$UNKNOWN_LOG_FILE"

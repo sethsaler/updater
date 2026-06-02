@@ -3,37 +3,92 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from typing import Any, Optional
 
 _UV_ORIGINS = frozenset({"uv", "uv/pip", "uv/venv"})
 EMIT_SEP = "\x1e"
+DEBUG = os.environ.get("UAC_DEBUG", "0") == "1"
+RATE_LIMIT_DELAY = float(os.environ.get("UAC_RATE_LIMIT_DELAY", "0.1"))
+
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.WARNING,
+    format="%(levelname)s: %(message)s" if DEBUG else "%(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
-def load_merge(base_path: str, local_path: Optional[str]) -> dict:
-    with open(base_path, encoding="utf-8") as f:
-        base = json.load(f)
+class RateLimiter:
+    """Simple rate limiter for subprocess calls."""
+    def __init__(self, delay: float = 0.1):
+        self.delay = delay
+        self.last_call = 0
+    
+    def acquire(self):
+        """Wait if necessary to respect rate limit."""
+        if self.delay > 0:
+            elapsed = time.time() - self.last_call
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+        self.last_call = time.time()
+
+
+# Global rate limiter instance
+_rate_limiter = RateLimiter(RATE_LIMIT_DELAY)
+
+
+def load_merge(base_path: str, local_path: Optional[str]) -> dict[str, Any]:
+    logger.debug(f"Loading base config from: {base_path}")
+    try:
+        with open(base_path, encoding="utf-8") as f:
+            base = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Base config file not found: {base_path}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in base config file {base_path}: {e}")
+    
     if local_path and os.path.isfile(local_path):
-        with open(local_path, encoding="utf-8") as f:
-            loc = json.load(f)
+        logger.debug(f"Merging local config from: {local_path}")
+        try:
+            with open(local_path, encoding="utf-8") as f:
+                loc = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in local config file {local_path}: {e}")
         for key in ("known", "bulk"):
             if key in loc and isinstance(loc[key], dict):
                 base.setdefault(key, {})
                 base[key].update(loc[key])
+                logger.debug(f"Merged {len(loc[key])} entries from local config {key}")
     return base
 
 
-def validate(cfg: dict) -> None:
+def validate(cfg: dict[str, Any]) -> None:
+    """Validate config structure using schema-like validation."""
+    # Check required top-level keys
     if not isinstance(cfg.get("known"), dict) or not isinstance(cfg.get("bulk"), dict):
         raise ValueError("config must contain 'known' and 'bulk' objects")
-    for section in ("known", "bulk"):
-        for k, v in cfg[section].items():
-            if not isinstance(v, str):
-                raise ValueError(f"{section}.{k!r} must be a string command")
+    
+    # Validate known section
+    for k, v in cfg["known"].items():
+        if not isinstance(k, str) or not k:
+            raise ValueError(f"known key must be a non-empty string, got {k!r}")
+        if not isinstance(v, str):
+            raise ValueError(f"known.{k!r} must be a string command")
+    
+    # Validate bulk section
+    for k, v in cfg["bulk"].items():
+        if not isinstance(k, str) or not k:
+            raise ValueError(f"bulk key must be a non-empty string, got {k!r}")
+        if not isinstance(v, str):
+            raise ValueError(f"bulk.{k!r} must be a string command")
 
 
 def _parse_csv(s: Optional[str]) -> set[str]:
@@ -93,15 +148,23 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
 
 def collect_emit_lines(
     cache_path: str,
-    cfg: dict,
+    cfg: dict[str, Any],
     only_origins: Optional[str],
     skip_origins: Optional[str],
 ) -> list[str]:
     only = _parse_csv(only_origins)
     skip = _parse_csv(skip_origins)
 
-    with open(cache_path, encoding="utf-8") as f:
-        data = json.load(f)
+    logger.debug(f"Loading cache from: {cache_path}")
+    logger.debug(f"Only origins: {only}, Skip origins: {skip}")
+
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Cache file not found: {cache_path}. Run discovery scan first.")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in cache file {cache_path}: {e}")
 
     tools = [t for t in data if "name" in t]
     self_cmd = cfg["known"]
@@ -110,6 +173,8 @@ def collect_emit_lines(
     seen_names: set[str] = set()
     seen_bulk: set[str] = set()
     lines: list[str] = []
+
+    logger.debug(f"Processing {len(tools)} tools from cache")
 
     def origin_allowed_for_known(origin: str, name: str) -> bool:
         if not only:
@@ -131,12 +196,14 @@ def collect_emit_lines(
         name = t["name"]
         origin = t.get("origin", "?")
 
+        # Skip if already processed
+        if name in seen_names:
+            continue
+
+        # Handle known tools
         if name in known_names:
-            if name in seen_names:
-                continue
-            if origin in skip:
-                continue
-            if not origin_allowed_for_known(origin, name):
+            if origin in skip or not origin_allowed_for_known(origin, name):
+                seen_names.add(name)
                 continue
             cmd = self_cmd[name]
             if not cmd or not cmd.strip():
@@ -147,15 +214,18 @@ def collect_emit_lines(
             seen_bulk.add(origin)
             continue
 
-        if name in seen_names:
-            continue
-
+        # Infer origin from symlink if possible
         inferred = _infer_origin_from_symlink(name, origin)
         if inferred:
             origin = inferred
 
-        if origin in bulk_origins and origin not in seen_bulk:
+        # Handle bulk origins
+        if origin in bulk_origins:
+            if origin in seen_bulk:
+                seen_names.add(name)
+                continue
             if not should_emit_bulk(origin):
+                seen_names.add(name)
                 continue
             cmd = bulk_origins[origin]
             if not cmd or not cmd.strip():
@@ -168,10 +238,7 @@ def collect_emit_lines(
             seen_names.add(name)
             continue
 
-        if origin in bulk_origins:
-            seen_names.add(name)
-            continue
-
+        # Skip unknown tools
         seen_names.add(name)
         lines.append(f"skip{EMIT_SEP}{name}{EMIT_SEP}{EMIT_SEP}")
 
@@ -180,7 +247,7 @@ def collect_emit_lines(
 
 def emit_lines(
     cache_path: str,
-    cfg: dict,
+    cfg: dict[str, Any],
     only_origins: Optional[str],
     skip_origins: Optional[str],
 ) -> None:
@@ -190,7 +257,7 @@ def emit_lines(
 
 def emit_plan_json(
     cache_path: str,
-    cfg: dict,
+    cfg: dict[str, Any],
     only_origins: Optional[str],
     skip_origins: Optional[str],
 ) -> None:
@@ -209,8 +276,14 @@ def emit_plan_json(
 
 
 def list_json(cache_path: str) -> None:
-    with open(cache_path, encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Cache file not found: {cache_path}. Run discovery scan first.")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in cache file {cache_path}: {e}")
+    
     tools = [t for t in data if "name" in t]
     meta = next((t for t in data if "scanned_at" in t), None)
     out = {
@@ -221,11 +294,13 @@ def list_json(cache_path: str) -> None:
     print(json.dumps(out, indent=2))
 
 
+@lru_cache(maxsize=512)
 def probe_version(name: str) -> str:
     """Best-effort version string for a CLI on PATH."""
     if not shutil.which(name):
         return "?"
     for args in ((name, "--version"), (name, "-V"), (name, "version")):
+        _rate_limiter.acquire()
         try:
             r = subprocess.run(
                 list(args),
@@ -317,9 +392,15 @@ def probe_bulk(origin: str) -> str:
 
 
 def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
+    logger.debug(f"Snapshotting versions for {len(lines)} lines")
     known: dict[str, str] = {}
     bulk: dict[str, str] = {}
     seen_bulk: set[str] = set()
+    
+    # Collect tasks for parallel execution
+    known_tasks: list[tuple[str, str]] = []
+    bulk_tasks: list[tuple[str, str]] = []
+    
     for line in lines:
         line = line.strip()
         if not line:
@@ -331,16 +412,52 @@ def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
         if kind == "skip":
             continue
         if kind == "known":
-            known[name] = probe_known(name)
+            known_tasks.append((name, "known"))
         elif kind == "bulk" and name not in seen_bulk:
             seen_bulk.add(name)
-            bulk[name] = probe_bulk(name)
+            bulk_tasks.append((name, "bulk"))
+    
+    # Probe versions in parallel with progress tracking
+    def probe_task(task: tuple[str, str]) -> tuple[str, str, str]:
+        name, kind = task
+        if kind == "known":
+            return name, "known", probe_known(name)
+        else:
+            return name, "bulk", probe_bulk(name)
+    
+    all_tasks = known_tasks + bulk_tasks
+    total_tasks = len(all_tasks)
+    completed = 0
+    
+    if DEBUG and total_tasks > 0:
+        logger.info(f"Probing versions for {total_tasks} tools...")
+    
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_task = {executor.submit(probe_task, task): task for task in all_tasks}
+        for future in as_completed(future_to_task):
+            completed += 1
+            if DEBUG and completed % 5 == 0:
+                logger.info(f"Progress: {completed}/{total_tasks} tools probed")
+            name, kind, version = future.result()
+            if kind == "known":
+                known[name] = version
+            else:
+                bulk[name] = version
+    
+    if DEBUG and total_tasks > 0:
+        logger.info(f"Completed probing {completed} tools")
+    
     return {"known": known, "bulk": bulk}
 
 
-def suggest_config(cache_path: str, cfg: dict) -> None:
-    with open(cache_path, encoding="utf-8") as f:
-        data = json.load(f)
+def suggest_config(cache_path: str, cfg: dict[str, Any]) -> None:
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Cache file not found: {cache_path}. Run discovery scan first.")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in cache file {cache_path}: {e}")
     tools = [t for t in data if "name" in t]
     self_cmd = cfg["known"]
     bulk_origins = cfg["bulk"]
@@ -378,7 +495,7 @@ UNKNOWN_LOG_DEFAULT = os.path.join(
 )
 
 
-def log_unknowns(cache_path: str, cfg: dict, unknown_log_path: str) -> None:
+def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) -> None:
     with open(cache_path, encoding="utf-8") as f:
         data = json.load(f)
     tools = [t for t in data if "name" in t]
@@ -578,16 +695,212 @@ def _load_json(path: str) -> dict[str, Any]:
         return json.load(f)
 
 
+def parse_npm_globals_json(json_input: str) -> str:
+    """Parse npm ls -g --json output and extract package directory paths."""
+    try:
+        data = json.loads(json_input)
+        deps = data.get('dependencies', {})
+        paths = []
+        for name, info in deps.items():
+            rp = info.get('resolved', info.get('path', ''))
+            if rp:
+                paths.append(rp)
+        return '|'.join(paths)
+    except Exception:
+        return ""
+
+
+def convert_tools_array_to_json(tools_input: str, scanned_at: str) -> str:
+    """Convert tools array format to JSON cache file."""
+    lines = [l.strip() for l in tools_input.split('\n') if '|' in l]
+    tools = []
+    for line in lines:
+        parts = line.split('|', 1)
+        if len(parts) == 2:
+            tools.append({'name': parts[0], 'origin': parts[1]})
+    tools.append({'scanned_at': scanned_at, 'count': len(tools)})
+    return json.dumps(tools, indent=2)
+
+
+def health_check() -> dict[str, Any]:
+    """Check availability of required tools and package managers."""
+    checks = {
+        "python3": {"available": shutil.which("python3") is not None, "required": True, "version": None},
+        "bash": {"available": shutil.which("bash") is not None, "required": True, "version": None},
+        "npm": {"available": shutil.which("npm") is not None, "required": False, "version": None},
+        "brew": {"available": shutil.which("brew") is not None, "required": False, "version": None},
+        "cargo": {"available": shutil.which("cargo") is not None, "required": False, "version": None},
+        "pip3": {"available": shutil.which("pip3") is not None, "required": False, "version": None},
+        "go": {"available": shutil.which("go") is not None, "required": False, "version": None},
+        "gem": {"available": shutil.which("gem") is not None, "required": False, "version": None},
+        "uv": {"available": shutil.which("uv") is not None, "required": False, "version": None},
+        "dotnet": {"available": shutil.which("dotnet") is not None, "required": False, "version": None},
+    }
+    
+    # Get versions for available tools
+    for name, info in checks.items():
+        if info["available"]:
+            try:
+                if name == "python3":
+                    checks[name]["version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                elif name in ("npm", "cargo", "pip3", "go", "gem", "uv", "dotnet"):
+                    checks[name]["version"] = probe_version(name)
+            except Exception:
+                pass
+    
+    missing_required = [name for name, info in checks.items() if info["required"] and not info["available"]]
+    missing_optional = [name for name, info in checks.items() if not info["required"] and not info["available"]]
+    
+    result = {
+        "status": "healthy" if not missing_required else "unhealthy",
+        "checks": checks,
+        "missing_required": missing_required,
+        "missing_optional": missing_optional,
+    }
+    return result
+
+
+def create_backup(cache_path: str) -> str:
+    """Create a backup of the cache file before updates."""
+    if not os.path.isfile(cache_path):
+        logger.debug(f"No cache file to backup: {cache_path}")
+        return ""
+    
+    backup_dir = os.path.join(os.path.dirname(cache_path), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    timestamp = os.path.basename(cache_path) + "." + os.environ.get("USER", "unknown") + "." + os.path.getpid().__str__()
+    backup_path = os.path.join(backup_dir, timestamp)
+    
+    shutil.copy2(cache_path, backup_path)
+    logger.debug(f"Created backup: {backup_path}")
+    return backup_path
+
+
+def list_backups(cache_path: str) -> list[str]:
+    """List available backup files for the cache."""
+    backup_dir = os.path.join(os.path.dirname(cache_path), "backups")
+    if not os.path.isdir(backup_dir):
+        return []
+    
+    cache_basename = os.path.basename(cache_path)
+    backups = []
+    for f in os.listdir(backup_dir):
+        if f.startswith(cache_basename + "."):
+            backups.append(os.path.join(backup_dir, f))
+    
+    return sorted(backups, key=os.path.getmtime, reverse=True)
+
+
+def restore_backup(cache_path: str, backup_path: str) -> bool:
+    """Restore a backup file to the cache location."""
+    if not os.path.isfile(backup_path):
+        logger.error(f"Backup file not found: {backup_path}")
+        return False
+    
+    try:
+        shutil.copy2(backup_path, cache_path)
+        logger.info(f"Restored backup from: {backup_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to restore backup: {e}")
+        return False
+
+
+def benchmark_operation(cache_path: str, cfg: dict[str, Any]) -> dict[str, float]:
+    """Benchmark key operations and return timing results."""
+    results = {}
+    
+    # Benchmark config loading
+    start = time.time()
+    load_merge(cfg.get("base_path", ""), cfg.get("local_path"))
+    results["load_merge"] = time.time() - start
+    
+    # Benchmark emit lines generation
+    start = time.time()
+    lines = collect_emit_lines(cache_path, cfg, None, None)
+    results["collect_emit_lines"] = time.time() - start
+    
+    # Benchmark version probing (sample)
+    start = time.time()
+    if lines:
+        sample_lines = lines[:min(5, len(lines))]
+        for line in sample_lines:
+            parts = line.split(EMIT_SEP)
+            if len(parts) >= 2:
+                probe_known(parts[1])
+    results["probe_versions_sample"] = time.time() - start
+    
+    return results
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print(
             "usage: lib_update_all_clis.py emit|emit-json|list-json|snapshot-versions|"
-            "notify-diff|run-summary|suggest|log-unknowns|report-unknown|ack-unknown …",
+            "notify-diff|run-summary|suggest|log-unknowns|report-unknown|ack-unknown|"
+            "parse-npm-globals|convert-tools-array|health-check|backup|restore|list-backups|benchmark …",
             file=sys.stderr,
         )
         sys.exit(2)
     cmd = sys.argv[1]
-    if cmd == "emit":
+    if cmd == "benchmark":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        base = os.environ.get("CONFIG_FILE", "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        results = benchmark_operation(cache_path, cfg)
+        print(json.dumps(results, indent=2))
+        sys.exit(0)
+    elif cmd == "health-check":
+        result = health_check()
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result["status"] == "healthy" else 1)
+    elif cmd == "backup":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not cache_path:
+            print("Usage: lib_update_all_clis.py backup <cache_path>", file=sys.stderr)
+            sys.exit(2)
+        backup_path = create_backup(cache_path)
+        if backup_path:
+            print(f"Backup created: {backup_path}")
+        else:
+            print("No backup created (cache file not found)")
+        sys.exit(0)
+    elif cmd == "list-backups":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not cache_path:
+            print("Usage: lib_update_all_clis.py list-backups <cache_path>", file=sys.stderr)
+            sys.exit(2)
+        backups = list_backups(cache_path)
+        if backups:
+            print(f"Found {len(backups)} backup(s):")
+            for b in backups:
+                mtime = os.path.getmtime(b)
+                print(f"  {b} (modified: {mtime})")
+        else:
+            print("No backups found")
+        sys.exit(0)
+    elif cmd == "restore":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        backup_path = sys.argv[3] if len(sys.argv) > 3 else ""
+        if not cache_path or not backup_path:
+            print("Usage: lib_update_all_clis.py restore <cache_path> <backup_path>", file=sys.stderr)
+            sys.exit(2)
+        success = restore_backup(cache_path, backup_path)
+        sys.exit(0 if success else 1)
+    elif cmd == "parse-npm-globals":
+        json_input = sys.stdin.read()
+        result = parse_npm_globals_json(json_input)
+        print(result)
+    elif cmd == "convert-tools-array":
+        scanned_at = sys.argv[2] if len(sys.argv) > 2 else ""
+        tools_input = sys.stdin.read()
+        result = convert_tools_array_to_json(tools_input, scanned_at)
+        print(result)
+    elif cmd == "emit":
         cache_path = sys.argv[2]
         base = os.environ.get("CONFIG_FILE", "")
         local = os.environ.get("CONFIG_LOCAL_FILE", "")
