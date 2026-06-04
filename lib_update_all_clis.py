@@ -17,7 +17,7 @@ from typing import Any, Optional
 _UV_ORIGINS = frozenset({"uv", "uv/pip", "uv/venv"})
 EMIT_SEP = "\x1e"
 DEBUG = os.environ.get("UAC_DEBUG", "0") == "1"
-RATE_LIMIT_DELAY = float(os.environ.get("UAC_RATE_LIMIT_DELAY", "0.1"))
+RATE_LIMIT_DELAY = float(os.environ.get("UAC_RATE_LIMIT_DELAY", "0.01"))
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.WARNING,
@@ -306,7 +306,7 @@ def probe_version(name: str) -> str:
                 list(args),
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=5,
                 env={**os.environ, "LC_ALL": "C"},
             )
             if r.stdout:
@@ -432,7 +432,7 @@ def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
     if DEBUG and total_tasks > 0:
         logger.info(f"Probing versions for {total_tasks} tools...")
     
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         future_to_task = {executor.submit(probe_task, task): task for task in all_tasks}
         for future in as_completed(future_to_task):
             completed += 1

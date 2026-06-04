@@ -49,7 +49,7 @@ ONLY_ORIGINS="${ONLY_ORIGINS:-}"
 SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
-SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=4
+SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
 JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 
@@ -533,7 +533,11 @@ run_updates_parallel() {
           new_pids+=("$pid")
         fi
       done
-      pids=("${new_pids[@]}")
+      if [[ ${#new_pids[@]} -gt 0 ]]; then
+        pids=("${new_pids[@]}")
+      else
+        pids=()
+      fi
     done
     (
       local result_file="$result_dir/$$.result"
