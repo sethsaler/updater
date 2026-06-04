@@ -31,6 +31,7 @@
     "kanban": "npm update -g kanban 2>/dev/null || true",
     "kimi": "kimi update 2>/dev/null || true",
     "lazygit": "brew upgrade lazygit 2>/dev/null || true",
+    "lit": "npm update -g lit 2>/dev/null || true",
     "mcp-remote": "npm update -g mcp-remote 2>/dev/null || true",
     "mem0": "npm update -g @mem0/cli 2>/dev/null || true",
     "mise": "mise self-update 2>/dev/null || true",

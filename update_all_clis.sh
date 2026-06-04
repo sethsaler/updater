@@ -49,8 +49,8 @@ ONLY_ORIGINS="${ONLY_ORIGINS:-}"
 SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
-SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=1
-REPORT_UNKNOWN=""; ACK_UNKNOWN=""
+SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=4
+REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
 JSON_PLAN=""; VERBOSE=""
 
 # -------------------------------------------------------------------
@@ -330,30 +330,16 @@ full_scan() {
 
   if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
     local pdir
-    declare -A _already_scanned
-    _already_scanned["$HOME/bin"]=1
-    _already_scanned["$HOME/.local/bin"]=1
-    _already_scanned["$HOME/.cargo/bin"]=1
-    _already_scanned["$HOME/.deno/bin"]=1
-    _already_scanned["$HOME/.bun/install/cache/bin"]=1
-    _already_scanned["$HOME/.rbenv/shims"]=1
-    _already_scanned["$HOME/.pyenv/shims"]=1
-    _already_scanned["$HOME/.opencode/bin"]=1
-    _already_scanned["$HOME/.grok/bin"]=1
-    _already_scanned["/opt/homebrew/bin"]=1
-    _already_scanned["/home/linuxbrew/.linuxbrew/bin"]=1
-    _already_scanned["/usr/local/bin"]=1
-    _already_scanned["$HOME/go/bin"]=1
-    [[ -n "${go_bin_dir:-}" ]] && _already_scanned["$go_bin_dir"]=1
-    [[ -n "${GOBIN:-}" ]] && _already_scanned["$GOBIN"]=1
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue
       [[ -d "$pdir" ]] || continue
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
+        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin") continue ;;
       esac
-      [[ -n "${_already_scanned[$pdir]:-}" ]] && continue
+      [[ -n "${go_bin_dir:-}" ]] && [[ "$pdir" == "$go_bin_dir" ]] && continue
+      [[ -n "${GOBIN:-}" ]] && [[ "$pdir" == "$GOBIN" ]] && continue
       scan_dir "$pdir" "path"
     done
   fi
@@ -512,20 +498,20 @@ run_updates_parallel() {
   shift
   local pids=()
   local line
-  local ec
+  local result_dir
+  result_dir=$(mktemp -d)
 
   for line in "$@"; do
     [[ -z "$line" ]] && continue
     while (( ${#pids[@]} >= max )); do
-      wait -n 2>/dev/null
-      ec=$?
-      case "$ec" in
-        0) ((UPDATE_OK++)) || true ;;
-        3) ;;
-        127) ;;  # wait -n not supported, fall back to wait
-        *) ((UPDATE_FAIL++)) || true ;;
-      esac
-      # Remove completed PID from array
+      # Wait for any child to complete using wait -n if available
+      if wait -n 2>/dev/null; then
+        :
+      else
+        # wait -n not supported, wait for first PID
+        wait "${pids[0]}" 2>/dev/null || true
+      fi
+      # Remove completed PIDs from array
       local new_pids=()
       for pid in "${pids[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
@@ -535,20 +521,29 @@ run_updates_parallel() {
       pids=("${new_pids[@]}")
     done
     (
+      local result_file="$result_dir/$$.result"
       SUPPRESS_TRACE=1
       _run_one_emit_line "$line"
+      echo $? > "$result_file"
     ) &
     pids+=($!)
   done
+  # Wait for all remaining processes
   for _pid in "${pids[@]}"; do
-    wait "$_pid"
-    ec=$?
+    wait "$_pid" 2>/dev/null || true
+  done
+  # Count results from files
+  for result_file in "$result_dir"/*.result; do
+    [[ -f "$result_file" ]] || continue
+    local ec
+    ec=$(cat "$result_file")
     case "$ec" in
       0) ((UPDATE_OK++)) || true ;;
       3) ;;
       *) ((UPDATE_FAIL++)) || true ;;
     esac
   done
+  rm -rf "$result_dir"
 }
 
 # -------------------------------------------------------------------
