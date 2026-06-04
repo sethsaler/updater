@@ -20,7 +20,7 @@
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.5.0"
+UAC_VERSION="0.6.0"
 
 set -uo pipefail
 

@@ -123,7 +123,7 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --json-summary  # after run, print one JSON line: {"ok":N,"failed":M}
 ./update_all_clis.sh --trace         # bash -x when running each update command
 ./update_all_clis.sh --no-scan-path  # skip scanning directories on $PATH
-./update_all_clis.sh --parallel=4    # run up to 4 updates at once (default 1)
+./update_all_clis.sh --parallel=8    # run up to 8 updates at once (default 8)
 ./update_all_clis.sh --only-origins=brew,npm
 ./update_all_clis.sh --skip-origins=gem
 ./update_all_clis.sh --validate-cache  # validate cache structure and show diagnostics (JSON)
@@ -132,6 +132,18 @@ SKIP=hermes,uv ./update_all_clis.sh
 ./update_all_clis.sh --skip=hermes,uv
 QUIET=1 ./update_all_clis.sh
 ```
+
+### Performance
+
+The updater includes several performance optimizations:
+
+- **Parallel execution** — runs 8 concurrent update jobs by default (adjustable with `--parallel=N`)
+- **Version caching** — preserves tool versions across rescans to avoid redundant version probing
+- **Rate limiting** — minimal delay between subprocess calls (0.01s default, configurable via `UAC_RATE_LIMIT_DELAY`)
+- **Parallel version probing** — uses 16 workers for concurrent version checks
+- **Fast failure detection** — 5-second timeout for unresponsive tools during version probing
+
+Use `--validate-cache` and `--debug-cache` to diagnose cache health and performance.
 
 ### Configuration merge and overrides
 
@@ -195,7 +207,7 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 4. **Cache** — reused until it is older than **`CACHE_TTL_HOURS`** (default 24h), unless you pass **`--rescan`**. A normal run performs **at most one** full scan.
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
-7. **Execution** — sequential by default; **`--parallel=N`** runs multiple update steps concurrently (tracing is disabled for parallel runs).
+7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs).
 
 ## Adding a new tool
 
