@@ -2,7 +2,7 @@
 
 > One script to discover and update every CLI and package manager on your system.
 
-`update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, npm global bins (including `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, `~/bin`, Wasmtime/Wasmer runtimes, and **all user-writable directories on `$PATH`** — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
+`update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, npm global bins (including `~/.npm-global/bin`, `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, `~/bin`, Wasmtime/Wasmer runtimes, and **all user-writable directories on `$PATH`** — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
 
 Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), and [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning).
 
@@ -126,6 +126,8 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --parallel=4    # run up to 4 updates at once (default 1)
 ./update_all_clis.sh --only-origins=brew,npm
 ./update_all_clis.sh --skip-origins=gem
+./update_all_clis.sh --validate-cache  # validate cache structure and show diagnostics (JSON)
+./update_all_clis.sh --debug-cache     # show human-readable cache validation report
 SKIP=hermes,uv ./update_all_clis.sh
 ./update_all_clis.sh --skip=hermes,uv
 QUIET=1 ./update_all_clis.sh
@@ -187,12 +189,13 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 
 ## How it works
 
-1. **Discovery scan** — walks 20+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`.
-2. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update.
-3. **Cache** — reused until it is older than **`CACHE_TTL_HOURS`** (default 24h), unless you pass **`--rescan`**. A normal run performs **at most one** full scan.
-4. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
-5. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
-6. **Execution** — sequential by default; **`--parallel=N`** runs multiple update steps concurrently (tracing is disabled for parallel runs).
+1. **Discovery scan** — walks 20+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`.
+2. **Version caching** — after each update run, tool versions are cached to speed up future runs. The cache preserves version information across rescans to avoid redundant version probing.
+3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update.
+4. **Cache** — reused until it is older than **`CACHE_TTL_HOURS`** (default 24h), unless you pass **`--rescan`**. A normal run performs **at most one** full scan.
+5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
+6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
+7. **Execution** — sequential by default; **`--parallel=N`** runs multiple update steps concurrently (tracing is disabled for parallel runs).
 
 ## Adding a new tool
 
@@ -278,6 +281,23 @@ Last modified is the file timestamp of the binary on disk (when it was last inst
 - Bash 3.2+ (macOS default bash works)
 - Python 3.6+ (for `lib_update_all_clis.py` and cache handling)
 - Git
+
+## Testing
+
+The project includes a comprehensive test suite:
+
+```bash
+python3 -m unittest tests/test_lib_update_all_clis.py -v
+```
+
+Tests cover:
+- Configuration loading and merging
+- Validation logic
+- Version caching functionality
+- Discovery path handling
+- Cache update operations
+
+All tests should pass before making changes to the core logic.
 
 ## Scheduling
 
