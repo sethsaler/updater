@@ -710,16 +710,180 @@ def parse_npm_globals_json(json_input: str) -> str:
         return ""
 
 
-def convert_tools_array_to_json(tools_input: str, scanned_at: str) -> str:
-    """Convert tools array format to JSON cache file."""
+def convert_tools_array_to_json(tools_input: str, scanned_at: str, existing_cache_path: Optional[str] = None) -> str:
+    """Convert tools array format to JSON cache file, preserving version data from existing cache."""
     lines = [l.strip() for l in tools_input.split('\n') if '|' in l]
+    
+    # Load existing cache to preserve version data
+    existing_versions = {}
+    if existing_cache_path and os.path.isfile(existing_cache_path):
+        try:
+            with open(existing_cache_path, encoding="utf-8") as f:
+                existing_data = json.load(f)
+            for item in existing_data:
+                if "name" in item and "version" in item:
+                    existing_versions[item["name"]] = item["version"]
+        except (json.JSONDecodeError, OSError):
+            pass
+    
     tools = []
     for line in lines:
         parts = line.split('|', 1)
         if len(parts) == 2:
-            tools.append({'name': parts[0], 'origin': parts[1]})
+            tool_entry = {'name': parts[0], 'origin': parts[1]}
+            # Preserve existing version if available
+            if parts[0] in existing_versions:
+                tool_entry['version'] = existing_versions[parts[0]]
+            tools.append(tool_entry)
     tools.append({'scanned_at': scanned_at, 'count': len(tools)})
     return json.dumps(tools, indent=2)
+
+
+def update_cache_versions(cache_path: str, versions: dict[str, dict[str, str]]) -> None:
+    """Update cache with new version data after updates."""
+    if not os.path.isfile(cache_path):
+        logger.debug(f"Cache file not found: {cache_path}")
+        return
+    
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"Failed to read cache file: {e}")
+        return
+    
+    # Update versions for known tools
+    known_versions = versions.get("known", {})
+    bulk_versions = versions.get("bulk", {})
+    
+    updated_count = 0
+    bulk_updated = False
+    for item in data:
+        if "name" not in item:
+            continue
+        name = item["name"]
+        if name in known_versions:
+            item["version"] = known_versions[name]
+            item["version_updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            updated_count += 1
+        # For bulk origins, store the package manager version
+        origin = item.get("origin", "?")
+        if origin in bulk_versions:
+            item["pm_version"] = bulk_versions[origin]
+            bulk_updated = True
+    
+    if updated_count > 0 or bulk_updated:
+        logger.debug(f"Updated {updated_count} tool versions and bulk PM versions in cache")
+        # Write back to cache
+        tmp_path = cache_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.rename(tmp_path, cache_path)
+        logger.debug(f"Cache updated with new versions: {cache_path}")
+
+
+def validate_cache(cache_path: str) -> dict[str, Any]:
+    """Validate cache structure and return diagnostic information."""
+    result = {
+        "valid": True,
+        "errors": [],
+        "warnings": [],
+        "stats": {},
+        "tools_with_versions": 0,
+        "tools_without_versions": 0,
+        "origins": {},
+    }
+    
+    if not os.path.isfile(cache_path):
+        result["valid"] = False
+        result["errors"].append(f"Cache file not found: {cache_path}")
+        return result
+    
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        result["valid"] = False
+        result["errors"].append(f"Invalid JSON: {e}")
+        return result
+    
+    if not isinstance(data, list):
+        result["valid"] = False
+        result["errors"].append("Cache must be a JSON array")
+        return result
+    
+    tools = [t for t in data if "name" in t]
+    meta = next((t for t in data if "scanned_at" in t), None)
+    
+    result["stats"]["total_items"] = len(data)
+    result["stats"]["tool_count"] = len(tools)
+    
+    if not meta:
+        result["warnings"].append("Missing metadata (scanned_at, count)")
+    else:
+        result["stats"]["scanned_at"] = meta.get("scanned_at")
+        result["stats"]["count"] = meta.get("count")
+        if meta.get("count") != len(tools):
+            result["warnings"].append(f"Count mismatch: metadata says {meta.get('count')}, found {len(tools)}")
+    
+    # Analyze tools
+    for tool in tools:
+        name = tool.get("name")
+        origin = tool.get("origin", "?")
+        
+        if not isinstance(name, str) or not name:
+            result["errors"].append(f"Invalid tool name: {name}")
+            continue
+        
+        result["origins"][origin] = result["origins"].get(origin, 0) + 1
+        
+        if "version" in tool:
+            result["tools_with_versions"] += 1
+        else:
+            result["tools_without_versions"] += 1
+    
+    # Check for duplicates
+    names = [t["name"] for t in tools]
+    duplicates = [name for name in set(names) if names.count(name) > 1]
+    if duplicates:
+        result["warnings"].append(f"Duplicate tool names: {', '.join(duplicates)}")
+    
+    return result
+
+
+def debug_cache(cache_path: str) -> None:
+    """Print detailed cache debugging information."""
+    validation = validate_cache(cache_path)
+    
+    print("Cache Validation Report")
+    print("=" * 50)
+    print(f"Valid: {validation['valid']}")
+    print(f"Total items: {validation['stats'].get('total_items', 0)}")
+    print(f"Tool count: {validation['stats'].get('tool_count', 0)}")
+    print(f"Scanned at: {validation['stats'].get('scanned_at', 'N/A')}")
+    print()
+    
+    print("Version Coverage:")
+    print(f"  Tools with versions: {validation['tools_with_versions']}")
+    print(f"  Tools without versions: {validation['tools_without_versions']}")
+    print()
+    
+    print("Origins:")
+    for origin, count in sorted(validation["origins"].items()):
+        print(f"  {origin}: {count}")
+    print()
+    
+    if validation["errors"]:
+        print("Errors:")
+        for error in validation["errors"]:
+            print(f"  - {error}")
+        print()
+    
+    if validation["warnings"]:
+        print("Warnings:")
+        for warning in validation["warnings"]:
+            print(f"  - {warning}")
+        print()
 
 
 def health_check() -> dict[str, Any]:
@@ -839,7 +1003,8 @@ def main() -> None:
         print(
             "usage: lib_update_all_clis.py emit|emit-json|list-json|snapshot-versions|"
             "notify-diff|run-summary|suggest|log-unknowns|report-unknown|ack-unknown|"
-            "parse-npm-globals|convert-tools-array|health-check|backup|restore|list-backups|benchmark …",
+            "parse-npm-globals|convert-tools-array|update-cache-versions|validate-cache|debug-cache|"
+            "health-check|backup|restore|list-backups|benchmark …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -897,9 +1062,25 @@ def main() -> None:
         print(result)
     elif cmd == "convert-tools-array":
         scanned_at = sys.argv[2] if len(sys.argv) > 2 else ""
+        existing_cache = sys.argv[3] if len(sys.argv) > 3 else None
         tools_input = sys.stdin.read()
-        result = convert_tools_array_to_json(tools_input, scanned_at)
+        result = convert_tools_array_to_json(tools_input, scanned_at, existing_cache)
         print(result)
+    elif cmd == "update-cache-versions":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        versions_input = sys.stdin.read()
+        versions = json.loads(versions_input) if versions_input.strip() else {}
+        update_cache_versions(cache_path, versions)
+        sys.exit(0)
+    elif cmd == "validate-cache":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        result = validate_cache(cache_path)
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result["valid"] else 1)
+    elif cmd == "debug-cache":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        debug_cache(cache_path)
+        sys.exit(0)
     elif cmd == "emit":
         cache_path = sys.argv[2]
         base = os.environ.get("CONFIG_FILE", "")

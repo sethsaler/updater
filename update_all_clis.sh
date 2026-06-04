@@ -51,7 +51,7 @@ QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=4
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
-JSON_PLAN=""; VERBOSE=""
+JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -100,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --verbose|-v)      VERBOSE=1; shift ;;
     --no-color)        export NO_COLOR=1; GREEN='' YELLOW='' BLUE='' BOLD='' NC=''; shift ;;
     --health-check)    HEALTH_CHECK=1; shift ;;
+    --validate-cache)  VALIDATE_CACHE=1; shift ;;
+    --debug-cache)     DEBUG_CACHE=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -183,6 +185,7 @@ full_scan() {
   scan_dir "$HOME/.local/bin"                  "uv/pip"
   scan_dir "$HOME/.cargo/bin"                  "cargo"
   scan_dir "$HOME/.deno/bin"                  "deno"
+  scan_dir "$HOME/.bun/bin"                    "bun"
   scan_dir "$HOME/.bun/install/cache/bin"      "bun"
   scan_dir "$HOME/.rbenv/shims"               "rbenv"
   scan_dir "$HOME/.pyenv/shims"               "pyenv"
@@ -195,11 +198,19 @@ full_scan() {
   npm_root=$(echo "$npm_info" | head -2 | tail -1)
   npm_globals=$(echo "$npm_info" | tail -n +3)
 
-  if [[ -n "$npm_prefix" ]] && [[ -d "$npm_prefix/lib/node_modules/.bin" ]]; then
-    scan_dir "$npm_prefix/lib/node_modules/.bin" "npm"
+  if [[ -n "$npm_prefix" ]]; then
+    if [[ -d "$npm_prefix/bin" ]]; then
+      scan_dir "$npm_prefix/bin" "npm"
+    fi
+    if [[ -d "$npm_prefix/lib/node_modules/.bin" ]]; then
+      scan_dir "$npm_prefix/lib/node_modules/.bin" "npm"
+    fi
   fi
   if [[ -d "$HOME/.npm-global/lib/node_modules/.bin" ]]; then
     scan_dir "$HOME/.npm-global/lib/node_modules/.bin" "npm"
+  fi
+  if [[ -d "$HOME/.npm-global/bin" ]]; then
+    scan_dir "$HOME/.npm-global/bin" "npm"
   fi
 
   if [[ -n "$npm_root" ]] && [[ -d "$npm_root/.bin" ]]; then
@@ -336,7 +347,7 @@ full_scan() {
       [[ -d "$pdir" ]] || continue
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
-        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin") continue ;;
+        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin") continue ;;
       esac
       [[ -n "${go_bin_dir:-}" ]] && [[ "$pdir" == "$go_bin_dir" ]] && continue
       [[ -n "${GOBIN:-}" ]] && [[ "$pdir" == "$GOBIN" ]] && continue
@@ -352,7 +363,11 @@ full_scan() {
   mkdir -p "$LOG_DIR"
 
   debug "Converting ${#TOOLS_ARRAY[@]} tools to JSON format"
-  printf '%s\n' "${TOOLS_ARRAY[@]}" | sort -u | python3 "$LIB_SCRIPT" convert-tools-array "$scanned_at" > "$tmpfile" 2>/dev/null
+  if [[ -f "$CACHE_FILE" ]]; then
+    printf '%s\n' "${TOOLS_ARRAY[@]}" | sort -u | python3 "$LIB_SCRIPT" convert-tools-array "$scanned_at" "$CACHE_FILE" > "$tmpfile" 2>/dev/null
+  else
+    printf '%s\n' "${TOOLS_ARRAY[@]}" | sort -u | python3 "$LIB_SCRIPT" convert-tools-array "$scanned_at" > "$tmpfile" 2>/dev/null
+  fi
 
   mv "$tmpfile" "$CACHE_FILE"
   debug "Cache written to: $CACHE_FILE"
@@ -583,6 +598,16 @@ main() {
     exit $?
   fi
 
+  if [[ -n "$VALIDATE_CACHE" ]]; then
+    python3 "$LIB_SCRIPT" validate-cache "$CACHE_FILE"
+    exit $?
+  fi
+
+  if [[ -n "$DEBUG_CACHE" ]]; then
+    python3 "$LIB_SCRIPT" debug-cache "$CACHE_FILE"
+    exit 0
+  fi
+
   if [[ -n "$REPORT_UNKNOWN" ]]; then
     python3 "$LIB_SCRIPT" report-unknown "$UNKNOWN_LOG_FILE"
     exit 0
@@ -673,6 +698,8 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
       python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
     fi
+    # Update cache with new version information
+    cat "$_after_snap" | python3 "$LIB_SCRIPT" update-cache-versions "$CACHE_FILE" 2>/dev/null || true
     rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
   fi
 
