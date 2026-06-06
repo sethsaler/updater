@@ -128,6 +128,7 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --skip-origins=gem
 ./update_all_clis.sh --validate-cache  # validate cache structure and show diagnostics (JSON)
 ./update_all_clis.sh --debug-cache     # show human-readable cache validation report
+./update_all_clis.sh --suggest-known   # show tools updated via bulk but not in known list
 SKIP=hermes,uv ./update_all_clis.sh
 ./update_all_clis.sh --skip=hermes,uv
 QUIET=1 ./update_all_clis.sh
@@ -170,6 +171,22 @@ python3 lib_update_all_clis.py suggest ~/.config/update-all-clis/cache.json
 ```
 
 This outputs a ready-to-paste `config.local.json` snippet with every discovered tool that isn't yet covered by `known` or `bulk` entries. Fill in the update commands and save to `~/.config/update-all-clis/config.local.json`.
+
+### Suggest-known command for tracked-tool gaps
+
+After a discovery run, use the `suggest-known` command to find tools that are updated via a bulk package manager (npm, cargo, go, etc.) but don't have dedicated entries in the `known` list:
+
+```bash
+python3 lib_update_all_clis.py suggest-known ~/.config/update-all-clis/cache.json
+```
+
+Or from the shell script:
+
+```bash
+./update_all_clis.sh --suggest-known
+```
+
+This outputs ready-to-paste `config.local.json` snippets for tools like `liteparse`, `roughdraft`, and others that are being handled by bulk updates but could benefit from individual tracking. The auto-tip also runs after each update, showing a brief summary if new candidates are found.
 
 ### Email via Agent Mail CLI
 

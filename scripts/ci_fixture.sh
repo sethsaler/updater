@@ -32,6 +32,10 @@ assert 'plan' in d and isinstance(d['plan'], list)
 
 python3 "$LIB_SCRIPT" suggest "$td/.config/update-all-clis/cache.json" >/dev/null || true
 
+# Smoke test suggest-known and suggest-known-count
+python3 "$LIB_SCRIPT" suggest-known "$td/.config/update-all-clis/cache.json" >/dev/null || true
+python3 "$LIB_SCRIPT" suggest-known-count "$td/.config/update-all-clis/cache.json" >/dev/null || true
+
 python3 -c "
 import sys
 sys.path.insert(0, '$ROOT')

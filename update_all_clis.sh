@@ -14,6 +14,7 @@
 #   --list --json     Machine-readable tool list (with --list)
 #   --report-unknown  Show tools discovered with no update path
 #   --ack-unknown=X   Dismiss a tool from the unknown report
+#   --suggest-known   Show tools updated via bulk but not in known list
 #   --trace           Trace shell commands (bash -x)
 #   --dry-run         Show commands without running
 #   --json-plan       Print planned updates as JSON and exit
@@ -51,7 +52,7 @@ QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
-JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
+SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -102,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --health-check)    HEALTH_CHECK=1; shift ;;
     --validate-cache)  VALIDATE_CACHE=1; shift ;;
     --debug-cache)     DEBUG_CACHE=1; shift ;;
+    --suggest-known)   SUGGEST_KNOWN=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -622,6 +624,13 @@ main() {
     exit 0
   fi
 
+  if [[ -n "$SUGGEST_KNOWN" ]]; then
+    export CONFIG_FILE
+    export CONFIG_LOCAL_FILE
+    python3 "$LIB_SCRIPT" suggest-known "$CACHE_FILE"
+    exit 0
+  fi
+
   if [[ -n "$JSON_PLAN" ]]; then
     ensure_cache
     export CONFIG_FILE
@@ -710,6 +719,21 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   log ""
   log "${BOLD}=== Done! ===${NC}"
   log "Summary: ${UPDATE_OK} ok, ${UPDATE_FAIL} failed"
+
+  # Auto-tip: bulk-covered tools missing from known list
+  if [[ -z "$DRY_RUN" ]]; then
+    local _known_candidates
+    _known_candidates=$(export CONFIG_FILE CONFIG_LOCAL_FILE; python3 "$LIB_SCRIPT" suggest-known-count "$CACHE_FILE" 2>/dev/null || echo "[]")
+    local _known_count
+    _known_count=$(echo "$_known_candidates" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
+    if [[ "$_known_count" -gt 0 ]]; then
+      local _known_sample
+      _known_sample=$(echo "$_known_candidates" | python3 -c "import json,sys; d=json.load(sys.stdin); print(', '.join(x[0] for x in d[:3]))" 2>/dev/null || true)
+      warn "$_known_count tools updated via bulk but not individually tracked (e.g., $_known_sample)"
+      log "  Run './update_all_clis.sh --suggest-known' to see all candidates."
+    fi
+  fi
+
   log "Cache: $CACHE_FILE"
   log "Run './update_all_clis.sh --rescan' to force a fresh discovery scan."
   log "Run './update_all_clis.sh --list' to see all discovered tools."

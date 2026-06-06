@@ -488,6 +488,99 @@ def suggest_config(cache_path: str, cfg: dict[str, Any]) -> None:
     print()
 
 
+# Origins where individual tool entries make sense (exclude brew which is
+# mostly system-level library binaries that aren't worth tracking individually)
+_TRACKABLE_ORIGINS = frozenset({
+    "npm", "cargo", "go", "gem", "pipx", "manual", "path",
+    "uv", "uv/pip", "uv/venv", "fnm", "bun", "deno",
+    "mise", "opencode", "grok", "conda", "dotnet", "krew",
+})
+
+
+def suggest_known(cache_path: str, cfg: dict[str, Any]) -> None:
+    """Suggest tools covered by bulk but missing from the known list."""
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Cache file not found: {cache_path}. Run discovery scan first.")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in cache file {cache_path}: {e}")
+    tools = [t for t in data if "name" in t]
+    known = set(cfg["known"].keys())
+    bulk_origins = cfg["bulk"]
+
+    # Group tools by origin that are covered by bulk but not in known
+    by_origin: dict[str, list[dict]] = {}
+    brew_count = 0
+    for t in tools:
+        name = t["name"]
+        origin = t.get("origin", "?")
+        if name in known:
+            continue
+        if origin not in bulk_origins:
+            inferred = _infer_origin_from_symlink(name, origin)
+            if not inferred or inferred not in bulk_origins:
+                continue
+            origin = inferred
+        if origin == "brew":
+            brew_count += 1
+            continue
+        by_origin.setdefault(origin, []).append(t)
+
+    if not by_origin and brew_count == 0:
+        print("All discovered tools are in the known list.", file=sys.stderr)
+        return
+
+    for origin in sorted(by_origin.keys()):
+        items = sorted(by_origin[origin], key=lambda x: x["name"])
+        print(f"  {origin} ({len(items)} tools):")
+        for t in items:
+            print(f'    "{t["name"]}": "UPDATE_COMMAND_HERE",')
+        print()
+
+    if brew_count > 0:
+        print(f"  [brew: {brew_count} tools skipped — system-level packages, not user CLIs]")
+        print()
+
+    total = sum(len(v) for v in by_origin.values())
+    print(f"Total: {total} tool(s) updated via bulk but missing from known list.")
+    print()
+    print("Copy entries above into ~/.config/update-all-clis/config.local.json")
+    print('under the "known" section, replacing UPDATE_COMMAND_HERE.')
+    print()
+
+
+def suggest_known_count(cache_path: str, cfg: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return list of (name, origin) for bulk-covered tools not in known (no output).
+    Excludes brew origin — too noisy for auto-tip."""
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    tools = [t for t in data if "name" in t]
+    known = set(cfg["known"].keys())
+    bulk_origins = cfg["bulk"]
+    found: list[tuple[str, str]] = []
+    for t in tools:
+        name = t["name"]
+        origin = t.get("origin", "?")
+        if name in known:
+            continue
+        if origin == "brew":
+            continue
+        if origin not in bulk_origins:
+            inferred = _infer_origin_from_symlink(name, origin)
+            if not inferred or inferred not in bulk_origins:
+                continue
+            origin = inferred
+        if origin == "brew":
+            continue
+        found.append((name, origin))
+    return found
+
+
 UNKNOWN_LOG_DEFAULT = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
     "update-all-clis",
@@ -1002,7 +1095,8 @@ def main() -> None:
     if len(sys.argv) < 2:
         print(
             "usage: lib_update_all_clis.py emit|emit-json|list-json|snapshot-versions|"
-            "notify-diff|run-summary|suggest|log-unknowns|report-unknown|ack-unknown|"
+            "notify-diff|run-summary|suggest|suggest-known|suggest-known-count|"
+            "log-unknowns|report-unknown|ack-unknown|"
             "parse-npm-globals|convert-tools-array|update-cache-versions|validate-cache|debug-cache|"
             "health-check|backup|restore|list-backups|benchmark …",
             file=sys.stderr,
@@ -1130,6 +1224,25 @@ def main() -> None:
         cfg = load_merge(base, local or None)
         validate(cfg)
         suggest_config(cache_path, cfg)
+    elif cmd == "suggest-known":
+        cache_path = sys.argv[2]
+        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        suggest_known(cache_path, cfg)
+    elif cmd == "suggest-known-count":
+        cache_path = sys.argv[2]
+        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        result = suggest_known_count(cache_path, cfg)
+        import json
+        print(json.dumps(result))
     elif cmd == "log-unknowns":
         cache_path = sys.argv[2]
         unknown_log = os.environ.get("UNKNOWN_LOG_FILE", UNKNOWN_LOG_DEFAULT)
