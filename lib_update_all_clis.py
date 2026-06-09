@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -27,18 +28,21 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """Simple rate limiter for subprocess calls."""
+    """Simple thread-safe rate limiter for subprocess calls."""
     def __init__(self, delay: float = 0.1):
         self.delay = delay
-        self.last_call = 0
+        self.last_call = 0.0
+        self._lock = threading.Lock()
     
     def acquire(self):
         """Wait if necessary to respect rate limit."""
-        if self.delay > 0:
+        if self.delay <= 0:
+            return
+        with self._lock:
             elapsed = time.time() - self.last_call
             if elapsed < self.delay:
                 time.sleep(self.delay - elapsed)
-        self.last_call = time.time()
+            self.last_call = time.time()
 
 
 # Global rate limiter instance
@@ -309,8 +313,9 @@ def probe_version(name: str) -> str:
                 timeout=5,
                 env={**os.environ, "LC_ALL": "C"},
             )
-            if r.stdout:
-                line = r.stdout.strip().split("\n")[0].strip()
+            out = r.stdout or r.stderr
+            if out:
+                line = out.strip().split("\n")[0].strip()
                 if line:
                     return line[:220]
         except (OSError, subprocess.TimeoutExpired):
@@ -365,11 +370,8 @@ def probe_bulk(origin: str) -> str:
     }
     if origin == "path":
         return "many tools (PATH scan)"
-    cmd = plans.get(origin)
-    if not cmd:
-        return f"({origin})"
-    try:
-        if origin == "sdkman":
+    if origin == "sdkman":
+        try:
             r = subprocess.run(
                 [
                     "bash",
@@ -383,12 +385,12 @@ def probe_bulk(origin: str) -> str:
             )
             out = (r.stdout or r.stderr or "").strip().split("\n")[0]
             return out[:220] if out else "?"
-        if not cmd:
-            return f"({origin})"
-        return _probe_single(cmd)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return "?"
+        except (OSError, subprocess.TimeoutExpired):
+            return "?"
+    cmd = plans.get(origin)
+    if not cmd:
+        return f"({origin})"
+    return _probe_single(cmd)
 
 
 def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
@@ -589,8 +591,13 @@ UNKNOWN_LOG_DEFAULT = os.path.join(
 
 
 def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) -> None:
-    with open(cache_path, encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Cache file not found: {cache_path}. Run discovery scan first.")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in cache file {cache_path}: {e}")
     tools = [t for t in data if "name" in t]
     meta = next((t for t in data if "scanned_at" in t), None)
     scanned_at = meta.get("scanned_at") if meta else None
@@ -624,7 +631,7 @@ def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) ->
             existing_tools[name]["last_seen"] = (
                 scanned_at or existing_tools[name].get("last_seen")
             )
-            existing_tools[name]["times_seen"] += 1
+            existing_tools[name]["times_seen"] = existing_tools[name].get("times_seen", 0) + 1
         else:
             existing_tools[name] = {
                 "name": name,
@@ -640,8 +647,10 @@ def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) ->
         "tools": existing_tools,
     }
     os.makedirs(os.path.dirname(unknown_log_path), exist_ok=True)
-    with open(unknown_log_path, "w", encoding="utf-8") as f:
+    tmp_path = unknown_log_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
+    os.replace(tmp_path, unknown_log_path)
 
 
 def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
@@ -652,7 +661,7 @@ def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
         data = json.load(f)
     tools = data.get("tools", {})
 
-    unhandled = [t for t in tools.values() if t["times_seen"] >= min_times and not t.get("acknowledged")]
+    unhandled = [t for t in tools.values() if t.get("times_seen", 0) >= min_times and not t.get("acknowledged")]
     acked = [t for t in tools.values() if t.get("acknowledged")]
 
     if not unhandled and not acked:
@@ -660,15 +669,15 @@ def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
         return
 
     if unhandled:
-        unhandled.sort(key=lambda x: (-x["times_seen"], x["name"]))
+        unhandled.sort(key=lambda x: (-x.get("times_seen", 0), x["name"]))
         print("Tools with no update path (seen in recent scans):")
         print()
         for t in unhandled:
             flag = ""
-            if t["times_seen"] >= 2:
+            if t.get("times_seen", 0) >= 2:
                 flag = f"  (run with --ack-unknown={t['name']} to dismiss)"
-            print(f'  {t["name"]}  [origin: {t["origin"]}]  '
-                  f'(seen {t["times_seen"]}x, last: {t["last_seen"]}){flag}')
+            print(f'  {t["name"]}  [origin: {t.get("origin", "?")}]  '
+                  f'(seen {t.get("times_seen", 0)}x, last: {t.get("last_seen")}){flag}')
             print(f'    add to known: "{t["name"]}": "UPDATE_COMMAND_HERE",')
             print()
         print("Tip: Add entries above to ~/.config/update-all-clis/config.local.json")
@@ -678,7 +687,7 @@ def report_unknown(unknown_log_path: str, min_times: int = 1) -> None:
     if acked:
         print("Acknowledged (dismissed from report):")
         for t in acked:
-            print(f'  {t["name"]}  (seen {t["times_seen"]}x, last: {t["last_seen"]})')
+            print(f'  {t["name"]}  (seen {t.get("times_seen", 0)}x, last: {t.get("last_seen")})')
 
 
 def ack_unknown(unknown_log_path: str, name: str) -> None:
@@ -925,6 +934,7 @@ def validate_cache(cache_path: str) -> dict[str, Any]:
         origin = tool.get("origin", "?")
         
         if not isinstance(name, str) or not name:
+            result["valid"] = False
             result["errors"].append(f"Invalid tool name: {name}")
             continue
         
@@ -1026,12 +1036,24 @@ def create_backup(cache_path: str) -> str:
     backup_dir = os.path.join(os.path.dirname(cache_path), "backups")
     os.makedirs(backup_dir, exist_ok=True)
     
-    timestamp = os.path.basename(cache_path) + "." + os.environ.get("USER", "unknown") + "." + os.path.getpid().__str__()
-    backup_path = os.path.join(backup_dir, timestamp)
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    backup_name = f"{os.path.basename(cache_path)}.{timestamp}.{os.getpid()}"
+    backup_path = os.path.join(backup_dir, backup_name)
     
     shutil.copy2(cache_path, backup_path)
     logger.debug(f"Created backup: {backup_path}")
+    _prune_backups(cache_path)
     return backup_path
+
+
+def _prune_backups(cache_path: str, keep: int = 10) -> None:
+    """Keep only the most recent `keep` backups for a cache file."""
+    for old in list_backups(cache_path)[keep:]:
+        try:
+            os.unlink(old)
+            logger.debug(f"Pruned old backup: {old}")
+        except OSError:
+            pass
 
 
 def list_backups(cache_path: str) -> list[str]:
@@ -1064,14 +1086,20 @@ def restore_backup(cache_path: str, backup_path: str) -> bool:
         return False
 
 
-def benchmark_operation(cache_path: str, cfg: dict[str, Any]) -> dict[str, float]:
+def benchmark_operation(
+    cache_path: str,
+    cfg: dict[str, Any],
+    base_path: Optional[str] = None,
+    local_path: Optional[str] = None,
+) -> dict[str, float]:
     """Benchmark key operations and return timing results."""
     results = {}
     
     # Benchmark config loading
-    start = time.time()
-    load_merge(cfg.get("base_path", ""), cfg.get("local_path"))
-    results["load_merge"] = time.time() - start
+    if base_path:
+        start = time.time()
+        load_merge(base_path, local_path)
+        results["load_merge"] = time.time() - start
     
     # Benchmark emit lines generation
     start = time.time()
@@ -1110,7 +1138,7 @@ def main() -> None:
         if not base:
             base = os.path.join(os.path.dirname(__file__), "tool_config.json")
         cfg = load_merge(base, local or None)
-        results = benchmark_operation(cache_path, cfg)
+        results = benchmark_operation(cache_path, cfg, base, local or None)
         print(json.dumps(results, indent=2))
         sys.exit(0)
     elif cmd == "health-check":
@@ -1137,7 +1165,7 @@ def main() -> None:
         if backups:
             print(f"Found {len(backups)} backup(s):")
             for b in backups:
-                mtime = os.path.getmtime(b)
+                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(b)))
                 print(f"  {b} (modified: {mtime})")
         else:
             print("No backups found")
@@ -1241,7 +1269,6 @@ def main() -> None:
             base = os.path.join(os.path.dirname(__file__), "tool_config.json")
         cfg = load_merge(base, local or None)
         result = suggest_known_count(cache_path, cfg)
-        import json
         print(json.dumps(result))
     elif cmd == "log-unknowns":
         cache_path = sys.argv[2]

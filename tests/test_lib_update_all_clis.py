@@ -4,9 +4,11 @@ import json, os, sys, tempfile, unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 from lib_update_all_clis import (
-    EMIT_SEP, _parse_csv, ack_unknown, collect_emit_lines, emit_plan_json,
-    load_merge, lock_group_for, log_unknowns, parse_npm_globals_json,
+    EMIT_SEP, _parse_csv, ack_unknown, collect_emit_lines, create_backup,
+    emit_plan_json, list_backups, load_merge, lock_group_for, log_unknowns,
+    parse_npm_globals_json, report_unknown, restore_backup,
     convert_tools_array_to_json, update_cache_versions, validate,
+    validate_cache,
 )
 
 class TestParseCSV(unittest.TestCase):
@@ -278,6 +280,89 @@ class TestDiscoveryPaths(unittest.TestCase):
         
         origins = {t["origin"] for t in tools}
         self.assertEqual(origins, {"npm", "cargo", "brew", "go", "manual"})
+
+class TestBackups(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.cache_path = os.path.join(self.dir, "cache.json")
+        with open(self.cache_path, "w") as f:
+            json.dump([{"name": "tool1", "origin": "npm"}], f)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_create_and_list_backup(self):
+        backup_path = create_backup(self.cache_path)
+        self.assertTrue(backup_path)
+        self.assertTrue(os.path.isfile(backup_path))
+        backups = list_backups(self.cache_path)
+        self.assertIn(backup_path, backups)
+
+    def test_create_backup_missing_cache(self):
+        self.assertEqual(create_backup(os.path.join(self.dir, "missing.json")), "")
+
+    def test_restore_backup(self):
+        backup_path = create_backup(self.cache_path)
+        with open(self.cache_path, "w") as f:
+            json.dump([], f)
+        self.assertTrue(restore_backup(self.cache_path, backup_path))
+        with open(self.cache_path) as f:
+            data = json.load(f)
+        self.assertEqual(data[0]["name"], "tool1")
+
+    def test_restore_missing_backup(self):
+        self.assertFalse(restore_backup(self.cache_path, "/nonexistent/backup"))
+
+class TestValidateCache(unittest.TestCase):
+    def test_valid_cache(self):
+        cache_path = tempfile.mktemp(suffix=".json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "tool1", "origin": "npm", "version": "1.0"},
+                {"scanned_at": "2026-06-01T00:00:00Z", "count": 1},
+            ], f)
+        result = validate_cache(cache_path)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["tools_with_versions"], 1)
+        os.unlink(cache_path)
+
+    def test_invalid_tool_name_marks_invalid(self):
+        cache_path = tempfile.mktemp(suffix=".json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": "", "origin": "npm"}], f)
+        result = validate_cache(cache_path)
+        self.assertFalse(result["valid"])
+        self.assertTrue(result["errors"])
+        os.unlink(cache_path)
+
+    def test_missing_cache(self):
+        result = validate_cache("/nonexistent/cache.json")
+        self.assertFalse(result["valid"])
+
+class TestLogUnknowns(unittest.TestCase):
+    def test_missing_cache_raises_value_error(self):
+        cfg = {"known": {}, "bulk": {}}
+        with self.assertRaises(ValueError):
+            log_unknowns("/nonexistent/cache.json", cfg, tempfile.mktemp(suffix=".json"))
+
+    def test_logs_and_increments(self):
+        dirpath = tempfile.mkdtemp()
+        cache_path = os.path.join(dirpath, "cache.json")
+        log_path = os.path.join(dirpath, "unknown.json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "mystery", "origin": "?"},
+                {"scanned_at": "2026-06-01T00:00:00Z", "count": 1},
+            ], f)
+        cfg = {"known": {}, "bulk": {}}
+        log_unknowns(cache_path, cfg, log_path)
+        log_unknowns(cache_path, cfg, log_path)
+        with open(log_path) as f:
+            data = json.load(f)
+        self.assertEqual(data["tools"]["mystery"]["times_seen"], 2)
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
 
 if __name__ == "__main__":
     unittest.main()
