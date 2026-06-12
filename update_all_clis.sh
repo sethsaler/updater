@@ -3,8 +3,9 @@
 # update-all-clis: Dynamic discovery + update all CLIs and package managers
 #
 # Usage: ./update_all_clis.sh [options]
-#   --rescan          Force a fresh discovery scan
-#   --no-scan         Use existing cache (even if older than TTL)
+#   --rescan          Force a fresh discovery scan (default behavior)
+#   --no-scan         Use existing cache instead of scanning
+#                     (set CACHE_TTL_HOURS=N to reuse a cache newer than N hours)
 #   --skip=a,b        Skip known tools (overrides $SKIP)
 #   --only-origins=   Only run bulk/known matching these origins or names
 #   --skip-origins=   Skip bulk (and known) for these origins
@@ -35,7 +36,9 @@ LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
 UNKNOWN_LOG_FILE="${UNKNOWN_LOG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/unknown_tools.json}"
 LOCK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/locks"
 
-CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-24}"
+# Default 0: every run does a fresh discovery scan so new installs are
+# always picked up. Set CACHE_TTL_HOURS=N to reuse a recent cache instead.
+CACHE_TTL_HOURS="${CACHE_TTL_HOURS:-0}"
 CACHE_TTL_SECONDS=$((CACHE_TTL_HOURS * 3600))
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'

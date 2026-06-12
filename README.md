@@ -117,9 +117,9 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh                 # discover (if needed) + update everything
 ./update_all_clis.sh --list          # show discovered tools and exit
 ./update_all_clis.sh --json          # JSON list of tools (implies --list)
-./update_all_clis.sh --rescan        # force fresh discovery scan
+./update_all_clis.sh --rescan        # force fresh discovery scan (default behavior)
 ./update_all_clis.sh --dry-run       # show what would be updated
-./update_all_clis.sh --no-scan       # use cached discovery only (even if older than TTL)
+./update_all_clis.sh --no-scan       # use cached discovery only (skip scanning)
 ./update_all_clis.sh --json-summary  # after run, print one JSON line: {"ok":N,"failed":M}
 ./update_all_clis.sh --trace         # bash -x when running each update command
 ./update_all_clis.sh --no-scan-path  # skip scanning directories on $PATH
@@ -149,7 +149,7 @@ Use `--validate-cache` and `--debug-cache` to diagnose cache health and performa
 ### Configuration merge and overrides
 
 - **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known` and `bulk` objects are **merged on top of** `tool_config.json` so you can add or override commands without editing the repo file.
-- **`CACHE_TTL_HOURS`** — cache freshness in hours (default **24**). Discovery runs again when the cache is older than this (unless `--no-scan` or a fresh cache is still valid).
+- **`CACHE_TTL_HOURS`** — cache freshness in hours (default **0**, i.e. every run does a fresh discovery scan so new installs are always picked up). Set to e.g. `24` to reuse a cache newer than 24h (unless `--rescan`).
 - **`ONLY_ORIGINS`** — comma-separated origins (and known tool names) to **restrict** what runs. When set, bulk updates run only for listed origins; known tools run only if their `origin` or `name` is listed.
 - **`SKIP_ORIGINS`** — comma-separated origins to skip for bulk updates; known tools whose `origin` is listed are skipped.
 
@@ -221,7 +221,7 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 1. **Discovery scan** — walks 20+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`.
 2. **Version caching** — after each update run, tool versions are cached to speed up future runs. The cache preserves version information across rescans to avoid redundant version probing.
 3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update.
-4. **Cache** — reused until it is older than **`CACHE_TTL_HOURS`** (default 24h), unless you pass **`--rescan`**. A normal run performs **at most one** full scan.
+4. **Cache** — by default every run performs a fresh discovery scan (**`CACHE_TTL_HOURS=0`**) so newly installed tools are always found. Set `CACHE_TTL_HOURS=N` to reuse a cache newer than N hours. A normal run performs **at most one** full scan.
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
 7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs).
