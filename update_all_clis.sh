@@ -493,7 +493,22 @@ _run_one_emit_line() {
 
   if (( PARALLEL_JOBS >= 2 )) && [[ "$cmd_type" != "skip" ]] && [[ -n "$lock_group" ]]; then
     mkdir -p "$LOCK_DIR"
-    { flock -x 200; _run_one_emit_line_core "$cmd_type" "$name" "$cmd"; } 200>"$LOCK_DIR/${lock_group}.lock"
+    if command -v flock >/dev/null 2>&1; then
+      { flock -x 200; _run_one_emit_line_core "$cmd_type" "$name" "$cmd"; } 200>"$LOCK_DIR/${lock_group}.lock"
+    else
+      # macOS has no flock; use a mkdir-based lock instead
+      local _mlock="$LOCK_DIR/${lock_group}.lockdir"
+      local _waited=0
+      until mkdir "$_mlock" 2>/dev/null; do
+        sleep 0.5
+        _waited=$((_waited + 1))
+        (( _waited > 2400 )) && break
+      done
+      local _ec=0
+      _run_one_emit_line_core "$cmd_type" "$name" "$cmd" || _ec=$?
+      rmdir "$_mlock" 2>/dev/null || true
+      return $_ec
+    fi
   else
     _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
   fi
@@ -519,10 +534,12 @@ run_updates_parallel() {
   local pids=()
   local line
   local result_dir
+  local result_idx=0
   result_dir=$(mktemp -d)
 
   for line in "$@"; do
     [[ -z "$line" ]] && continue
+    result_idx=$((result_idx + 1))
     while (( ${#pids[@]} >= max )); do
       # Wait for any child to complete using wait -n if available
       if wait -n 2>/dev/null; then
@@ -545,7 +562,7 @@ run_updates_parallel() {
       fi
     done
     (
-      local result_file="$result_dir/$$.result"
+      local result_file="$result_dir/$result_idx.result"
       SUPPRESS_TRACE=1
       _run_one_emit_line "$line"
       echo $? > "$result_file"
