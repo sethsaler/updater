@@ -75,6 +75,7 @@
     "md-to-pdf": "npm update -g md-to-pdf 2>/dev/null || true",
     "md2pdf": "npm update -g md2pdf 2>/dev/null || true",
     "mem0": "npm update -g @mem0/cli 2>/dev/null || true",
+    "mimo": "mimo upgrade 2>/dev/null || true",
     "mise": "mise self-update 2>/dev/null || true",
     "mmdc": "npm update -g mmdc 2>/dev/null || true",
     "mmx": "npm update -g mmx-cli 2>/dev/null || true",

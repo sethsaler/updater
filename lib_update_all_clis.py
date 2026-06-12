@@ -603,7 +603,8 @@ def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) ->
     scanned_at = meta.get("scanned_at") if meta else None
 
     known = set(cfg["known"].keys())
-    bulk = set(cfg["bulk"].keys())
+    bulk_cmds = cfg["bulk"]
+    bulk = {o for o, c in bulk_cmds.items() if c and str(c).strip()}
 
     existing: dict = {}
     if os.path.isfile(unknown_log_path):

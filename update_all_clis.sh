@@ -734,6 +734,25 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     fi
   fi
 
+  # Auto-tip: discovered tools with no update path at all
+  if [[ -z "$DRY_RUN" ]] && [[ -f "$UNKNOWN_LOG_FILE" ]]; then
+    local _unknown_info
+    _unknown_info=$(python3 -c "
+import json
+d = json.load(open('$UNKNOWN_LOG_FILE'))
+tools = [t['name'] for t in d.get('tools', {}).values() if not t.get('acknowledged')]
+print(len(tools))
+print(', '.join(sorted(tools)[:5]))
+" 2>/dev/null || echo "0")
+    local _unknown_count _unknown_sample
+    _unknown_count=$(echo "$_unknown_info" | head -1)
+    _unknown_sample=$(echo "$_unknown_info" | tail -1)
+    if [[ "$_unknown_count" =~ ^[0-9]+$ ]] && [[ "$_unknown_count" -gt 0 ]]; then
+      warn "$_unknown_count discovered tools have no update path (e.g., $_unknown_sample)"
+      log "  Run './update_all_clis.sh --report-unknown' to review and add them."
+    fi
+  fi
+
   log "Cache: $CACHE_FILE"
   log "Run './update_all_clis.sh --rescan' to force a fresh discovery scan."
   log "Run './update_all_clis.sh --list' to see all discovered tools."

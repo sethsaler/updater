@@ -364,5 +364,24 @@ class TestLogUnknowns(unittest.TestCase):
         import shutil
         shutil.rmtree(dirpath, ignore_errors=True)
 
+    def test_empty_bulk_command_origin_is_logged(self):
+        dirpath = tempfile.mkdtemp()
+        cache_path = os.path.join(dirpath, "cache.json")
+        log_path = os.path.join(dirpath, "unknown.json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "mimo", "origin": "path"},
+                {"name": "covered", "origin": "npm"},
+                {"scanned_at": "2026-06-01T00:00:00Z", "count": 2},
+            ], f)
+        cfg = {"known": {}, "bulk": {"path": "", "npm": "npm update -g"}}
+        log_unknowns(cache_path, cfg, log_path)
+        with open(log_path) as f:
+            data = json.load(f)
+        self.assertIn("mimo", data["tools"])
+        self.assertNotIn("covered", data["tools"])
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()
