@@ -707,42 +707,80 @@ def ack_unknown(unknown_log_path: str, name: str) -> None:
     print(f"Acknowledged '{name}' — it will no longer appear in reports.")
 
 
-def format_run_summary(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> str:
+def diff_new_tools(prev_names_path: str, cache_path: str) -> list[str]:
+    """Return tool names present in the cache but not in the previous-names file."""
+    prev: set[str] = set()
+    if os.path.isfile(prev_names_path):
+        try:
+            with open(prev_names_path, encoding="utf-8") as f:
+                prev = {line.strip() for line in f if line.strip()}
+        except OSError:
+            prev = set()
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    current = {t["name"] for t in data if "name" in t}
+    if not prev:
+        return []
+    return sorted(current - prev)
+
+
+def format_run_summary(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ok: int,
+    fail: int,
+    new_tools: Optional[list[str]] = None,
+) -> str:
+    upgraded: list[str] = []
+    unchanged: list[str] = []
+    for section in ("known", "bulk"):
+        names = set(before.get(section, {})) | set(after.get(section, {}))
+        for name in sorted(names):
+            b = before.get(section, {}).get(name, "?")
+            a = after.get(section, {}).get(name, "?")
+            if b == a:
+                unchanged.append(name)
+            else:
+                upgraded.append(f"  {name}: {b} → {a}")
+
     lines_out: list[str] = [
         "update-all-clis",
         f"Steps: {ok} ok, {fail} failed",
         "",
-        "Known tools:",
+        f"Upgraded ({len(upgraded)}):",
     ]
-    kn = set(before.get("known", {})) | set(after.get("known", {}))
-    if not kn:
-        lines_out.append("  (none)")
-    for name in sorted(kn):
-        b = before.get("known", {}).get(name, "?")
-        a = after.get("known", {}).get(name, "?")
-        if b == a:
-            lines_out.append(f"  {name}: {a}")
-        else:
-            lines_out.append(f"  {name}: {b} → {a}")
+    lines_out.extend(upgraded if upgraded else ["  (none)"])
+
     lines_out.append("")
-    lines_out.append("Bulk (package managers / env):")
-    bk = set(before.get("bulk", {})) | set(after.get("bulk", {}))
-    if not bk:
+    new_tools = new_tools or []
+    lines_out.append(f"New installs added for future runs ({len(new_tools)}):")
+    if new_tools:
+        lines_out.extend(f"  {name}" for name in sorted(new_tools))
+    else:
         lines_out.append("  (none)")
-    for name in sorted(bk):
-        b = before.get("bulk", {}).get(name, "?")
-        a = after.get("bulk", {}).get(name, "?")
-        if b == a:
-            lines_out.append(f"  {name}: {a}")
-        else:
-            lines_out.append(f"  {name}: {b} → {a}")
+
+    lines_out.append("")
+    lines_out.append(f"Already up to date ({len(unchanged)}):")
+    if unchanged:
+        lines_out.append("  " + ", ".join(sorted(unchanged)))
+    else:
+        lines_out.append("  (none)")
     return "\n".join(lines_out) + "\n"
 
 
-def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
+def notify_macos_dialog(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ok: int,
+    fail: int,
+    new_tools: Optional[list[str]] = None,
+) -> None:
     if sys.platform != "darwin":
         return
-    body = format_run_summary(before, after, ok, fail).rstrip("\n")
+    body = format_run_summary(before, after, ok, fail, new_tools).rstrip("\n")
     if len(body) > 950:
         body = body[:947] + "\n…"
     fd, path = tempfile.mkstemp(suffix=".txt", text=True)
@@ -772,9 +810,15 @@ def notify_macos_dialog(before: dict[str, Any], after: dict[str, Any], ok: int, 
             pass
 
 
-def notify_linux(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
+def notify_linux(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ok: int,
+    fail: int,
+    new_tools: Optional[list[str]] = None,
+) -> None:
     if sys.platform == "linux" and shutil.which("notify-send"):
-        body = format_run_summary(before, after, ok, fail).rstrip("\n")
+        body = format_run_summary(before, after, ok, fail, new_tools).rstrip("\n")
         if len(body) > 500:
             body = body[:497] + "…"
         subprocess.run(
@@ -788,14 +832,31 @@ def notify_linux(before: dict[str, Any], after: dict[str, Any], ok: int, fail: i
         )
 
 
-def notify_diff(before: dict[str, Any], after: dict[str, Any], ok: int, fail: int) -> None:
-    notify_macos_dialog(before, after, ok, fail)
-    notify_linux(before, after, ok, fail)
+def notify_diff(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ok: int,
+    fail: int,
+    new_tools: Optional[list[str]] = None,
+) -> None:
+    notify_macos_dialog(before, after, ok, fail, new_tools)
+    notify_linux(before, after, ok, fail, new_tools)
 
 
 def _load_json(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _load_new_tools_arg(path: str) -> list[str]:
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
 
 
 def parse_npm_globals_json(json_input: str) -> str:
@@ -1124,7 +1185,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         print(
             "usage: lib_update_all_clis.py emit|emit-json|list-json|snapshot-versions|"
-            "notify-diff|run-summary|suggest|suggest-known|suggest-known-count|"
+            "notify-diff|run-summary|new-tools|suggest|suggest-known|suggest-known-count|"
             "log-unknowns|report-unknown|ack-unknown|"
             "parse-npm-globals|convert-tools-array|update-cache-versions|validate-cache|debug-cache|"
             "health-check|backup|restore|list-backups|benchmark …",
@@ -1239,11 +1300,17 @@ def main() -> None:
     elif cmd == "notify-diff":
         before = _load_json(sys.argv[2])
         after = _load_json(sys.argv[3])
-        notify_diff(before, after, int(sys.argv[4]), int(sys.argv[5]))
+        new_tools = _load_new_tools_arg(sys.argv[6] if len(sys.argv) > 6 else "")
+        notify_diff(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools)
     elif cmd == "run-summary":
         before = _load_json(sys.argv[2])
         after = _load_json(sys.argv[3])
-        sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5])))
+        new_tools = _load_new_tools_arg(sys.argv[6] if len(sys.argv) > 6 else "")
+        sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools))
+    elif cmd == "new-tools":
+        prev_names_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        cache_path = sys.argv[3] if len(sys.argv) > 3 else ""
+        print(json.dumps(diff_new_tools(prev_names_path, cache_path)))
     elif cmd == "suggest":
         cache_path = sys.argv[2]
         base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")

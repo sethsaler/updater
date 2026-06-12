@@ -383,5 +383,55 @@ class TestLogUnknowns(unittest.TestCase):
         import shutil
         shutil.rmtree(dirpath, ignore_errors=True)
 
+class TestRunSummary(unittest.TestCase):
+    def test_sections(self):
+        from lib_update_all_clis import format_run_summary
+        before = {"known": {"a": "1.0", "b": "2.0"}, "bulk": {"npm": "10.0"}}
+        after = {"known": {"a": "1.1", "b": "2.0"}, "bulk": {"npm": "10.0"}}
+        out = format_run_summary(before, after, 3, 0, ["mimo"])
+        self.assertIn("Upgraded (1):", out)
+        self.assertIn("a: 1.0 → 1.1", out)
+        self.assertIn("New installs added for future runs (1):", out)
+        self.assertIn("  mimo", out)
+        self.assertIn("Already up to date (2):", out)
+        self.assertIn("b, npm", out)
+
+    def test_empty_sections(self):
+        from lib_update_all_clis import format_run_summary
+        out = format_run_summary({}, {}, 0, 0)
+        self.assertIn("Upgraded (0):", out)
+        self.assertIn("New installs added for future runs (0):", out)
+        self.assertIn("Already up to date (0):", out)
+
+
+class TestDiffNewTools(unittest.TestCase):
+    def test_detects_new_tools(self):
+        from lib_update_all_clis import diff_new_tools
+        dirpath = tempfile.mkdtemp()
+        prev_path = os.path.join(dirpath, "prev.txt")
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(prev_path, "w") as f:
+            f.write("old-tool\n")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "old-tool", "origin": "npm"},
+                {"name": "mimo", "origin": "path"},
+                {"scanned_at": "2026-06-12T00:00:00Z", "count": 2},
+            ], f)
+        self.assertEqual(diff_new_tools(prev_path, cache_path), ["mimo"])
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+
+    def test_empty_prev_returns_nothing(self):
+        from lib_update_all_clis import diff_new_tools
+        dirpath = tempfile.mkdtemp()
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": "x", "origin": "npm"}], f)
+        self.assertEqual(diff_new_tools(os.path.join(dirpath, "missing.txt"), cache_path), [])
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

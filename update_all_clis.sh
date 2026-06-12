@@ -641,7 +641,23 @@ main() {
     exit 0
   fi
 
+  local _prev_names_snap
+  _prev_names_snap=$(mktemp)
+  if [[ -f "$CACHE_FILE" ]]; then
+    python3 -c "
+import json
+for t in json.load(open('$CACHE_FILE')):
+    if 'name' in t:
+        print(t['name'])
+" > "$_prev_names_snap" 2>/dev/null || true
+  fi
+
   ensure_cache
+
+  local _new_tools_snap
+  _new_tools_snap=$(mktemp)
+  python3 "$LIB_SCRIPT" new-tools "$_prev_names_snap" "$CACHE_FILE" > "$_new_tools_snap" 2>/dev/null || echo "[]" > "$_new_tools_snap"
+  rm -f "$_prev_names_snap"
 
   if [[ -n "$LIST_MODE" ]]; then
     if [[ -n "$LIST_JSON" ]]; then
@@ -706,15 +722,16 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   if [[ -n "$_emit_snap" ]]; then
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" > "$_after_snap" 2>/dev/null || true
     if _want_notify_popup; then
-      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" 2>/dev/null || true
+      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" 2>/dev/null || true
     fi
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
-      python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+      python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
     fi
     # Update cache with new version information
     cat "$_after_snap" | python3 "$LIB_SCRIPT" update-cache-versions "$CACHE_FILE" 2>/dev/null || true
     rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
   fi
+  rm -f "$_new_tools_snap"
 
   log ""
   log "${BOLD}=== Done! ===${NC}"
