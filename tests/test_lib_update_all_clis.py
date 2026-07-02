@@ -433,5 +433,80 @@ class TestDiffNewTools(unittest.TestCase):
         shutil.rmtree(dirpath, ignore_errors=True)
 
 
+class TestCachedVersions(unittest.TestCase):
+    def test_load_cached_versions(self):
+        from lib_update_all_clis import _load_cached_versions
+        dirpath = tempfile.mkdtemp()
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "tool1", "origin": "npm", "version": "1.2.3"},
+                {"name": "tool2", "origin": "cargo", "version": "9.9", "pm_version": "1.75"},
+                {"name": "noversion", "origin": "npm"},
+                {"scanned_at": "x", "count": 2},
+            ], f)
+        known, bulk = _load_cached_versions(cache_path)
+        self.assertEqual(known.get("tool1"), "1.2.3")
+        self.assertNotIn("noversion", known)
+        self.assertEqual(bulk.get("cargo"), "1.75")
+        # missing / none are no-ops
+        self.assertEqual(_load_cached_versions("/nonexistent"), ({}, {}))
+        self.assertEqual(_load_cached_versions(None), ({}, {}))
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+
+    def test_snapshot_uses_cache_and_skips_probe(self):
+        import lib_update_all_clis as m
+        dirpath = tempfile.mkdtemp()
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": "cachedtool", "origin": "npm", "version": "7.7.7"}], f)
+        called = []
+        orig = m.probe_known
+        m.probe_known = lambda name: called.append(name) or "PROBED"
+        try:
+            lines = [f"known{EMIT_SEP}cachedtool{EMIT_SEP}echo{EMIT_SEP}npm"]
+            snap = m.snapshot_versions(lines, cache_path)
+        finally:
+            m.probe_known = orig
+        self.assertEqual(snap["known"]["cachedtool"], "7.7.7")
+        self.assertEqual(called, [])
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+
+
+class TestHoldLock(unittest.TestCase):
+    def test_busy_then_acquire(self):
+        import subprocess, time
+        import shutil
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(dirpath, ignore_errors=True))
+        lockfile = os.path.join(dirpath, "sub.lock")
+        lib = os.path.join(REPO_ROOT, "lib_update_all_clis.py")
+        py = sys.executable
+
+        holder = subprocess.Popen([py, lib, "hold-lock", lockfile],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            self.assertEqual(holder.stdout.readline().decode().strip(), "LOCKED")
+            # Non-blocking attempt while held must report BUSY (exit 2).
+            r = subprocess.run([py, lib, "try-hold-lock", lockfile],
+                               capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), "BUSY")
+            self.assertEqual(r.returncode, 2)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        # After release, a fresh non-blocking attempt acquires (LOCKED).
+        r = subprocess.Popen([py, lib, "try-hold-lock", lockfile],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            self.assertEqual(r.stdout.readline().decode().strip(), "LOCKED")
+        finally:
+            r.terminate()
+            r.wait()
+
+
 if __name__ == "__main__":
     unittest.main()

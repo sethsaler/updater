@@ -2,9 +2,11 @@
 """Merge tool config, validate, emit update lines for update_all_clis.sh."""
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -360,7 +362,7 @@ def probe_bulk(origin: str) -> str:
         "rbenv": ("rbenv", "--version"),
         "conda": ("conda", "--version"),
         "opencode": ("opencode", "--version"),
-        "manual": ("brew", "--version"),
+        "manual": (),
         "dotnet": ("dotnet", "--version"),
         "krew": ("kubectl", "krew", "version"),
         "mise": ("mise", "--version"),
@@ -393,7 +395,37 @@ def probe_bulk(origin: str) -> str:
     return _probe_single(cmd)
 
 
-def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
+def _load_cached_versions(cache_path: Optional[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (tool_name->version, origin->pm_version) from a cache file, if present.
+
+    Lets the "before" snapshot reuse versions captured on the previous run
+    instead of re-spawning `--version` probes for every tool.
+    """
+    versions: dict[str, str] = {}
+    pm_versions: dict[str, str] = {}
+    if not cache_path or not os.path.isfile(cache_path):
+        return versions, pm_versions
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return versions, pm_versions
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if name and item.get("version"):
+            versions[str(name)] = str(item["version"])
+        origin = item.get("origin")
+        if origin and item.get("pm_version"):
+            pm_versions[str(origin)] = str(item["pm_version"])
+    return versions, pm_versions
+
+
+def snapshot_versions(
+    lines: list[str],
+    cache_path: Optional[str] = None,
+) -> dict[str, dict[str, str]]:
     logger.debug(f"Snapshotting versions for {len(lines)} lines")
     known: dict[str, str] = {}
     bulk: dict[str, str] = {}
@@ -419,12 +451,19 @@ def snapshot_versions(lines: list[str]) -> dict[str, dict[str, str]]:
             seen_bulk.add(name)
             bulk_tasks.append((name, "bulk"))
     
+    # Reuse versions captured on the previous run (avoids re-probing)
+    cached_known, cached_bulk = _load_cached_versions(cache_path)
+
     # Probe versions in parallel with progress tracking
     def probe_task(task: tuple[str, str]) -> tuple[str, str, str]:
         name, kind = task
         if kind == "known":
+            if name in cached_known:
+                return name, "known", cached_known[name]
             return name, "known", probe_known(name)
         else:
+            if name in cached_bulk:
+                return name, "bulk", cached_bulk[name]
             return name, "bulk", probe_bulk(name)
     
     all_tasks = known_tasks + bulk_tasks
@@ -787,23 +826,26 @@ def notify_macos_dialog(
     try:
         with os.fdopen(fd, "w", encoding="utf-16") as f:
             f.write(body)
-        path_esc = path.replace("\\", "\\\\").replace('"', '\\"')
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                f'set f to POSIX file "{path_esc}"',
-                "-e",
-                "set msg to read file f as Unicode text",
-                "-e",
-                'display dialog msg with title "update-all-clis" buttons {"OK"} default button "OK"',
-            ],
-            check=False,
-            timeout=120,
+        # Run the modal fully detached so the calling script never blocks.
+        # `giving up after` ensures osascript never lingers indefinitely.
+        # The wrapper removes the temp file after osascript finishes.
+        path_osa = path.replace("\\", "\\\\").replace('"', '\\"')
+        osa_args = [
+            "osascript",
+            "-e", f'set f to POSIX file "{path_osa}"',
+            "-e", "set msg to read file f as Unicode text",
+            "-e",
+            'display dialog msg with title "update-all-clis" '
+            'buttons {"OK"} default button "OK" giving up after 120',
+        ]
+        wrapper = " ".join(shlex.quote(a) for a in osa_args) + f" ; rm -f {shlex.quote(path)}"
+        subprocess.Popen(
+            ["bash", "-c", wrapper],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except OSError:
-        pass
-    finally:
         try:
             os.unlink(path)
         except OSError:
@@ -1181,6 +1223,44 @@ def benchmark_operation(
     return results
 
 
+def hold_lock(path: str, blocking: bool = True) -> int:
+    """Acquire an exclusive lock on `path` via fcntl.flock and hold it until killed.
+
+    Prints 'LOCKED' to stdout once acquired, or 'BUSY' (exit 2) when non-blocking
+    and already held. The lock is released automatically when the process dies
+    (the OS closes the fd). Works on macOS and Linux without the `flock` binary.
+    """
+    lock_dir = os.path.dirname(path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    flags = fcntl.LOCK_EX
+    if not blocking:
+        flags |= fcntl.LOCK_NB
+    try:
+        f = open(path, "a", encoding="utf-8")
+    except OSError as e:
+        print(f"LOCK_ERROR {e}", file=sys.stderr)
+        return 3
+    try:
+        fcntl.flock(f.fileno(), flags)
+    except OSError:
+        f.close()
+        if not blocking:
+            sys.stdout.write("BUSY\n")
+            sys.stdout.flush()
+            return 2
+        print("LOCK_ERROR could not acquire lock", file=sys.stderr)
+        return 3
+    sys.stdout.write("LOCKED\n")
+    sys.stdout.flush()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print(
@@ -1188,7 +1268,7 @@ def main() -> None:
             "notify-diff|run-summary|new-tools|suggest|suggest-known|suggest-known-count|"
             "log-unknowns|report-unknown|ack-unknown|"
             "parse-npm-globals|convert-tools-array|update-cache-versions|validate-cache|debug-cache|"
-            "health-check|backup|restore|list-backups|benchmark …",
+            "health-check|backup|restore|list-backups|hold-lock|try-hold-lock|benchmark …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -1240,6 +1320,12 @@ def main() -> None:
             sys.exit(2)
         success = restore_backup(cache_path, backup_path)
         sys.exit(0 if success else 1)
+    elif cmd in ("hold-lock", "try-hold-lock"):
+        path = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not path:
+            print(f"usage: lib_update_all_clis.py {cmd} <path>", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(hold_lock(path, blocking=(cmd == "hold-lock")))
     elif cmd == "parse-npm-globals":
         json_input = sys.stdin.read()
         result = parse_npm_globals_json(json_input)
@@ -1294,8 +1380,9 @@ def main() -> None:
         list_json(cache_path)
     elif cmd == "snapshot-versions":
         emit_path = sys.argv[2]
+        cache_path = sys.argv[3] if len(sys.argv) > 3 else None
         with open(emit_path, encoding="utf-8") as f:
-            snap = snapshot_versions(f.read().splitlines())
+            snap = snapshot_versions(f.read().splitlines(), cache_path)
         print(json.dumps(snap))
     elif cmd == "notify-diff":
         before = _load_json(sys.argv[2])

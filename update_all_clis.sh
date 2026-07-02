@@ -10,7 +10,7 @@
 #   --only-origins=   Only run bulk/known matching these origins or names
 #   --skip-origins=   Skip bulk (and known) for these origins
 #   --no-scan-path    Skip scanning directories on $PATH (origin: path)
-#   --parallel=N      Run up to N updates concurrently (default 1)
+#   --parallel=N      Run up to N updates concurrently (default 8)
 #   --json-summary    Print JSON ok/failed counts on stdout after run
 #   --list --json     Machine-readable tool list (with --list)
 #   --report-unknown  Show tools discovered with no update path
@@ -19,6 +19,8 @@
 #   --trace           Trace shell commands (bash -x)
 #   --dry-run         Show commands without running
 #   --json-plan       Print planned updates as JSON and exit
+#   --notify          Show the desktop summary dialog (non-blocking, opt-in)
+#                     (also: UPDATE_ALL_CLIS_NOTIFY=1; default is silent)
 #   --version         Print version and exit
 # =============================================================================
 
@@ -53,9 +55,13 @@ ONLY_ORIGINS="${ONLY_ORIGINS:-}"
 SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
-SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8
+SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8; NOTIFY=""
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
 SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
+
+# Background-job bookkeeping for the cleanup trap (parallel updates + locks).
+_UAC_PIDS=()
+_UAC_RUN_LOCK_PID=""
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -75,6 +81,39 @@ is_skipped() {
   done
   return 1
 }
+
+# -------------------------------------------------------------------
+# Cleanup: kill background update jobs + release locks on exit/interrupt
+# -------------------------------------------------------------------
+_kill_tree() {
+  # Recursively kill a process and all its descendants (pgrep is available
+  # on both macOS and Linux). Ensures in-flight brew/npm/cargo updates
+  # don't survive a Ctrl+C as orphans.
+  local parent="$1"
+  [[ "$parent" =~ ^[0-9]+$ ]] || return 0
+  local child
+  while IFS= read -r child; do
+    [[ -n "$child" ]] && _kill_tree "$child"
+  done < <(pgrep -P "$parent" 2>/dev/null)
+  kill "$parent" 2>/dev/null || true
+}
+
+_cleanup() {
+  # Stop background update subshells and any commands they spawned.
+  local _pid
+  for _pid in "${_UAC_PIDS[@]:-}"; do
+    [[ -n "$_pid" ]] && _kill_tree "$_pid"
+  done
+  # Catch any background children not tracked in _UAC_PIDS.
+  pkill -P $$ 2>/dev/null || true
+  # Release the single-instance lock.
+  if [[ -n "$_UAC_RUN_LOCK_PID" ]]; then
+    kill "$_UAC_RUN_LOCK_PID" 2>/dev/null || true
+  fi
+  # Remove lock directory (flock holders release on fd close / process death).
+  [[ -d "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+trap _cleanup EXIT INT TERM
 
 # -------------------------------------------------------------------
 # Argument parsing
@@ -107,6 +146,7 @@ while [[ $# -gt 0 ]]; do
     --validate-cache)  VALIDATE_CACHE=1; shift ;;
     --debug-cache)     DEBUG_CACHE=1; shift ;;
     --suggest-known)   SUGGEST_KNOWN=1; shift ;;
+    --notify)          NOTIFY=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -133,7 +173,8 @@ if [[ "$PARALLEL_JOBS" == "0" ]]; then
 fi
 
 # -------------------------------------------------------------------
-# Desktop summary for manual (TTY) runs unless overridden.
+# Desktop summary is opt-in only so the terminal never blocks/hangs.
+# Enable with --notify or UPDATE_ALL_CLIS_NOTIFY=1.
 # Scheduled LaunchAgent/systemd set UPDATE_ALL_CLIS_NO_NOTIFY=1.
 # -------------------------------------------------------------------
 _want_notify_popup() {
@@ -142,7 +183,7 @@ _want_notify_popup() {
     1) return 0 ;;
     0) return 1 ;;
   esac
-  [[ -t 1 ]]
+  [[ -n "$NOTIFY" ]]
 }
 
 # -------------------------------------------------------------------
@@ -482,6 +523,31 @@ _run_one_emit_line_core() {
   esac
 }
 
+# Acquire a per-origin lock via Python fcntl.flock (works on macOS, no flock
+# binary needed). Spawns a "holder" coprocess that prints LOCKED then blocks;
+# we wait for LOCKED, run the critical section, then kill the holder to release.
+_run_with_py_lock() {
+  local lock_group="$1"; shift
+  local lockfile="$LOCK_DIR/${lock_group}.lock"
+  local _ready _holder _waited=0 _ec=0
+  _ready=$(mktemp)
+  python3 "$LIB_SCRIPT" hold-lock "$lockfile" >"$_ready" 2>/dev/null &
+  _holder=$!
+  # Wait for the lock (OS-managed queue; no busy spin). 5-min safety cap so
+  # a dead holder can never hang the run.
+  until grep -q '^LOCKED$' "$_ready" 2>/dev/null; do
+    sleep 0.2
+    _waited=$((_waited + 1))
+    (( _waited > 1500 )) && break
+    kill -0 "$_holder" 2>/dev/null || break
+  done
+  _run_one_emit_line_core "$@" || _ec=$?
+  kill "$_holder" 2>/dev/null || true
+  wait "$_holder" 2>/dev/null || true
+  rm -f "$_ready"
+  return $_ec
+}
+
 _run_one_emit_line() {
   local line="$1"
   local cmd_type name cmd lock_group
@@ -496,18 +562,8 @@ _run_one_emit_line() {
     if command -v flock >/dev/null 2>&1; then
       { flock -x 200; _run_one_emit_line_core "$cmd_type" "$name" "$cmd"; } 200>"$LOCK_DIR/${lock_group}.lock"
     else
-      # macOS has no flock; use a mkdir-based lock instead
-      local _mlock="$LOCK_DIR/${lock_group}.lockdir"
-      local _waited=0
-      until mkdir "$_mlock" 2>/dev/null; do
-        sleep 0.5
-        _waited=$((_waited + 1))
-        (( _waited > 2400 )) && break
-      done
-      local _ec=0
-      _run_one_emit_line_core "$cmd_type" "$name" "$cmd" || _ec=$?
-      rmdir "$_mlock" 2>/dev/null || true
-      return $_ec
+      _run_with_py_lock "$lock_group" "$cmd_type" "$name" "$cmd"
+      return $?
     fi
   else
     _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
@@ -536,6 +592,7 @@ run_updates_parallel() {
   local result_dir
   local result_idx=0
   result_dir=$(mktemp -d)
+  _UAC_PIDS=()
 
   for line in "$@"; do
     [[ -z "$line" ]] && continue
@@ -568,11 +625,13 @@ run_updates_parallel() {
       echo $? > "$result_file"
     ) &
     pids+=($!)
+    _UAC_PIDS+=("$!")
   done
   # Wait for all remaining processes
   for _pid in "${pids[@]}"; do
     wait "$_pid" 2>/dev/null || true
   done
+  _UAC_PIDS=()
   # Count results from files
   for result_file in "$result_dir"/*.result; do
     [[ -f "$result_file" ]] || continue
@@ -591,12 +650,6 @@ run_updates_parallel() {
 # Main
 # -------------------------------------------------------------------
 main() {
-  # Cleanup trap for lock files
-  cleanup_locks() {
-    [[ -d "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
-  }
-  trap cleanup_locks EXIT INT TERM
-
   if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Missing config: $CONFIG_FILE" >&2
     exit 1
@@ -650,6 +703,27 @@ main() {
     python3 "$LIB_SCRIPT" suggest-known "$CACHE_FILE"
     exit 0
   fi
+
+  # Single-instance lock for anything that scans/writes the cache or runs
+  # updates (read-only commands above already exited). Avoids overlapping runs
+  # (LaunchAgent + manual, or two terminals) clobbering each other's cache.
+  # Non-blocking; exits if another run holds it. Held until cleanup kills it.
+  mkdir -p "$LOCK_DIR"
+  local _ilock_out _iwait=0
+  _ilock_out=$(mktemp)
+  python3 "$LIB_SCRIPT" try-hold-lock "$LOCK_DIR/run.lock" >"$_ilock_out" 2>/dev/null &
+  _UAC_RUN_LOCK_PID=$!
+  while (( _iwait < 50 )); do
+    if grep -q '^LOCKED$' "$_ilock_out" 2>/dev/null; then break; fi
+    if grep -q '^BUSY$' "$_ilock_out" 2>/dev/null; then
+      warn "another update-all-clis run is in progress; exiting"
+      rm -f "$_ilock_out"
+      exit 0
+    fi
+    sleep 0.1
+    _iwait=$((_iwait + 1))
+  done
+  rm -f "$_ilock_out"
 
   if [[ -n "$JSON_PLAN" ]]; then
     ensure_cache
@@ -730,7 +804,9 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     _before_snap=$(mktemp)
     _after_snap=$(mktemp)
     printf '%s\n' "${lines[@]}" > "$_emit_snap"
-    python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" > "$_before_snap" 2>/dev/null || true
+    # "before" reuses versions cached on the previous run (no subprocess spawns);
+    # "after" probes fresh to capture what changed.
+    python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "$CACHE_FILE" > "$_before_snap" 2>/dev/null || true
   fi
 
   if (( PARALLEL_JOBS < 2 )); then
