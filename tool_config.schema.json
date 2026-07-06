@@ -19,6 +19,29 @@
         "type": "string",
         "description": "Shell command to update all tools from this origin"
       }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "description": "Shell command whose stdout decides whether this origin's bulk update is needed: exit 0 with empty (or '[]'/'{}') stdout means up to date and the update is skipped; any other result runs the update as normal."
+      }
+    },
+    "hold": {
+      "type": "array",
+      "description": "Pinned known-tool names and/or bulk origins to skip every run until removed. An entry may be \"name\" or \"name:major\" (v1 treats both identically; see README).",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "repos": {
+      "type": "object",
+      "description": "Tool/origin name -> GitHub 'owner/repo', used for the best-effort changelog digest.",
+      "additionalProperties": {
+        "type": "string",
+        "description": "GitHub 'owner/repo' slug"
+      }
     }
   }
 }

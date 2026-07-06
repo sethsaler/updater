@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import fcntl
+import glob
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -13,12 +15,27 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Optional
 
 _UV_ORIGINS = frozenset({"uv", "uv/pip", "uv/venv"})
 EMIT_SEP = "\x1e"
+
+
+def _read_lines(path: str) -> list[str]:
+    """Read a text file and split strictly on "\\n".
+
+    NOT `str.splitlines()`: emit/result lines are joined with EMIT_SEP
+    ("\\x1e", ASCII Record Separator), and `splitlines()` treats \\x1e (along
+    with \\x1c, \\x1d, \\x85, \\u2028, \\u2029) as its own line boundary,
+    which would shred every EMIT_SEP-delimited field onto its own "line".
+    """
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    return content.split("\n")
 DEBUG = os.environ.get("UAC_DEBUG", "0") == "1"
 RATE_LIMIT_DELAY = float(os.environ.get("UAC_RATE_LIMIT_DELAY", "0.01"))
 
@@ -68,11 +85,23 @@ def load_merge(base_path: str, local_path: Optional[str]) -> dict[str, Any]:
                 loc = json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in local config file {local_path}: {e}")
-        for key in ("known", "bulk"):
+        for key in ("known", "bulk", "check", "repos"):
             if key in loc and isinstance(loc[key], dict):
                 base.setdefault(key, {})
                 base[key].update(loc[key])
                 logger.debug(f"Merged {len(loc[key])} entries from local config {key}")
+        # "hold" is a flat list, not a dict: local entries ADD to (rather than
+        # replace) the base list, deduplicated, preserving base order first.
+        if "hold" in loc and isinstance(loc["hold"], list):
+            base_hold = base.get("hold", [])
+            if not isinstance(base_hold, list):
+                base_hold = []
+            merged_hold = list(base_hold)
+            for entry in loc["hold"]:
+                if entry not in merged_hold:
+                    merged_hold.append(entry)
+            base["hold"] = merged_hold
+            logger.debug(f"Merged hold list, now {len(merged_hold)} entries")
     return base
 
 
@@ -81,14 +110,14 @@ def validate(cfg: dict[str, Any]) -> None:
     # Check required top-level keys
     if not isinstance(cfg.get("known"), dict) or not isinstance(cfg.get("bulk"), dict):
         raise ValueError("config must contain 'known' and 'bulk' objects")
-    
+
     # Validate known section
     for k, v in cfg["known"].items():
         if not isinstance(k, str) or not k:
             raise ValueError(f"known key must be a non-empty string, got {k!r}")
         if not isinstance(v, str):
             raise ValueError(f"known.{k!r} must be a string command")
-    
+
     # Validate bulk section
     for k, v in cfg["bulk"].items():
         if not isinstance(k, str) or not k:
@@ -96,11 +125,104 @@ def validate(cfg: dict[str, Any]) -> None:
         if not isinstance(v, str):
             raise ValueError(f"bulk.{k!r} must be a string command")
 
+    # Validate optional check section (origin -> "is anything outdated?" probe
+    # command). Missing entirely is fine; every origin without a check simply
+    # never gets pre-checked and always runs its bulk update as before.
+    if "check" in cfg:
+        if not isinstance(cfg["check"], dict):
+            raise ValueError("'check' must be an object mapping origin to a check command")
+        for k, v in cfg["check"].items():
+            if not isinstance(k, str) or not k:
+                raise ValueError(f"check key must be a non-empty string, got {k!r}")
+            if not isinstance(v, str):
+                raise ValueError(f"check.{k!r} must be a string command")
+
+    # Validate optional "hold" list (pinned tools/origins). Each entry is
+    # either a plain known-tool name / bulk-origin name, or "name:major" —
+    # the latter is accepted but (v1) treated identically to a plain hold;
+    # see README for why semver-aware holds only apply at the summary level.
+    if "hold" in cfg:
+        if not isinstance(cfg["hold"], list):
+            raise ValueError("'hold' must be an array of strings")
+        for entry in cfg["hold"]:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(f"hold entries must be non-empty strings, got {entry!r}")
+
+    # Validate optional "repos" mapping (tool/origin name -> GitHub owner/repo,
+    # used for the best-effort changelog digest).
+    if "repos" in cfg:
+        if not isinstance(cfg["repos"], dict):
+            raise ValueError("'repos' must be an object mapping name to 'owner/repo'")
+        for k, v in cfg["repos"].items():
+            if not isinstance(k, str) or not k:
+                raise ValueError(f"repos key must be a non-empty string, got {k!r}")
+            if not isinstance(v, str) or "/" not in v:
+                raise ValueError(f"repos.{k!r} must be a string 'owner/repo'")
+
 
 def _parse_csv(s: Optional[str]) -> set[str]:
     if not s or not str(s).strip():
         return set()
     return {x.strip() for x in str(s).split(",") if x.strip()}
+
+
+def _hold_base_name(entry: str) -> str:
+    """Strip a ":major" suffix from a hold entry, e.g. "claude:major" -> "claude".
+
+    v1 treats "name:major" identically to a plain hold (we can't reliably know
+    the target version ahead of time for most managers); the ":major" suffix
+    is accepted for forward-compat and documented in the README.
+    """
+    if entry.endswith(":major"):
+        return entry[: -len(":major")]
+    return entry
+
+
+def normalize_hold_entries(entries: Optional[list[str]]) -> set[str]:
+    """Config `hold` list -> set of plain names/origins (":major" suffix stripped)."""
+    if not entries:
+        return set()
+    return {_hold_base_name(e) for e in entries if isinstance(e, str) and e.strip()}
+
+
+def edit_local_hold(
+    local_path: str,
+    add: Optional[set[str]] = None,
+    remove: Optional[set[str]] = None,
+) -> list[str]:
+    """Add/remove entries in `local_path`'s "hold" array in place (creates the file if needed).
+
+    Backs `--hold=`/`--unhold=` CLI flags. Preserves every other key already
+    in the local config file untouched. Returns the resulting hold list.
+    """
+    data: dict[str, Any] = {}
+    if os.path.isfile(local_path):
+        try:
+            with open(local_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    hold = [h for h in data.get("hold", []) if isinstance(h, str)]
+    if add:
+        for name in sorted(add):
+            if name not in hold:
+                hold.append(name)
+    if remove:
+        remove_bases = {_hold_base_name(r) for r in remove}
+        hold = [h for h in hold if _hold_base_name(h) not in remove_bases]
+    data["hold"] = hold
+
+    local_dir = os.path.dirname(local_path)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+    tmp_path = local_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, local_path)
+    return hold
 
 
 def lock_group_for(origin: str, cmd: str, name: str) -> str:
@@ -152,11 +274,228 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
     return None
 
 
+def _stdout_signals_uptodate(stdout: str) -> bool:
+    """True if a check command's stdout means "nothing to update".
+
+    Empty output, or an empty JSON array/object (`[]`/`{}`), both count as
+    up to date. Any other output (including unparseable non-empty text,
+    which is treated conservatively as "there might be something") means
+    the bulk update should still run.
+    """
+    s = (stdout or "").strip()
+    if not s:
+        return True
+    if s in ("[]", "{}"):
+        return True
+    try:
+        parsed = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if isinstance(parsed, (list, dict)):
+        return len(parsed) == 0
+    return False
+
+
+def run_check_command(cmd: str, timeout: int = 60) -> tuple[bool, float]:
+    """Run one `check` command; return (is_up_to_date, duration_s).
+
+    Fails open: a missing binary, non-zero exit, or timeout is treated as
+    "not up to date" (i.e. the real bulk update still runs).
+    """
+    start = time.time()
+    try:
+        r = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, time.time() - start
+    duration = time.time() - start
+    if r.returncode != 0:
+        return False, duration
+    return _stdout_signals_uptodate(r.stdout), duration
+
+
+def _precheck_candidates(
+    cfg: dict[str, Any],
+    only_origins: Optional[str] = None,
+    skip_origins: Optional[str] = None,
+) -> list[tuple[str, str]]:
+    """(origin, cmd) pairs eligible to be pre-checked, honoring only/skip filters."""
+    checks = cfg.get("check", {}) or {}
+    only = _parse_csv(only_origins)
+    skip = _parse_csv(skip_origins)
+    out: list[tuple[str, str]] = []
+    for origin, cmd in checks.items():
+        if not cmd or not str(cmd).strip():
+            continue
+        if origin in skip:
+            continue
+        if only and origin not in only:
+            continue
+        out.append((origin, cmd))
+    return out
+
+
+def precheck_candidate_origins(
+    cfg: dict[str, Any],
+    only_origins: Optional[str] = None,
+    skip_origins: Optional[str] = None,
+) -> list[str]:
+    """Origins that WOULD be pre-checked this run (no commands executed)."""
+    return sorted(o for o, _ in _precheck_candidates(cfg, only_origins, skip_origins))
+
+
+def run_prechecks(
+    cfg: dict[str, Any],
+    only_origins: Optional[str] = None,
+    skip_origins: Optional[str] = None,
+) -> dict[str, float]:
+    """Run all configured `check` commands concurrently.
+
+    Returns {origin: duration_s} for origins confirmed up to date (and thus
+    safe to skip this run). Origins with no check, or whose check fails/errors/
+    produces real output, are simply absent from the result (fail open).
+    """
+    candidates = _precheck_candidates(cfg, only_origins, skip_origins)
+    if not candidates:
+        return {}
+    results: dict[str, float] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
+        future_to_origin = {
+            executor.submit(run_check_command, cmd): origin for origin, cmd in candidates
+        }
+        for future in as_completed(future_to_origin):
+            origin = future_to_origin[future]
+            try:
+                uptodate, duration = future.result()
+            except Exception:
+                continue
+            if uptodate:
+                results[origin] = round(duration, 3)
+    return results
+
+
+def default_history_path() -> str:
+    """Default location for the run-history JSONL file (override via env)."""
+    return os.environ.get(
+        "UPDATE_ALL_CLIS_HISTORY_FILE",
+        os.path.join(
+            os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+            "update-all-clis",
+            "history.jsonl",
+        ),
+    )
+
+
+HISTORY_MAX_LINES = 2000
+DEFAULT_QUARANTINE_AFTER = 3
+HISTORY_JOBS_PER_MEAN = 10
+
+
+def load_history_records(history_path: Optional[str]) -> list[dict[str, Any]]:
+    """Read all JSONL history records in file order (oldest first)."""
+    if not history_path or not os.path.isfile(history_path):
+        return []
+    records: list[dict[str, Any]] = []
+    with open(history_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                records.append(rec)
+    return records
+
+
+def load_history_by_name(history_path: Optional[str]) -> dict[str, list[dict[str, Any]]]:
+    """Group history records by job name, preserving chronological order."""
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for rec in load_history_records(history_path):
+        name = rec.get("name")
+        if not name:
+            continue
+        by_name.setdefault(str(name), []).append(rec)
+    return by_name
+
+
+def historical_mean_durations(
+    by_name: dict[str, list[dict[str, Any]]],
+    per_job: int = HISTORY_JOBS_PER_MEAN,
+) -> dict[str, float]:
+    """Mean duration_s per job name, based on the last `per_job` history records."""
+    means: dict[str, float] = {}
+    for name, recs in by_name.items():
+        durs = [
+            float(r["duration_s"])
+            for r in recs
+            if isinstance(r.get("duration_s"), (int, float))
+        ]
+        if not durs:
+            continue
+        recent = durs[-per_job:]
+        means[name] = sum(recent) / len(recent)
+    return means
+
+
+def quarantined_names(
+    by_name: dict[str, list[dict[str, Any]]],
+    threshold: int,
+) -> set[str]:
+    """Names whose last `threshold` consecutive history appearances all failed.
+
+    threshold <= 0 disables quarantine entirely (empty set).
+    """
+    if threshold <= 0:
+        return set()
+    quarantined: set[str] = set()
+    for name, recs in by_name.items():
+        if len(recs) < threshold:
+            continue
+        last = recs[-threshold:]
+        if all(r.get("status") == "fail" for r in last):
+            quarantined.add(name)
+    return quarantined
+
+
+def _order_by_history(lines: list[str], means: dict[str, float]) -> list[str]:
+    """Order plan lines by historical mean duration, slowest first.
+
+    Jobs with no history sort after jobs with history, keeping their
+    relative (original) order stable within each group.
+    """
+    def key(idx_line: tuple[int, str]) -> tuple[int, float, int]:
+        idx, line = idx_line
+        parts = line.split(EMIT_SEP, 2)
+        name = parts[1] if len(parts) > 1 else ""
+        mean = means.get(name)
+        if mean is None:
+            return (1, 0.0, idx)
+        return (0, -mean, idx)
+
+    indexed = list(enumerate(lines))
+    indexed.sort(key=key)
+    return [line for _, line in indexed]
+
+
 def collect_emit_lines(
     cache_path: str,
     cfg: dict[str, Any],
     only_origins: Optional[str],
     skip_origins: Optional[str],
+    history_path: Optional[str] = None,
+    quarantine_after: int = DEFAULT_QUARANTINE_AFTER,
+    include_quarantined: bool = False,
+    precheck_uptodate: Optional[dict[str, float]] = None,
+    held_config: Optional[set[str]] = None,
+    held_adhoc: Optional[set[str]] = None,
 ) -> list[str]:
     only = _parse_csv(only_origins)
     skip = _parse_csv(skip_origins)
@@ -217,7 +556,12 @@ def collect_emit_lines(
                 continue
             seen_names.add(name)
             write_line("known", name, cmd, origin)
-            seen_bulk.add(origin)
+            # NOTE: do NOT seen_bulk.add(origin) here. A known tool has its
+            # own specific update command, but other, untracked globals from
+            # the same origin (e.g. other npm -g packages) still need the
+            # origin's bulk update to run — so the bulk line must still be
+            # able to emit later for this origin (once; dedup happens at the
+            # `if origin in seen_bulk` check below when bulk actually emits).
             continue
 
         # Infer origin from symlink if possible
@@ -248,6 +592,68 @@ def collect_emit_lines(
         seen_names.add(name)
         lines.append(f"skip{EMIT_SEP}{name}{EMIT_SEP}{EMIT_SEP}")
 
+    # Pinned/held jobs: a known tool name or bulk origin listed in config's
+    # "hold" array (persistent) or the one-run HOLD= env (ad hoc) becomes a
+    # synthetic "held" line instead of running. Applied before quarantine/
+    # precheck so a hold always wins regardless of history/outdated state.
+    # The cmd field carries the hold's source ("config" or "env") so the
+    # shell can phrase its message accordingly.
+    held_config = held_config or set()
+    held_adhoc = held_adhoc or set()
+    if held_config or held_adhoc:
+        transformed_held: list[str] = []
+        for line in lines:
+            parts = line.split(EMIT_SEP, 3)
+            kind = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            if kind in ("known", "bulk") and name in held_config:
+                transformed_held.append(f"held{EMIT_SEP}{name}{EMIT_SEP}config{EMIT_SEP}")
+            elif kind in ("known", "bulk") and name in held_adhoc:
+                transformed_held.append(f"held{EMIT_SEP}{name}{EMIT_SEP}env{EMIT_SEP}")
+            else:
+                transformed_held.append(line)
+        lines = transformed_held
+
+    # Failure quarantine: replace known/bulk lines whose job name failed its
+    # last `quarantine_after` consecutive history appearances with a
+    # "quarantined" line (shell prints a warning and counts it as skipped).
+    by_name = load_history_by_name(history_path)
+    quarantined = set() if include_quarantined else quarantined_names(by_name, quarantine_after)
+    if quarantined:
+        transformed: list[str] = []
+        for line in lines:
+            parts = line.split(EMIT_SEP, 3)
+            kind = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            if kind in ("known", "bulk") and name in quarantined:
+                transformed.append(f"quarantined{EMIT_SEP}{name}{EMIT_SEP}{quarantine_after}{EMIT_SEP}")
+            else:
+                transformed.append(line)
+        lines = transformed
+
+    # Outdated pre-checks: a bulk origin whose `check` command reported
+    # nothing to do is replaced with a synthetic "uptodate" line (shell
+    # prints it as an instant ok, no update command runs). Applied after
+    # quarantine so a quarantined origin still shows as quarantined, not
+    # up to date, if both would otherwise apply.
+    if precheck_uptodate:
+        transformed2: list[str] = []
+        for line in lines:
+            parts = line.split(EMIT_SEP, 3)
+            kind = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            if kind == "bulk" and name in precheck_uptodate:
+                duration = precheck_uptodate[name]
+                transformed2.append(f"uptodate{EMIT_SEP}{name}{EMIT_SEP}{duration}{EMIT_SEP}")
+            else:
+                transformed2.append(line)
+        lines = transformed2
+
+    # Slowest-first scheduling: order by historical mean duration (desc) so
+    # the long pole (usually brew) starts first in a parallel run.
+    means = historical_mean_durations(by_name)
+    lines = _order_by_history(lines, means)
+
     return lines
 
 
@@ -256,8 +662,18 @@ def emit_lines(
     cfg: dict[str, Any],
     only_origins: Optional[str],
     skip_origins: Optional[str],
+    history_path: Optional[str] = None,
+    quarantine_after: int = DEFAULT_QUARANTINE_AFTER,
+    include_quarantined: bool = False,
+    precheck_uptodate: Optional[dict[str, float]] = None,
+    held_config: Optional[set[str]] = None,
+    held_adhoc: Optional[set[str]] = None,
 ) -> None:
-    for line in collect_emit_lines(cache_path, cfg, only_origins, skip_origins):
+    for line in collect_emit_lines(
+        cache_path, cfg, only_origins, skip_origins,
+        history_path, quarantine_after, include_quarantined, precheck_uptodate,
+        held_config, held_adhoc,
+    ):
         sys.stdout.write(line + "\n")
 
 
@@ -266,9 +682,19 @@ def emit_plan_json(
     cfg: dict[str, Any],
     only_origins: Optional[str],
     skip_origins: Optional[str],
+    history_path: Optional[str] = None,
+    quarantine_after: int = DEFAULT_QUARANTINE_AFTER,
+    include_quarantined: bool = False,
+    precheck_uptodate: Optional[dict[str, float]] = None,
+    held_config: Optional[set[str]] = None,
+    held_adhoc: Optional[set[str]] = None,
 ) -> None:
     plan: list[dict[str, str]] = []
-    for line in collect_emit_lines(cache_path, cfg, only_origins, skip_origins):
+    for line in collect_emit_lines(
+        cache_path, cfg, only_origins, skip_origins,
+        history_path, quarantine_after, include_quarantined, precheck_uptodate,
+        held_config, held_adhoc,
+    ):
         parts = line.split(EMIT_SEP, 3)
         if len(parts) < 3:
             continue
@@ -422,19 +848,59 @@ def _load_cached_versions(cache_path: Optional[str]) -> tuple[dict[str, str], di
     return versions, pm_versions
 
 
+# Bulk origins whose package-manager version we can resolve to a concrete
+# binary on PATH (mirrors the command table in probe_bulk). Used to find a
+# stat-able path for the mtime gate below; origins absent here (e.g. "path",
+# "manual", "sdkman") always get re-probed since there's nothing cheap to
+# gate on.
+_BULK_ORIGIN_BINARY = {
+    "brew": "brew", "npm": "npm", "cargo": "cargo", "gem": "gem", "pip": "pip3",
+    "uv": "uv", "uv/pip": "uv", "uv/venv": "uv", "fnm": "fnm", "bun": "bun",
+    "deno": "deno", "pyenv": "pyenv", "rbenv": "rbenv", "conda": "conda",
+    "opencode": "opencode", "dotnet": "dotnet", "mise": "mise", "pipx": "pipx",
+    "grok": "grok",
+}
+
+
+def _stat_mtime(path: Optional[str]) -> Optional[float]:
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _bulk_origin_binary_path(origin: str) -> Optional[str]:
+    name = _BULK_ORIGIN_BINARY.get(origin)
+    return shutil.which(name) if name else None
+
+
 def snapshot_versions(
     lines: list[str],
     cache_path: Optional[str] = None,
-) -> dict[str, dict[str, str]]:
+    prior_snapshot_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Probe versions for every known/bulk job in `lines`.
+
+    If `prior_snapshot_path` is given (the pre-run snapshot, which always
+    records each job's resolved binary mtime under "mtimes"), a job whose
+    binary mtime hasn't changed since then reuses the prior version string
+    instead of spawning a new `--version` probe. Jobs whose binary can't be
+    stat'd (or whose mtime changed) are probed fresh, same as before. This
+    only affects the cheaper POST snapshot; behavior/format are unaffected
+    otherwise (the extra "mtimes" key is additive, existing consumers only
+    read "known"/"bulk").
+    """
     logger.debug(f"Snapshotting versions for {len(lines)} lines")
     known: dict[str, str] = {}
     bulk: dict[str, str] = {}
     seen_bulk: set[str] = set()
-    
+
     # Collect tasks for parallel execution
     known_tasks: list[tuple[str, str]] = []
     bulk_tasks: list[tuple[str, str]] = []
-    
+
     for line in lines:
         line = line.strip()
         if not line:
@@ -443,36 +909,69 @@ def snapshot_versions(
         if len(parts) < 3:
             continue
         kind, name = parts[0], parts[1]
-        if kind == "skip":
+        if kind in ("skip", "quarantined", "held"):
             continue
         if kind == "known":
             known_tasks.append((name, "known"))
-        elif kind == "bulk" and name not in seen_bulk:
+        elif kind in ("bulk", "uptodate") and name not in seen_bulk:
             seen_bulk.add(name)
             bulk_tasks.append((name, "bulk"))
-    
+
     # Reuse versions captured on the previous run (avoids re-probing)
     cached_known, cached_bulk = _load_cached_versions(cache_path)
+
+    prior: dict[str, Any] = {}
+    if prior_snapshot_path and os.path.isfile(prior_snapshot_path):
+        try:
+            with open(prior_snapshot_path, encoding="utf-8") as f:
+                prior = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            prior = {}
+    prior_mtimes: dict[str, float] = prior.get("mtimes", {}) if isinstance(prior, dict) else {}
+    prior_known: dict[str, str] = prior.get("known", {}) if isinstance(prior, dict) else {}
+    prior_bulk: dict[str, str] = prior.get("bulk", {}) if isinstance(prior, dict) else {}
+
+    mtimes: dict[str, float] = {}
 
     # Probe versions in parallel with progress tracking
     def probe_task(task: tuple[str, str]) -> tuple[str, str, str]:
         name, kind = task
         if kind == "known":
+            path = shutil.which(name)
+            mtime = _stat_mtime(path)
+            if mtime is not None:
+                mtimes[name] = mtime
+            if (
+                mtime is not None
+                and prior_mtimes.get(name) == mtime
+                and name in prior_known
+            ):
+                return name, "known", prior_known[name]
             if name in cached_known:
                 return name, "known", cached_known[name]
             return name, "known", probe_known(name)
         else:
+            path = _bulk_origin_binary_path(name)
+            mtime = _stat_mtime(path)
+            if mtime is not None:
+                mtimes[name] = mtime
+            if (
+                mtime is not None
+                and prior_mtimes.get(name) == mtime
+                and name in prior_bulk
+            ):
+                return name, "bulk", prior_bulk[name]
             if name in cached_bulk:
                 return name, "bulk", cached_bulk[name]
             return name, "bulk", probe_bulk(name)
-    
+
     all_tasks = known_tasks + bulk_tasks
     total_tasks = len(all_tasks)
     completed = 0
-    
+
     if DEBUG and total_tasks > 0:
         logger.info(f"Probing versions for {total_tasks} tools...")
-    
+
     with ThreadPoolExecutor(max_workers=16) as executor:
         future_to_task = {executor.submit(probe_task, task): task for task in all_tasks}
         for future in as_completed(future_to_task):
@@ -484,11 +983,11 @@ def snapshot_versions(
                 known[name] = version
             else:
                 bulk[name] = version
-    
+
     if DEBUG and total_tasks > 0:
         logger.info(f"Completed probing {completed} tools")
-    
-    return {"known": known, "bulk": bulk}
+
+    return {"known": known, "bulk": bulk, "mtimes": mtimes}
 
 
 def suggest_config(cache_path: str, cfg: dict[str, Any]) -> None:
@@ -766,12 +1265,194 @@ def diff_new_tools(prev_names_path: str, cache_path: str) -> list[str]:
     return sorted(current - prev)
 
 
+def _parse_history_result_line(line: str) -> Optional[dict[str, Any]]:
+    """Parse one shell-emitted job-result line: kind\\x1ename\\x1ecmd\\x1eec\\x1estart\\x1eend."""
+    parts = line.split(EMIT_SEP)
+    if len(parts) < 6:
+        return None
+    kind, name, cmd, ec_s, start_s, end_s = parts[:6]
+    try:
+        ec = int(ec_s)
+        start = float(start_s)
+        end = float(end_s)
+    except ValueError:
+        return None
+    return {"kind": kind, "name": name, "cmd": cmd, "ec": ec, "start": start, "end": end}
+
+
+def history_append(
+    history_path: str,
+    run_id: str,
+    result_lines: list[str],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    max_lines: int = HISTORY_MAX_LINES,
+) -> int:
+    """Append one JSONL record per executed (known/bulk) job to the history file.
+
+    `result_lines` are shell-emitted "kind\\x1ename\\x1ecmd\\x1eec\\x1estart\\x1eend"
+    strings for every job actually run this pass (skip/quarantined jobs are not
+    included by the caller). Prunes the file to the most recent `max_lines` lines.
+    Returns the number of records appended.
+
+    "held" jobs are recorded too (unlike "quarantined", which isn't): they get
+    `status: "held"` (a status distinct from "ok"/"fail", so they never count
+    toward quarantine's consecutive-failure streak) plus `"held": true`, and
+    since the job never actually ran, no version lookup is attempted.
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    records: list[dict[str, Any]] = []
+    for line in result_lines:
+        line = line.strip()
+        if not line:
+            continue
+        parsed = _parse_history_result_line(line)
+        if not parsed or parsed["kind"] not in ("known", "bulk", "uptodate", "held"):
+            continue
+        name = parsed["name"]
+        if parsed["kind"] == "held":
+            records.append({
+                "ts": ts,
+                "run_id": run_id,
+                "kind": "held",
+                "name": name,
+                "cmd": parsed["cmd"],
+                "duration_s": round(parsed["end"] - parsed["start"], 3),
+                "status": "held",
+                "held": True,
+                "version_before": "?",
+                "version_after": "?",
+            })
+            continue
+        # "uptodate" (pre-check skip) jobs are bulk origins under the hood;
+        # look their versions up in the bulk section of before/after.
+        section = "bulk" if parsed["kind"] == "uptodate" else parsed["kind"]
+        records.append({
+            "ts": ts,
+            "run_id": run_id,
+            "kind": parsed["kind"],
+            "name": name,
+            "cmd": parsed["cmd"],
+            "duration_s": round(parsed["end"] - parsed["start"], 3),
+            "status": "ok" if parsed["ec"] == 0 else "fail",
+            "version_before": before.get(section, {}).get(name, "?"),
+            "version_after": after.get(section, {}).get(name, "?"),
+        })
+
+    if not records:
+        return 0
+
+    hist_dir = os.path.dirname(history_path)
+    if hist_dir:
+        os.makedirs(hist_dir, exist_ok=True)
+
+    existing: list[str] = []
+    if os.path.isfile(history_path):
+        try:
+            with open(history_path, encoding="utf-8") as f:
+                existing = f.read().splitlines()
+        except OSError:
+            existing = []
+
+    combined = existing + [json.dumps(r) for r in records]
+    if len(combined) > max_lines:
+        combined = combined[-max_lines:]
+
+    tmp_path = history_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(combined) + ("\n" if combined else ""))
+    os.replace(tmp_path, history_path)
+    return len(records)
+
+
+def group_history_by_run(records: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Group history records into runs, preserving file order (each run_id is contiguous)."""
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    for r in records:
+        rid = str(r.get("run_id", "?"))
+        if groups and groups[-1][0] == rid:
+            groups[-1][1].append(r)
+        else:
+            groups.append((rid, [r]))
+    return groups
+
+
+def format_history(history_path: str, n: int = 3) -> str:
+    """Human-readable summary of the last `n` runs recorded in history.jsonl."""
+    records = load_history_records(history_path)
+    groups = group_history_by_run(records)
+    if not groups:
+        return "No run history recorded yet.\n"
+
+    out: list[str] = []
+    for run_id, recs in reversed(groups[-n:] if n > 0 else groups):
+        ts = recs[0].get("ts", "?") if recs else "?"
+        ok = sum(1 for r in recs if r.get("status") == "ok")
+        fail = sum(1 for r in recs if r.get("status") == "fail")
+        out.append(f"Run {run_id} ({ts}) — {ok} ok, {fail} failed")
+
+        changed = [r for r in recs if r.get("version_before") != r.get("version_after")]
+        if changed:
+            out.append("  Changed:")
+            for r in changed:
+                out.append(f"    {r.get('name')}: {r.get('version_before')} → {r.get('version_after')}")
+
+        failures = [r for r in recs if r.get("status") == "fail"]
+        if failures:
+            out.append("  Failed:")
+            for r in failures:
+                out.append(f"    {r.get('name')}")
+        out.append("")
+
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _parse_version_tuple(v: Optional[str]) -> Optional[tuple[int, ...]]:
+    """Best-effort leading dotted-integer sequence from a free-form version string.
+
+    Tolerates a leading "v"/"V" and arbitrary trailing text (e.g.
+    "ripgrep 15.1.0" won't parse — callers should pass just the version
+    token; "v2.3.1" / "2.3.1-beta" / "2.1.139 (Claude Code)" all parse their
+    leading numeric run). Returns None if no leading digits are found.
+    """
+    if not v:
+        return None
+    s = v.strip()
+    if s[:1] in ("v", "V"):
+        s = s[1:]
+    m = re.match(r"(\d+(?:\.\d+)*)", s)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def leading_major(v: Optional[str]) -> Optional[int]:
+    """The leading integer component of a version string, or None if unparseable."""
+    t = _parse_version_tuple(v)
+    return t[0] if t else None
+
+
+def is_major_upgrade(before: Optional[str], after: Optional[str]) -> bool:
+    """True if `after`'s leading integer component is greater than `before`'s.
+
+    Both sides must parse to a usable leading integer; unparseable/"?"
+    versions never count as a major jump (conservative — no false positives).
+    """
+    b = leading_major(before)
+    a = leading_major(after)
+    if b is None or a is None:
+        return False
+    return a > b
+
+
 def format_run_summary(
     before: dict[str, Any],
     after: dict[str, Any],
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
+    quarantined: Optional[list[str]] = None,
+    held: Optional[list[str]] = None,
 ) -> str:
     upgraded: list[str] = []
     unchanged: list[str] = []
@@ -783,7 +1464,8 @@ def format_run_summary(
             if b == a:
                 unchanged.append(name)
             else:
-                upgraded.append(f"  {name}: {b} → {a}")
+                marker = "  [MAJOR UPGRADE]" if is_major_upgrade(b, a) else ""
+                upgraded.append(f"  {name}: {b} → {a}{marker}")
 
     lines_out: list[str] = [
         "update-all-clis",
@@ -807,6 +1489,23 @@ def format_run_summary(
         lines_out.append("  " + ", ".join(sorted(unchanged)))
     else:
         lines_out.append("  (none)")
+
+    lines_out.append("")
+    quarantined = quarantined or []
+    lines_out.append(f"Quarantined, skipped this run ({len(quarantined)}):")
+    if quarantined:
+        lines_out.append("  " + ", ".join(sorted(quarantined)))
+    else:
+        lines_out.append("  (none)")
+
+    lines_out.append("")
+    held = held or []
+    lines_out.append(f"Held (pinned in config), skipped this run ({len(held)}):")
+    if held:
+        lines_out.append("  " + ", ".join(sorted(held)))
+    else:
+        lines_out.append("  (none)")
+
     return "\n".join(lines_out) + "\n"
 
 
@@ -816,10 +1515,12 @@ def notify_macos_dialog(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
+    quarantined: Optional[list[str]] = None,
+    held: Optional[list[str]] = None,
 ) -> None:
     if sys.platform != "darwin":
         return
-    body = format_run_summary(before, after, ok, fail, new_tools).rstrip("\n")
+    body = format_run_summary(before, after, ok, fail, new_tools, quarantined, held).rstrip("\n")
     if len(body) > 950:
         body = body[:947] + "\n…"
     fd, path = tempfile.mkstemp(suffix=".txt", text=True)
@@ -858,9 +1559,11 @@ def notify_linux(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
+    quarantined: Optional[list[str]] = None,
+    held: Optional[list[str]] = None,
 ) -> None:
     if sys.platform == "linux" and shutil.which("notify-send"):
-        body = format_run_summary(before, after, ok, fail, new_tools).rstrip("\n")
+        body = format_run_summary(before, after, ok, fail, new_tools, quarantined, held).rstrip("\n")
         if len(body) > 500:
             body = body[:497] + "…"
         subprocess.run(
@@ -880,9 +1583,11 @@ def notify_diff(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
+    quarantined: Optional[list[str]] = None,
+    held: Optional[list[str]] = None,
 ) -> None:
-    notify_macos_dialog(before, after, ok, fail, new_tools)
-    notify_linux(before, after, ok, fail, new_tools)
+    notify_macos_dialog(before, after, ok, fail, new_tools, quarantined, held)
+    notify_linux(before, after, ok, fail, new_tools, quarantined, held)
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -943,6 +1648,201 @@ def convert_tools_array_to_json(tools_input: str, scanned_at: str, existing_cach
             tools.append(tool_entry)
     tools.append({'scanned_at': scanned_at, 'count': len(tools)})
     return json.dumps(tools, indent=2)
+
+
+# Same exclusion rules as update_all_clis.sh's scan_dir(), kept in sync by
+# hand (see the `case "$name"` block there).
+_SCAN_EXCLUDE_NAMES = frozenset({
+    "npm", "npx", "node", "python", "python3", "ruby", "perl", "lua",
+    "bash", "zsh", "sh", "sh.dist", "npm-cli", "npx-cli",
+    "corepack", "corepack.exe", "yarn", "yarn.js", "pnpm", "pnpm.js", "git",
+})
+
+
+def _scan_dir_entries(dir_path: str) -> list[str]:
+    """Names of executable, non-hidden, non-excluded files directly in `dir_path`.
+
+    Mirrors update_all_clis.sh's scan_dir(): only regular files (no
+    subdirectories/symlinked dirs), executable, not dotfiles, not one of the
+    shared runtime/vcs binaries every manager drags in, not `git-*`.
+    """
+    try:
+        entries = os.listdir(dir_path)
+    except OSError:
+        return []
+    names: list[str] = []
+    for name in entries:
+        if name.startswith("."):
+            continue
+        if name in _SCAN_EXCLUDE_NAMES or name.startswith("git-"):
+            continue
+        full = os.path.join(dir_path, name)
+        try:
+            if not os.path.isfile(full) or not os.access(full, os.X_OK):
+                continue
+        except OSError:
+            continue
+        names.append(name)
+    return names
+
+
+def _sdkman_candidate_binaries(dir_path: str) -> list[str]:
+    """Names of executables in `$dir/*/current/bin/*` (sdkman's layout)."""
+    names: list[str] = []
+    for cand in sorted(glob.glob(os.path.join(dir_path, "*", "current", "bin", "*"))):
+        base = os.path.basename(cand)
+        if base.startswith("."):
+            continue
+        try:
+            if not os.path.isfile(cand) or not os.access(cand, os.X_OK):
+                continue
+        except OSError:
+            continue
+        names.append(base)
+    return names
+
+
+def _tree_scan_entries(dir_path: str) -> list[str]:
+    """Names from every `$dir/*/bin` subdirectory (mirrors scan_tree())."""
+    names: list[str] = []
+    for sub in sorted(glob.glob(os.path.join(dir_path, "*", "bin"))):
+        names.extend(_scan_dir_entries(sub))
+    return names
+
+
+def incremental_scan_merge(
+    rows: list[tuple[str, str, str, bool]],
+    cache_path: str,
+    scanned_at: str,
+    force: bool = False,
+    extra_tools: Optional[list[tuple[str, str]]] = None,
+) -> str:
+    """Build the next cache.json, re-walking only directories that changed.
+
+    `rows` is (dir, origin, mode, exists) for every directory the shell
+    would otherwise scan directly, where mode is "dir" (flat, scan_dir),
+    "tree" (one level of `*/bin` subdirs, scan_tree), or "sdkman"
+    (`*/current/bin/*`). `exists` is whatever `[[ -d "$dir" ]]` found in the
+    shell — a row with exists=False prunes any cached tools tagged to that
+    directory (their source disappeared).
+
+    A directory whose mtime matches what's stored in the cache's
+    "dir_mtimes" record reuses the tools cached under that directory
+    instead of re-listing it. `force=True` (--rescan) ignores stored
+    mtimes and re-walks everything, refreshing all stored mtimes.
+
+    Top-level directory mtime is sufficient for "dir" (adding/removing a
+    file changes the parent dir's mtime on APFS/most filesystems) but NOT
+    for deep changes inside a "tree"/"sdkman" node's subdirectories (e.g. a
+    Homebrew Cellar upgrade that doesn't add/remove a top-level symlink).
+    For those, only *new/removed* top-level entries are guaranteed to be
+    noticed; that's judged acceptable since existing binary *names* don't
+    change on an in-place upgrade, and `--rescan` remains available to force
+    a full walk.
+    """
+    existing: list[Any] = []
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                existing = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            existing = []
+
+    cached_tools = [t for t in existing if isinstance(t, dict) and "name" in t]
+    mtimes_rec = next((t for t in existing if isinstance(t, dict) and "dir_mtimes" in t), None)
+    old_mtimes: dict[str, float] = mtimes_rec.get("dir_mtimes", {}) if mtimes_rec else {}
+    existing_versions = {t["name"]: t["version"] for t in cached_tools if "version" in t}
+
+    cached_by_dir: dict[str, list[dict[str, Any]]] = {}
+    for t in cached_tools:
+        d = t.get("dir")
+        if d:
+            cached_by_dir.setdefault(d, []).append(t)
+
+    out_tools: list[dict[str, Any]] = []
+    new_mtimes: dict[str, float] = {}
+    handled_dirs: set[str] = set()
+    # Dedup by (name, origin) only — matching the old `sort -u` on "name|origin"
+    # lines. The SAME (name, origin) can legitimately turn up from more than
+    # one directory (e.g. a brew keg's opt/*/bin entry and a top-level
+    # /opt/homebrew/bin symlink); only the first directory's tag is kept for
+    # future mtime-gating, but only one final tool record is emitted.
+    seen_keys: set[tuple[str, str]] = set()
+
+    def emit(name: str, origin: str, dir_tag: Optional[str]) -> None:
+        key = (name, origin)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        entry: dict[str, Any] = {"name": name, "origin": origin}
+        if dir_tag:
+            entry["dir"] = dir_tag
+        if name in existing_versions:
+            entry["version"] = existing_versions[name]
+        out_tools.append(entry)
+
+    for dir_path, origin, mode, exists in rows:
+        handled_dirs.add(dir_path)
+        if not exists:
+            continue
+        try:
+            cur_mtime = os.stat(dir_path).st_mtime
+        except OSError:
+            continue
+        old_mtime = old_mtimes.get(dir_path)
+        if (not force) and old_mtime is not None and cur_mtime == old_mtime and dir_path in cached_by_dir:
+            for t in cached_by_dir[dir_path]:
+                emit(t["name"], origin, dir_path)
+        else:
+            if mode == "tree":
+                names = _tree_scan_entries(dir_path)
+            elif mode == "sdkman":
+                names = _sdkman_candidate_binaries(dir_path)
+            else:
+                names = _scan_dir_entries(dir_path)
+            for n in names:
+                emit(n, origin, dir_path)
+        new_mtimes[dir_path] = cur_mtime
+
+    # Non-directory-gated entries the shell adds directly (currently just
+    # the fnm sentinel: fnm's own binary lives under a version-manager
+    # shim, not a plain bin dir worth mtime-tracking).
+    for name, origin in (extra_tools or []):
+        emit(name, origin, None)
+
+    # Carry forward mtimes for directories not mentioned at all this run
+    # (e.g. a manager whose whole resolution path is conditional and wasn't
+    # even attempted, such as npm's dirs when npm itself isn't installed).
+    for d, mt in old_mtimes.items():
+        if d not in handled_dirs:
+            new_mtimes[d] = mt
+
+    # Carry forward cached tools whose directory wasn't touched this run,
+    # and any tool with no "dir" tag at all (pre-migration cache entries,
+    # or entries the shell adds directly without directory gating, e.g. fnm).
+    for t in cached_tools:
+        d = t.get("dir")
+        if d is None or d not in handled_dirs:
+            emit(t["name"], t.get("origin", "?"), d)
+
+    out_tools.append({"scanned_at": scanned_at, "count": len(out_tools)})
+    out_tools.append({"dir_mtimes": new_mtimes})
+    return json.dumps(out_tools, indent=2)
+
+
+def parse_scan_rows(rows_input: str) -> list[tuple[str, str, str, bool]]:
+    """Parse "dir\\torigin\\tmode\\texists" lines (as written by the shell)."""
+    rows: list[tuple[str, str, str, bool]] = []
+    for line in rows_input.split("\n"):
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        dir_path, origin, mode, exists_s = parts[0], parts[1], parts[2], parts[3]
+        rows.append((dir_path, origin, mode, exists_s == "1"))
+    return rows
 
 
 def update_cache_versions(cache_path: str, versions: dict[str, dict[str, str]]) -> None:
@@ -1219,8 +2119,398 @@ def benchmark_operation(
             if len(parts) >= 2:
                 probe_known(parts[1])
     results["probe_versions_sample"] = time.time() - start
-    
+
     return results
+
+
+# =============================================================================
+# Doctor: read-only diagnostics over the existing cache + history + config.
+# Each check is independent and failure-isolated (see doctor_report) so one
+# crashing check never prevents the rest of the report from printing.
+# =============================================================================
+
+def doctor_broken_symlinks(dirs: list[str]) -> list[str]:
+    """Symlinks in the given directories whose target no longer resolves."""
+    broken: list[str] = []
+    seen_dirs: set[str] = set()
+    for d in dirs:
+        if not d or d in seen_dirs:
+            continue
+        seen_dirs.add(d)
+        if not os.path.isdir(d):
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for name in entries:
+            full = os.path.join(d, name)
+            try:
+                if os.path.islink(full) and not os.path.exists(full):
+                    broken.append(full)
+            except OSError:
+                continue
+    return sorted(broken)
+
+
+def doctor_shadowed_duplicates(cache_path: str) -> list[dict[str, Any]]:
+    """Binary names present under 2+ distinct origins in the cache.
+
+    Reports which origins provide the name and which absolute path
+    currently wins on `$PATH` (via shutil.which, so it reflects the live
+    system's actual PATH order, not just the cache).
+    """
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    tools = [t for t in data if isinstance(t, dict) and "name" in t]
+    by_name: dict[str, set[str]] = {}
+    for t in tools:
+        by_name.setdefault(t["name"], set()).add(str(t.get("origin", "?")))
+    out: list[dict[str, Any]] = []
+    for name in sorted(by_name):
+        origins = by_name[name]
+        if len(origins) < 2:
+            continue
+        out.append({
+            "name": name,
+            "origins": sorted(origins),
+            "winner_path": shutil.which(name),
+        })
+    return out
+
+
+def doctor_chronic_failures(
+    history_path: Optional[str],
+    window: int = 10,
+    min_failures: int = 3,
+) -> list[dict[str, Any]]:
+    """Jobs with >= `min_failures` failures in their last `window` history records.
+
+    Surfaces failure-prone jobs even if they haven't (yet) hit the
+    consecutive-failure quarantine threshold (e.g. failing intermittently
+    rather than on every single run).
+    """
+    by_name = load_history_by_name(history_path)
+    out: list[dict[str, Any]] = []
+    for name in sorted(by_name):
+        recent = by_name[name][-window:]
+        fails = sum(1 for r in recent if r.get("status") == "fail")
+        if fails >= min_failures:
+            out.append({"name": name, "failures": fails, "checked": len(recent)})
+    return out
+
+
+def doctor_config_issues(cfg: dict[str, Any]) -> list[str]:
+    """Config-level issues: dead `known` entries, dangling `hold`/`check` entries."""
+    issues: list[str] = []
+    known = cfg.get("known", {}) or {}
+    bulk = cfg.get("bulk", {}) or {}
+    hold = cfg.get("hold", []) or []
+    check = cfg.get("check", {}) or {}
+
+    for name in sorted(known):
+        if not shutil.which(name):
+            issues.append(f"known entry '{name}' has no binary on PATH")
+
+    valid_targets = set(known) | set(bulk)
+    for entry in sorted(normalize_hold_entries(hold)):
+        if entry not in valid_targets:
+            issues.append(f"hold entry '{entry}' matches no known tool or bulk origin")
+
+    for origin in sorted(check):
+        if origin not in bulk or not str(bulk.get(origin, "")).strip():
+            issues.append(f"check entry for origin '{origin}' has no corresponding bulk command")
+
+    return issues
+
+
+def doctor_report(
+    cache_path: str,
+    cfg: dict[str, Any],
+    history_path: Optional[str] = None,
+    extra_dirs: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Run every doctor check, isolating failures so one crash doesn't kill the rest."""
+    report: dict[str, Any] = {
+        "cache_validation": {},
+        "broken_symlinks": [],
+        "shadowed_duplicates": [],
+        "chronic_failures": [],
+        "config_issues": [],
+        "errors": [],
+    }
+
+    try:
+        report["cache_validation"] = validate_cache(cache_path)
+    except Exception as e:
+        report["errors"].append(f"cache validation failed: {e}")
+
+    try:
+        dirs: set[str] = set(extra_dirs or [])
+        if os.path.isfile(cache_path):
+            with open(cache_path, encoding="utf-8") as f:
+                data = json.load(f)
+            for t in data:
+                if isinstance(t, dict) and t.get("dir"):
+                    dirs.add(t["dir"])
+        dirs.update(p for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+        report["broken_symlinks"] = doctor_broken_symlinks(sorted(dirs))
+    except Exception as e:
+        report["errors"].append(f"broken symlink check failed: {e}")
+
+    try:
+        report["shadowed_duplicates"] = doctor_shadowed_duplicates(cache_path)
+    except Exception as e:
+        report["errors"].append(f"shadowed duplicate check failed: {e}")
+
+    try:
+        report["chronic_failures"] = doctor_chronic_failures(history_path or default_history_path())
+    except Exception as e:
+        report["errors"].append(f"chronic failure check failed: {e}")
+
+    try:
+        report["config_issues"] = doctor_config_issues(cfg)
+    except Exception as e:
+        report["errors"].append(f"config issue check failed: {e}")
+
+    return report
+
+
+def doctor_has_findings(report: dict[str, Any]) -> bool:
+    cv = report.get("cache_validation", {}) or {}
+    return bool(
+        (not cv.get("valid", True))
+        or cv.get("warnings")
+        or report.get("broken_symlinks")
+        or report.get("shadowed_duplicates")
+        or report.get("chronic_failures")
+        or report.get("config_issues")
+        or report.get("errors")
+    )
+
+
+def format_doctor_report(report: dict[str, Any]) -> str:
+    lines: list[str] = ["update-all-clis doctor report", "=" * 30, ""]
+
+    cv = report.get("cache_validation", {}) or {}
+    lines.append(f"Cache valid: {cv.get('valid')}")
+    for w in cv.get("warnings", []) or []:
+        lines.append(f"  warning: {w}")
+    for e in cv.get("errors", []) or []:
+        lines.append(f"  error: {e}")
+    lines.append("")
+
+    bs = report.get("broken_symlinks", []) or []
+    lines.append(f"Broken symlinks ({len(bs)}):")
+    if bs:
+        lines.extend(f"  {p}" for p in bs)
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    sd = report.get("shadowed_duplicates", []) or []
+    lines.append(f"Shadowed duplicates ({len(sd)}):")
+    if sd:
+        for d in sd:
+            lines.append(
+                f"  {d['name']}  [origins: {', '.join(d['origins'])}]  "
+                f"winner: {d.get('winner_path') or '?'}"
+            )
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    cf = report.get("chronic_failures", []) or []
+    lines.append(f"Chronic failures ({len(cf)}):")
+    if cf:
+        for c in cf:
+            lines.append(f"  {c['name']}: {c['failures']}/{c['checked']} recent runs failed")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    ci = report.get("config_issues", []) or []
+    lines.append(f"Config issues ({len(ci)}):")
+    if ci:
+        lines.extend(f"  {issue}" for issue in ci)
+    else:
+        lines.append("  (none)")
+
+    errs = report.get("errors", []) or []
+    if errs:
+        lines.append("")
+        lines.append(f"Check errors ({len(errs)}):")
+        lines.extend(f"  {e}" for e in errs)
+
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# Changelog digest: best-effort, offline-safe release-notes lookup for tools
+# whose version changed this run and have a "repos" (owner/repo) mapping.
+# Pure helpers (tag-range matching, truncation, formatting) are unit-tested
+# without network; fetch_github_releases is the only part that hits the
+# network and is mocked in tests.
+# =============================================================================
+
+CHANGELOG_MAX_TOOLS = 5
+CHANGELOG_BODY_LIMIT = 400
+CHANGELOG_TOTAL_TIMEOUT = 10.0
+
+
+def tag_to_version(tag: str) -> str:
+    """Strip a leading "v"/"V" from a release tag (tolerant of untagged input)."""
+    if not tag:
+        return tag
+    return tag[1:] if tag[:1] in ("v", "V") else tag
+
+
+def tag_in_range(tag: str, before: Optional[str], after: Optional[str]) -> bool:
+    """True if `tag`'s version falls in (before, after] — i.e. it's a release
+
+    the update just moved past. Unparseable `tag`/`after` never match
+    (conservative); a missing/unparseable `before` only requires tag <= after
+    (can't rule out "too old" without a lower bound, so we don't try).
+    """
+    tag_t = _parse_version_tuple(tag_to_version(tag))
+    after_t = _parse_version_tuple(after)
+    if tag_t is None or after_t is None:
+        return False
+    if tag_t > after_t:
+        return False
+    before_t = _parse_version_tuple(before)
+    if before_t is not None and tag_t <= before_t:
+        return False
+    return True
+
+
+def truncate_changelog_body(body: Optional[str], limit: int = CHANGELOG_BODY_LIMIT) -> str:
+    text = (body or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def format_changelog_section(entries: list[dict[str, Any]], capped: bool = False, cap: int = CHANGELOG_MAX_TOOLS) -> str:
+    """Render matched release entries as a "Changelog highlights" section.
+
+    `entries` is a list of {"name", "version_before", "version_after",
+    "releases": [{"tag", "body"}, ...]}. Returns "" if there's nothing to show.
+    """
+    if not entries:
+        return ""
+    lines = ["Changelog highlights:"]
+    for e in entries:
+        lines.append(f"  {e['name']} ({e['version_before']} → {e['version_after']}):")
+        for rel in e.get("releases", []):
+            body = truncate_changelog_body(rel.get("body", ""))
+            tag = rel.get("tag", "?")
+            if body:
+                lines.append(f"    [{tag}] {body}")
+            else:
+                lines.append(f"    [{tag}] (no release notes)")
+    if capped:
+        lines.append(f"  (capped at {cap} tools this run — rest omitted)")
+    return "\n".join(lines) + "\n"
+
+
+def fetch_github_releases(slug: str, timeout: float = 8.0) -> list[dict[str, Any]]:
+    """Best-effort GitHub releases lookup for `owner/repo`; [] on any failure.
+
+    Prefers `gh api` (works with auth, higher rate limit) when the `gh`
+    binary is available; falls back to an unauthenticated urllib request
+    against the public REST API (60 req/hr limit).
+    """
+    if shutil.which("gh"):
+        try:
+            r = subprocess.run(
+                ["gh", "api", f"repos/{slug}/releases?per_page=10"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                parsed = json.loads(r.stdout)
+                if isinstance(parsed, list):
+                    return parsed
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
+            pass
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{slug}/releases?per_page=10",
+            headers={"User-Agent": "update-all-clis", "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            parsed = json.loads(resp.read().decode("utf-8"))
+            if isinstance(parsed, list):
+                return parsed
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, TimeoutError):
+        pass
+    return []
+
+
+def changed_tools_with_repos(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    repos: dict[str, str],
+) -> list[tuple[str, str, str]]:
+    """(name, version_before, version_after) for every changed tool with a repos mapping."""
+    changed: list[tuple[str, str, str]] = []
+    for section in ("known", "bulk"):
+        b_map = before.get(section, {}) or {}
+        a_map = after.get(section, {}) or {}
+        for name in sorted(set(b_map) | set(a_map)):
+            if name not in repos:
+                continue
+            bv, av = b_map.get(name, "?"), a_map.get(name, "?")
+            if bv != av and bv not in ("?", "") and av not in ("?", ""):
+                changed.append((name, bv, av))
+    return changed
+
+
+def build_changelog_digest(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    cfg: dict[str, Any],
+    max_tools: int = CHANGELOG_MAX_TOOLS,
+    total_timeout: float = CHANGELOG_TOTAL_TIMEOUT,
+    fetch: Any = fetch_github_releases,
+) -> str:
+    """Build the "Changelog highlights" section for this run, or "" if nothing to show.
+
+    Network calls (via `fetch`, defaulting to fetch_github_releases) are
+    capped at `max_tools` per run and to a `total_timeout`-second wall clock
+    budget; any single tool's failure (offline, rate-limited, no matching
+    tag) just omits that tool rather than aborting the whole digest.
+    """
+    repos = cfg.get("repos", {}) or {}
+    changed = changed_tools_with_repos(before, after, repos)
+    if not changed:
+        return ""
+
+    capped = len(changed) > max_tools
+    start = time.time()
+    entries: list[dict[str, Any]] = []
+    for name, bv, av in changed[:max_tools]:
+        remaining = total_timeout - (time.time() - start)
+        if remaining <= 0:
+            break
+        try:
+            releases = fetch(repos[name], timeout=max(1.0, min(8.0, remaining)))
+        except Exception:
+            continue
+        matched = [
+            {"tag": rel.get("tag_name", "?"), "body": rel.get("body", "")}
+            for rel in (releases or [])
+            if isinstance(rel, dict) and tag_in_range(rel.get("tag_name", ""), bv, av)
+        ]
+        if matched:
+            entries.append({"name": name, "version_before": bv, "version_after": av, "releases": matched})
+
+    return format_changelog_section(entries, capped=capped, cap=max_tools)
 
 
 def hold_lock(path: str, blocking: bool = True) -> int:
@@ -1261,6 +2551,25 @@ def hold_lock(path: str, blocking: bool = True) -> int:
     return 0
 
 
+def _load_precheck_uptodate_env() -> Optional[dict[str, float]]:
+    """Read the {origin: duration_s} map written by the shell's pre-check stage.
+
+    Path is passed via UAC_PRECHECK_UPTODATE_FILE (a small JSON file) rather
+    than raw JSON in an env var, to sidestep shell quoting entirely.
+    """
+    path = os.environ.get("UAC_PRECHECK_UPTODATE_FILE")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print(
@@ -1268,7 +2577,9 @@ def main() -> None:
             "notify-diff|run-summary|new-tools|suggest|suggest-known|suggest-known-count|"
             "log-unknowns|report-unknown|ack-unknown|"
             "parse-npm-globals|convert-tools-array|update-cache-versions|validate-cache|debug-cache|"
-            "health-check|backup|restore|list-backups|hold-lock|try-hold-lock|benchmark …",
+            "health-check|backup|restore|list-backups|hold-lock|try-hold-lock|benchmark|"
+            "hold-add|hold-remove|doctor|changelog|"
+            "history|history-append …",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -1336,6 +2647,33 @@ def main() -> None:
         tools_input = sys.stdin.read()
         result = convert_tools_array_to_json(tools_input, scanned_at, existing_cache)
         print(result)
+    elif cmd == "incremental-scan":
+        if len(sys.argv) < 6:
+            print(
+                "usage: lib_update_all_clis.py incremental-scan <cache_path> <scanned_at> "
+                "<force:0|1> <rows_file> [extra_tools_file]",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        cache_path = sys.argv[2]
+        scanned_at = sys.argv[3]
+        force = sys.argv[4] == "1"
+        rows_file = sys.argv[5]
+        extra_file = sys.argv[6] if len(sys.argv) > 6 else ""
+        with open(rows_file, encoding="utf-8") as f:
+            rows = parse_scan_rows(f.read())
+        extra_tools: list[tuple[str, str]] = []
+        if extra_file and os.path.isfile(extra_file):
+            with open(extra_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if "|" not in line:
+                        continue
+                    n, o = line.split("|", 1)
+                    if n:
+                        extra_tools.append((n, o))
+        result = incremental_scan_merge(rows, cache_path, scanned_at, force, extra_tools)
+        print(result)
     elif cmd == "update-cache-versions":
         cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
         versions_input = sys.stdin.read()
@@ -1362,6 +2700,12 @@ def main() -> None:
             cfg,
             os.environ.get("ONLY_ORIGINS"),
             os.environ.get("SKIP_ORIGINS"),
+            os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path(),
+            int(os.environ.get("UAC_QUARANTINE_AFTER") or DEFAULT_QUARANTINE_AFTER),
+            os.environ.get("UAC_INCLUDE_QUARANTINED", "0") == "1",
+            _load_precheck_uptodate_env(),
+            normalize_hold_entries(cfg.get("hold")),
+            _parse_csv(os.environ.get("HOLD")),
         )
     elif cmd == "emit-json":
         cache_path = sys.argv[2]
@@ -1374,26 +2718,75 @@ def main() -> None:
             cfg,
             os.environ.get("ONLY_ORIGINS"),
             os.environ.get("SKIP_ORIGINS"),
+            os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path(),
+            int(os.environ.get("UAC_QUARANTINE_AFTER") or DEFAULT_QUARANTINE_AFTER),
+            os.environ.get("UAC_INCLUDE_QUARANTINED", "0") == "1",
+            _load_precheck_uptodate_env(),
+            normalize_hold_entries(cfg.get("hold")),
+            _parse_csv(os.environ.get("HOLD")),
         )
+    elif cmd == "precheck":
+        base = os.environ.get("CONFIG_FILE", "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        result = run_prechecks(cfg, os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"))
+        print(json.dumps(result))
+    elif cmd == "precheck-candidates":
+        base = os.environ.get("CONFIG_FILE", "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        origins = precheck_candidate_origins(cfg, os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"))
+        print(", ".join(origins))
     elif cmd == "list-json":
         cache_path = sys.argv[2]
         list_json(cache_path)
     elif cmd == "snapshot-versions":
         emit_path = sys.argv[2]
-        cache_path = sys.argv[3] if len(sys.argv) > 3 else None
-        with open(emit_path, encoding="utf-8") as f:
-            snap = snapshot_versions(f.read().splitlines(), cache_path)
+        cache_path = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+        prior_snapshot_path = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        snap = snapshot_versions(_read_lines(emit_path), cache_path, prior_snapshot_path)
         print(json.dumps(snap))
     elif cmd == "notify-diff":
         before = _load_json(sys.argv[2])
         after = _load_json(sys.argv[3])
         new_tools = _load_new_tools_arg(sys.argv[6] if len(sys.argv) > 6 else "")
-        notify_diff(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools)
+        quarantined = _load_new_tools_arg(sys.argv[7] if len(sys.argv) > 7 else "")
+        held = _load_new_tools_arg(sys.argv[8] if len(sys.argv) > 8 else "")
+        notify_diff(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools, quarantined, held)
     elif cmd == "run-summary":
         before = _load_json(sys.argv[2])
         after = _load_json(sys.argv[3])
         new_tools = _load_new_tools_arg(sys.argv[6] if len(sys.argv) > 6 else "")
-        sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools))
+        quarantined = _load_new_tools_arg(sys.argv[7] if len(sys.argv) > 7 else "")
+        held = _load_new_tools_arg(sys.argv[8] if len(sys.argv) > 8 else "")
+        sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools, quarantined, held))
+    elif cmd == "history":
+        history_path = sys.argv[2] if len(sys.argv) > 2 else default_history_path()
+        n = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+        sys.stdout.write(format_history(history_path, n))
+    elif cmd == "history-append":
+        if len(sys.argv) < 5:
+            print(
+                "usage: lib_update_all_clis.py history-append <history_path> <run_id> "
+                "<results_path> [before_json] [after_json]",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        history_path = sys.argv[2]
+        run_id = sys.argv[3]
+        results_path = sys.argv[4]
+        before = _load_json(sys.argv[5]) if len(sys.argv) > 5 else {}
+        after = _load_json(sys.argv[6]) if len(sys.argv) > 6 else {}
+        result_lines = _read_lines(results_path)
+        appended = history_append(history_path, run_id, result_lines, before, after)
+        logger.debug(f"Appended {appended} history record(s) to {history_path}")
+        sys.exit(0)
     elif cmd == "new-tools":
         prev_names_path = sys.argv[2] if len(sys.argv) > 2 else ""
         cache_path = sys.argv[3] if len(sys.argv) > 3 else ""
@@ -1444,6 +2837,56 @@ def main() -> None:
             print("usage: lib_update_all_clis.py ack-unknown UNKNOWN_LOG TOOL_NAME", file=sys.stderr)
             sys.exit(2)
         ack_unknown(sys.argv[2], sys.argv[3])
+    elif cmd == "hold-add":
+        if len(sys.argv) < 4:
+            print("usage: lib_update_all_clis.py hold-add CONFIG_LOCAL_FILE name1,name2,...", file=sys.stderr)
+            sys.exit(2)
+        names = _parse_csv(sys.argv[3])
+        if not names:
+            print("No names given.", file=sys.stderr)
+            sys.exit(2)
+        hold = edit_local_hold(sys.argv[2], add=names)
+        print(f"Held: {', '.join(sorted(names))}")
+        print(f"hold list now ({len(hold)}): {', '.join(hold) if hold else '(empty)'}")
+    elif cmd == "hold-remove":
+        if len(sys.argv) < 4:
+            print("usage: lib_update_all_clis.py hold-remove CONFIG_LOCAL_FILE name1,name2,...", file=sys.stderr)
+            sys.exit(2)
+        names = _parse_csv(sys.argv[3])
+        if not names:
+            print("No names given.", file=sys.stderr)
+            sys.exit(2)
+        hold = edit_local_hold(sys.argv[2], remove=names)
+        print(f"Unheld: {', '.join(sorted(names))}")
+        print(f"hold list now ({len(hold)}): {', '.join(hold) if hold else '(empty)'}")
+    elif cmd == "doctor":
+        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
+        want_json = "--json" in sys.argv[3:]
+        base = os.environ.get("CONFIG_FILE", "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        validate(cfg)
+        history_path = os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path()
+        report = doctor_report(cache_path, cfg, history_path)
+        if want_json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(format_doctor_report(report), end="")
+        sys.exit(1 if doctor_has_findings(report) else 0)
+    elif cmd == "changelog":
+        if len(sys.argv) < 4:
+            print("usage: lib_update_all_clis.py changelog BEFORE_JSON AFTER_JSON", file=sys.stderr)
+            sys.exit(2)
+        before = _load_json(sys.argv[2])
+        after = _load_json(sys.argv[3])
+        base = os.environ.get("CONFIG_FILE", "")
+        local = os.environ.get("CONFIG_LOCAL_FILE", "")
+        if not base:
+            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
+        cfg = load_merge(base, local or None)
+        sys.stdout.write(build_changelog_digest(before, after, cfg))
     else:
         print("unknown command", file=sys.stderr)
         sys.exit(2)

@@ -21,12 +21,33 @@
 #   --json-plan       Print planned updates as JSON and exit
 #   --notify          Show the desktop summary dialog (non-blocking, opt-in)
 #                     (also: UPDATE_ALL_CLIS_NOTIFY=1; default is silent)
+#   --history[=N]     Show the last N runs from history.jsonl (default 3) and exit
+#   --include-quarantined  Force quarantined tools/origins to run this run
+#                     (also: UAC_INCLUDE_QUARANTINED=1)
+#                     (quarantine threshold: UAC_QUARANTINE_AFTER, default 3, 0 disables)
+#   --no-precheck     Skip outdated pre-checks; always run every bulk update
+#                     (also: UAC_NO_PRECHECK=1)
+#   --hold=a,b        Add tools/origins to the persistent hold list (config.local.json) and exit
+#   --unhold=a,b      Remove tools/origins from the persistent hold list and exit
+#                     (one-run ad hoc hold: HOLD=a,b ./update_all_clis.sh)
+#   --doctor          Read-only diagnostics: broken symlinks, shadowed duplicates,
+#                     chronic failures, config issues, cache health (--doctor --json for JSON)
+#   --changelog       After a real run, fetch best-effort release notes for tools that
+#                     changed version and have a "repos" mapping (also: UPDATE_ALL_CLIS_CHANGELOG=1)
+#   --self-update     Before planning, `git pull --ff-only` this script's own repo checkout
+#                     and re-exec once if it updated (also: UPDATE_ALL_CLIS_SELF_UPDATE=1)
+#                     Off by default; any failure (dirty tree, no network, diverged,
+#                     not a git checkout) warns and continues — never fails the run.
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.6.0"
+UAC_VERSION="0.7.0"
 
 set -uo pipefail
+
+# Preserve the original argv for a self-update re-exec (arg parsing below
+# consumes "$@" via shift, so it must be captured before that happens).
+_UAC_ORIG_ARGS=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_SCRIPT="${LIB_SCRIPT:-$SCRIPT_DIR/lib_update_all_clis.py}"
@@ -37,6 +58,11 @@ CACHE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/cache.json"
 LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
 UNKNOWN_LOG_FILE="${UNKNOWN_LOG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/unknown_tools.json}"
 LOCK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/locks"
+HISTORY_FILE="${UPDATE_ALL_CLIS_HISTORY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/history.jsonl}"
+
+# Quarantine: a job (known tool or bulk origin) that failed its last N
+# consecutive appearances in history.jsonl is skipped by default. 0 disables.
+UAC_QUARANTINE_AFTER="${UAC_QUARANTINE_AFTER:-3}"
 
 # Default 0: every run does a fresh discovery scan so new installs are
 # always picked up. Set CACHE_TTL_HOURS=N to reuse a recent cache instead.
@@ -58,10 +84,20 @@ LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8; NOTIFY=""
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
 SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
+HISTORY_MODE=""; HISTORY_N=3
+INCLUDE_QUARANTINED="${UAC_INCLUDE_QUARANTINED:-}"
+NO_PRECHECK="${UAC_NO_PRECHECK:-}"
+HOLD_ADD=""; HOLD_REMOVE=""; DOCTOR_MODE=""
+HOLD="${HOLD:-}"
+CHANGELOG="${UPDATE_ALL_CLIS_CHANGELOG:-}"
+SELF_UPDATE="${UPDATE_ALL_CLIS_SELF_UPDATE:-}"
 
 # Background-job bookkeeping for the cleanup trap (parallel updates + locks).
 _UAC_PIDS=()
-_UAC_RUN_LOCK_PID=""
+# Job-result records (kind\x1ename\x1ecmd\x1eec\x1estart\x1eend) collected
+# during this run, fed to `history-append` afterward (Feature: run history).
+declare -a _UAC_RESULT_LINES=()
+_UAC_SEP=$'\x1e'
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -106,11 +142,8 @@ _cleanup() {
   done
   # Catch any background children not tracked in _UAC_PIDS.
   pkill -P $$ 2>/dev/null || true
-  # Release the single-instance lock.
-  if [[ -n "$_UAC_RUN_LOCK_PID" ]]; then
-    kill "$_UAC_RUN_LOCK_PID" 2>/dev/null || true
-  fi
-  # Remove lock directory (flock holders release on fd close / process death).
+  # Remove the lock directory: releases the single-instance run.lockdir and
+  # any per-origin job lockdirs (mkdir-based; see _run_with_mkdir_lock).
   [[ -d "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 trap _cleanup EXIT INT TERM
@@ -147,6 +180,15 @@ while [[ $# -gt 0 ]]; do
     --debug-cache)     DEBUG_CACHE=1; shift ;;
     --suggest-known)   SUGGEST_KNOWN=1; shift ;;
     --notify)          NOTIFY=1; shift ;;
+    --history)         HISTORY_MODE=1; shift ;;
+    --history=*)       HISTORY_MODE=1; HISTORY_N="${1#*=}"; shift ;;
+    --include-quarantined) INCLUDE_QUARANTINED=1; shift ;;
+    --no-precheck)     NO_PRECHECK=1; shift ;;
+    --hold=*)          HOLD_ADD="${1#*=}"; shift ;;
+    --unhold=*)        HOLD_REMOVE="${1#*=}"; shift ;;
+    --doctor)          DOCTOR_MODE=1; shift ;;
+    --changelog)       CHANGELOG=1; shift ;;
+    --self-update)     SELF_UPDATE=1; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -187,56 +229,47 @@ _want_notify_popup() {
 }
 
 # -------------------------------------------------------------------
-# Glob-based directory scanner — pure bash, accumulates into TOOLS_ARRAY
+# Directory scan planning — incremental by default (see plan-scan-rows
+# below): rather than list every directory's contents ourselves in bash,
+# we record (dir, origin, mode, exists) rows and hand them to Python, which
+# skips re-listing any directory whose mtime hasn't changed since the last
+# scan (reusing that directory's previously cached tools instead). This is
+# what makes repeated `--list`/runs with nothing newly installed cheap.
+# `scan_dir`/`scan_tree` below are kept only as the (rare) direct-append
+# path for entries that aren't worth directory-gating (single-CLI managers
+# like fnm, rustup, gcloud, mas, tlmgr — a command-existence check, not a
+# directory of binaries).
 # -------------------------------------------------------------------
 declare -a TOOLS_ARRAY=()
+declare -a _SCAN_ROWS=()
 
-scan_dir() {
-  local dir="$1"; local origin="$2"
-  [[ -d "$dir" ]] && [[ -r "$dir" ]] || return 0
-
-  debug "Scanning directory: $dir (origin: $origin)"
-  local bin
-  for bin in "$dir"/*; do
-    [[ -f "$bin" && -x "$bin" ]] || continue
-    local name
-    name="$(basename "$bin")"
-
-    [[ "$name" != .* ]] || continue
-    case "$name" in
-      npm|npx|node|python|python3|ruby|perl|lua|bash|zsh|sh|sh.dist|npm-cli|npx-cli) continue ;;
-      corepack|corepack.exe|yarn|yarn.js|pnpm|pnpm.js|git|git-*) continue ;;
-    esac
-
-    TOOLS_ARRAY+=("${name}|${origin}")
-  done
-}
-
-scan_tree() {
-  local dir="$1"; local origin="$2"
-  [[ -d "$dir" ]] && [[ -r "$dir" ]] || return 0
-  local subdir
-  for subdir in "$dir"/*/bin; do
-    [[ -d "$subdir" ]] && scan_dir "$subdir" "$origin"
-  done
+_scan_row() {
+  local dir="$1" origin="$2" mode="$3"
+  local exists=0
+  [[ -d "$dir" ]] && exists=1
+  _SCAN_ROWS+=("${dir}"$'\t'"${origin}"$'\t'"${mode}"$'\t'"${exists}")
 }
 
 # -------------------------------------------------------------------
-# Full filesystem scan
+# Full filesystem scan (incremental unless --rescan / RESCAN is set)
 # -------------------------------------------------------------------
 full_scan() {
   TOOLS_ARRAY=()
-  debug "Starting full filesystem scan"
+  _SCAN_ROWS=()
+  debug "Starting discovery scan (incremental: dirs whose mtime is unchanged are not re-listed)"
 
-  scan_dir "$HOME/.local/bin"                  "uv/pip"
-  scan_dir "$HOME/.cargo/bin"                  "cargo"
-  scan_dir "$HOME/.deno/bin"                  "deno"
-  scan_dir "$HOME/.bun/bin"                    "bun"
-  scan_dir "$HOME/.bun/install/cache/bin"      "bun"
-  scan_dir "$HOME/.rbenv/shims"               "rbenv"
-  scan_dir "$HOME/.pyenv/shims"               "pyenv"
+  _scan_row "$HOME/.local/bin"             "uv/pip" "dir"
+  _scan_row "$HOME/.cargo/bin"             "cargo"  "dir"
+  _scan_row "$HOME/.deno/bin"              "deno"   "dir"
+  _scan_row "$HOME/.bun/bin"               "bun"    "dir"
+  _scan_row "$HOME/.bun/install/cache/bin" "bun"    "dir"
+  _scan_row "$HOME/.rbenv/shims"           "rbenv"  "dir"
+  _scan_row "$HOME/.pyenv/shims"           "pyenv"  "dir"
 
-  # Combine npm calls into single subprocess for efficiency
+  # Combine npm calls into single subprocess for efficiency. `npm ls -g
+  # --json` itself still runs every scan (it's a manager query, not a
+  # filesystem walk we can mtime-gate cheaply); the directories it and npm's
+  # fixed locations resolve to ARE mtime-gated below like everything else.
   local npm_info
   npm_info=$(npm config get prefix 2>/dev/null; npm root -g 2>/dev/null; npm ls -g --depth=0 --json 2>/dev/null || true)
   local npm_prefix npm_root npm_globals
@@ -245,26 +278,18 @@ full_scan() {
   npm_globals=$(echo "$npm_info" | tail -n +3)
 
   if [[ -n "$npm_prefix" ]]; then
-    if [[ -d "$npm_prefix/bin" ]]; then
-      scan_dir "$npm_prefix/bin" "npm"
-    fi
-    if [[ -d "$npm_prefix/lib/node_modules/.bin" ]]; then
-      scan_dir "$npm_prefix/lib/node_modules/.bin" "npm"
-    fi
+    _scan_row "$npm_prefix/bin" "npm" "dir"
+    _scan_row "$npm_prefix/lib/node_modules/.bin" "npm" "dir"
   fi
-  if [[ -d "$HOME/.npm-global/lib/node_modules/.bin" ]]; then
-    scan_dir "$HOME/.npm-global/lib/node_modules/.bin" "npm"
-  fi
-  if [[ -d "$HOME/.npm-global/bin" ]]; then
-    scan_dir "$HOME/.npm-global/bin" "npm"
-  fi
+  _scan_row "$HOME/.npm-global/lib/node_modules/.bin" "npm" "dir"
+  _scan_row "$HOME/.npm-global/bin" "npm" "dir"
 
-  if [[ -n "$npm_root" ]] && [[ -d "$npm_root/.bin" ]]; then
+  if [[ -n "$npm_root" ]]; then
     local _npm_bin_dir="$npm_root/.bin"
     local _prefix_bin_dir=""
     [[ -n "$npm_prefix" ]] && _prefix_bin_dir="$npm_prefix/lib/node_modules/.bin"
     if [[ "$_npm_bin_dir" != "$_prefix_bin_dir" ]]; then
-      scan_dir "$_npm_bin_dir" "npm"
+      _scan_row "$_npm_bin_dir" "npm" "dir"
     fi
   fi
 
@@ -276,11 +301,10 @@ full_scan() {
       for pkg_dir in "${pkg_dirs[@]}"; do
         [[ -n "$pkg_dir" ]] || continue
         local bin_dir="${pkg_dir}/.bin"
-        [[ -d "$bin_dir" ]] || continue
         case "$bin_dir" in
           "$HOME/.npm-global/lib/node_modules/.bin"|"$npm_prefix/lib/node_modules/.bin"|"$npm_root/.bin") continue ;;
         esac
-        scan_dir "$bin_dir" "npm"
+        _scan_row "$bin_dir" "npm" "dir"
       done
     fi
   fi
@@ -289,133 +313,135 @@ full_scan() {
   if command -v brew >/dev/null 2>&1; then
     local brew_prefix
     brew_prefix=$(brew --prefix 2>/dev/null || true)
-    if [[ -n "$brew_prefix" ]] && [[ -d "$brew_prefix/opt" ]]; then
-      scan_tree "$brew_prefix/opt" "brew"
+    if [[ -n "$brew_prefix" ]]; then
+      # Cellar/opt is scanned one level deep (each formula's own bin dir);
+      # we only mtime-gate at the "opt" level (see incremental_scan_merge's
+      # docstring for why that's an acceptable trade-off vs a full walk).
+      _scan_row "$brew_prefix/opt" "brew" "tree"
     fi
   fi
-  [[ -d "/opt/homebrew/bin" ]] && scan_dir "/opt/homebrew/bin" "brew"
-  [[ -d "/home/linuxbrew/.linuxbrew/bin" ]] && scan_dir "/home/linuxbrew/.linuxbrew/bin" "brew"
+  _scan_row "/opt/homebrew/bin" "brew" "dir"
+  _scan_row "/home/linuxbrew/.linuxbrew/bin" "brew" "dir"
 
   if command -v go >/dev/null 2>&1; then
     go_bin_dir="$(go env GOPATH 2>/dev/null)/bin"
-    [[ -d "$go_bin_dir" ]] && scan_dir "$go_bin_dir" "go"
+    [[ -n "$go_bin_dir" ]] && _scan_row "$go_bin_dir" "go" "dir"
   fi
-  [[ -n "${GOBIN:-}" && -d "$GOBIN" ]] && scan_dir "$GOBIN" "go"
-  [[ -d "$HOME/go/bin" ]] && scan_dir "$HOME/go/bin" "go"
+  [[ -n "${GOBIN:-}" ]] && _scan_row "$GOBIN" "go" "dir"
+  _scan_row "$HOME/go/bin" "go" "dir"
 
   local conda_base
   for conda_base in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/mambaforge" "$HOME/miniforge3" "$HOME/micromamba"; do
-    [[ -d "$conda_base/bin" ]] && scan_dir "$conda_base/bin" "conda"
+    _scan_row "$conda_base/bin" "conda" "dir"
   done
 
   if [[ -d "$HOME/.nvm/versions/node" ]]; then
     local nvm_bin
     for nvm_bin in "$HOME/.nvm/versions/node"/*/bin; do
-      [[ -d "$nvm_bin" ]] && scan_dir "$nvm_bin" "npm"
+      [[ -d "$nvm_bin" ]] && _scan_row "$nvm_bin" "npm" "dir"
     done
   fi
 
   if [[ -d "$HOME/.local/pipx/venvs" ]]; then
     local pipx_bin
     for pipx_bin in "$HOME/.local/pipx/venvs"/*/bin; do
-      [[ -d "$pipx_bin" ]] && scan_dir "$pipx_bin" "pipx"
+      [[ -d "$pipx_bin" ]] && _scan_row "$pipx_bin" "pipx" "dir"
     done
   fi
 
   local gem_home
   gem_home=$(gem env home 2>/dev/null || true)
-  if [[ -n "$gem_home" ]] && [[ -d "$gem_home/bin" ]]; then
-    scan_dir "$gem_home/bin" "gem"
-  fi
+  [[ -n "$gem_home" ]] && _scan_row "$gem_home/bin" "gem" "dir"
 
-  if [[ -d "$HOME/.sdkman/candidates" ]]; then
-    local cand
-    for cand in "$HOME/.sdkman/candidates"/*/current/bin/*; do
-      [[ -f "$cand" && -x "$cand" ]] || continue
-      local name
-      name="$(basename "$cand")"
-      [[ "$name" != .* ]] || continue
-      TOOLS_ARRAY+=("${name}|sdkman")
-    done
-  fi
+  # sdkman's layout (candidates/*/current/bin/*) is gated at the top-level
+  # "candidates" dir; adding/removing a candidate changes its mtime.
+  _scan_row "$HOME/.sdkman/candidates" "sdkman" "sdkman"
 
-  [[ -d "$HOME/.local/share/venv" ]] && scan_tree "$HOME/.local/share/venv" "uv/venv"
+  _scan_row "$HOME/.local/share/venv" "uv/venv" "tree"
 
-  [[ -d "/usr/local/bin" ]] && scan_dir "/usr/local/bin" "manual"
+  _scan_row "/usr/local/bin" "manual" "dir"
 
-  [[ -d "$HOME/.opencode/bin" ]] && scan_dir "$HOME/.opencode/bin" "opencode"
+  _scan_row "$HOME/.opencode/bin" "opencode" "dir"
 
-  [[ -d "$HOME/.grok/bin" ]] && scan_dir "$HOME/.grok/bin" "grok"
+  _scan_row "$HOME/.grok/bin" "grok" "dir"
 
-  scan_dir "$HOME/bin"                          "manual"
+  _scan_row "$HOME/bin" "manual" "dir"
 
-  if [[ -n "${PNPM_HOME:-}" ]] && [[ -d "$PNPM_HOME" ]]; then
-    scan_dir "$PNPM_HOME" "npm"
-  elif [[ -d "$HOME/.local/share/pnpm/bin" ]]; then
-    scan_dir "$HOME/.local/share/pnpm/bin" "npm"
+  if [[ -n "${PNPM_HOME:-}" ]]; then
+    _scan_row "$PNPM_HOME" "npm" "dir"
+  else
+    _scan_row "$HOME/.local/share/pnpm/bin" "npm" "dir"
   fi
 
   local _npm_packages="$HOME/.npm-packages/bin"
-  if [[ -d "$_npm_packages" ]]; then
-    npm_global_prefix=$(npm config get prefix 2>/dev/null || echo "")
-    if [[ -n "$npm_global_prefix" ]] && [[ "${npm_global_prefix}/lib/node_modules/.bin" != "$_npm_packages" ]]; then
-      scan_dir "$_npm_packages" "npm"
-    fi
+  if [[ -z "$npm_prefix" ]] || [[ "${npm_prefix}/lib/node_modules/.bin" != "$_npm_packages" ]]; then
+    _scan_row "$_npm_packages" "npm" "dir"
   fi
 
-  [[ -d "$HOME/.config/yarn/global/node_modules/.bin" ]] && scan_dir "$HOME/.config/yarn/global/node_modules/.bin" "npm"
+  _scan_row "$HOME/.config/yarn/global/node_modules/.bin" "npm" "dir"
 
-  [[ -d "$HOME/.dotnet/tools" ]] && scan_dir "$HOME/.dotnet/tools" "dotnet"
+  _scan_row "$HOME/.dotnet/tools" "dotnet" "dir"
 
-  [[ -d "$HOME/.krew/bin" ]] && scan_dir "$HOME/.krew/bin" "krew"
+  _scan_row "$HOME/.krew/bin" "krew" "dir"
 
-  if [[ -d "$HOME/.local/share/mise/shims" ]]; then
-    scan_dir "$HOME/.local/share/mise/shims" "mise"
-  fi
-  if [[ -d "$HOME/.local/share/mise/installs" ]]; then
-    local mise_tool_bin
-    for mise_tool_bin in "$HOME/.local/share/mise/installs"/*/bin; do
-      [[ -d "$mise_tool_bin" ]] && scan_dir "$mise_tool_bin" "mise"
-    done
-  fi
+  _scan_row "$HOME/.local/share/mise/shims" "mise" "dir"
+  _scan_row "$HOME/.local/share/mise/installs" "mise" "tree"
 
-  [[ -d "/opt/local/bin" ]] && scan_dir "/opt/local/bin" "manual"
-  [[ -d "$HOME/.wasmtime/bin" ]] && scan_dir "$HOME/.wasmtime/bin" "manual"
-  [[ -d "$HOME/.wasmer/bin" ]] && scan_dir "$HOME/.wasmer/bin" "manual"
+  _scan_row "/opt/local/bin" "manual" "dir"
+  _scan_row "$HOME/.wasmtime/bin" "manual" "dir"
+  _scan_row "$HOME/.wasmer/bin" "manual" "dir"
 
   [[ -d "$HOME/.fnm" ]] && TOOLS_ARRAY+=("fnm|fnm")
+
+  # rustup/gcloud/mas/tlmgr are single system-wide CLIs, not directories of
+  # installed binaries, so (like fnm above) they're a direct TOOLS_ARRAY
+  # append gated on command existence rather than a scanned/mtime-gated dir.
+  # Each is a silent no-op on machines where the tool isn't installed.
+  command -v rustup >/dev/null 2>&1 && TOOLS_ARRAY+=("rustup|rustup")
+  command -v gcloud >/dev/null 2>&1 && TOOLS_ARRAY+=("gcloud|gcloud")
+  command -v mas >/dev/null 2>&1 && TOOLS_ARRAY+=("mas|mas")
+  command -v tlmgr >/dev/null 2>&1 && TOOLS_ARRAY+=("tlmgr|tlmgr")
 
   if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
     local pdir
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue
-      [[ -d "$pdir" ]] || continue
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
         "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin") continue ;;
       esac
       [[ -n "${go_bin_dir:-}" ]] && [[ "$pdir" == "$go_bin_dir" ]] && continue
       [[ -n "${GOBIN:-}" ]] && [[ "$pdir" == "$GOBIN" ]] && continue
-      scan_dir "$pdir" "path"
+      _scan_row "$pdir" "path" "dir"
     done
   fi
 
-  local tmpfile="${CACHE_FILE}.tmp.$$"
   local scanned_at
   scanned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
   mkdir -p "$(dirname "$CACHE_FILE")"
   mkdir -p "$LOG_DIR"
 
-  debug "Converting ${#TOOLS_ARRAY[@]} tools to JSON format"
-  if [[ -f "$CACHE_FILE" ]]; then
-    printf '%s\n' "${TOOLS_ARRAY[@]}" | sort -u | python3 "$LIB_SCRIPT" convert-tools-array "$scanned_at" "$CACHE_FILE" > "$tmpfile" 2>/dev/null
-  else
-    printf '%s\n' "${TOOLS_ARRAY[@]}" | sort -u | python3 "$LIB_SCRIPT" convert-tools-array "$scanned_at" > "$tmpfile" 2>/dev/null
-  fi
+  local rows_file extra_file tmpfile
+  rows_file=$(mktemp)
+  extra_file=$(mktemp)
+  tmpfile="${CACHE_FILE}.tmp.$$"
+  # Guard against `set -u` treating a zero-element array expansion as an
+  # unbound variable (TOOLS_ARRAY is usually empty now that directory
+  # scanning goes through _SCAN_ROWS instead of direct appends).
+  : > "$rows_file"
+  (( ${#_SCAN_ROWS[@]} > 0 )) && printf '%s\n' "${_SCAN_ROWS[@]}" > "$rows_file"
+  : > "$extra_file"
+  (( ${#TOOLS_ARRAY[@]} > 0 )) && printf '%s\n' "${TOOLS_ARRAY[@]}" > "$extra_file"
 
+  local force_flag=""
+  [[ -n "$RESCAN" ]] && force_flag="1"
+
+  debug "Planning scan over ${#_SCAN_ROWS[@]} directories (force=$force_flag)"
+  python3 "$LIB_SCRIPT" incremental-scan "$CACHE_FILE" "$scanned_at" "$force_flag" "$rows_file" "$extra_file" > "$tmpfile" 2>/dev/null
   mv "$tmpfile" "$CACHE_FILE"
+  rm -f "$rows_file" "$extra_file"
   debug "Cache written to: $CACHE_FILE"
 }
 
@@ -508,6 +534,22 @@ _run_one_emit_line_core() {
   local cmd="$3"
   case "$cmd_type" in
     skip) return 3 ;;
+    quarantined)
+      warn "skipped (quarantined after $cmd consecutive failures): $name — run with --include-quarantined to retry"
+      return 3
+      ;;
+    held)
+      if [[ "$cmd" == "env" ]]; then
+        warn "held (env HOLD=): $name — remove from HOLD= to resume this run only"
+      else
+        warn "held (config): $name — remove from \"hold\" to resume updates"
+      fi
+      return 3
+      ;;
+    uptodate)
+      ok "$name: already up to date (pre-check)"
+      return 0
+      ;;
     bulk)
       info "Updating all $name..."
       run_update "$name" "$cmd"
@@ -523,28 +565,42 @@ _run_one_emit_line_core() {
   esac
 }
 
-# Acquire a per-origin lock via Python fcntl.flock (works on macOS, no flock
-# binary needed). Spawns a "holder" coprocess that prints LOCKED then blocks;
-# we wait for LOCKED, run the critical section, then kill the holder to release.
-_run_with_py_lock() {
+# Acquire a per-origin lock with a bash-native `mkdir` spin-lock (mkdir is
+# atomic on POSIX filesystems, so this needs no `flock` binary and no helper
+# process/python spawn per job — unlike the old fcntl.flock coprocess this
+# replaced). Jobs sharing a lock_group (same package manager) serialize;
+# a lockdir older than the stale cap is assumed abandoned (crashed/killed
+# holder) and stolen rather than waited on forever. On interrupt, the
+# top-level `_cleanup` trap's `rm -rf "$LOCK_DIR"` sweeps up any lockdir left
+# behind mid-critical-section, so no extra bookkeeping is needed here.
+_UAC_LOCK_STALE_SECS=600
+_lockdir_age() {
+  local d="$1" mtime now
+  if [[ "$(uname)" == "Darwin" ]]; then
+    mtime=$(stat -f "%m" "$d" 2>/dev/null)
+  else
+    mtime=$(stat -c "%Y" "$d" 2>/dev/null)
+  fi
+  [[ -z "$mtime" ]] && { echo 0; return; }
+  now=$(date +%s)
+  echo $((now - mtime))
+}
+
+_run_with_mkdir_lock() {
   local lock_group="$1"; shift
-  local lockfile="$LOCK_DIR/${lock_group}.lock"
-  local _ready _holder _waited=0 _ec=0
-  _ready=$(mktemp)
-  python3 "$LIB_SCRIPT" hold-lock "$lockfile" >"$_ready" 2>/dev/null &
-  _holder=$!
-  # Wait for the lock (OS-managed queue; no busy spin). 5-min safety cap so
-  # a dead holder can never hang the run.
-  until grep -q '^LOCKED$' "$_ready" 2>/dev/null; do
+  local lock_dir="$LOCK_DIR/${lock_group}.lockdir"
+  local _waited=0 _ec=0
+  until mkdir "$lock_dir" 2>/dev/null; do
+    if [[ -d "$lock_dir" ]] && (( $(_lockdir_age "$lock_dir") > _UAC_LOCK_STALE_SECS )); then
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
     sleep 0.2
     _waited=$((_waited + 1))
     (( _waited > 1500 )) && break
-    kill -0 "$_holder" 2>/dev/null || break
   done
   _run_one_emit_line_core "$@" || _ec=$?
-  kill "$_holder" 2>/dev/null || true
-  wait "$_holder" 2>/dev/null || true
-  rm -f "$_ready"
+  rmdir "$lock_dir" 2>/dev/null || true
   return $_ec
 }
 
@@ -557,12 +613,21 @@ _run_one_emit_line() {
   cmd="$EMIT_CMD"
   lock_group="${EMIT_LOCK:-$name}"
 
+  # Dry-run never mutates anything, so locking (which only exists to
+  # serialize concurrent *writes* from the same package manager) is pointless
+  # overhead there — every dry-run "job" is a near-instant echo of the
+  # command it would run, so skip the lock round-trip entirely.
+  if [[ -n "$DRY_RUN" ]]; then
+    _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
+    return $?
+  fi
+
   if (( PARALLEL_JOBS >= 2 )) && [[ "$cmd_type" != "skip" ]] && [[ -n "$lock_group" ]]; then
     mkdir -p "$LOCK_DIR"
     if command -v flock >/dev/null 2>&1; then
       { flock -x 200; _run_one_emit_line_core "$cmd_type" "$name" "$cmd"; } 200>"$LOCK_DIR/${lock_group}.lock"
     else
-      _run_with_py_lock "$lock_group" "$cmd_type" "$name" "$cmd"
+      _run_with_mkdir_lock "$lock_group" "$cmd_type" "$name" "$cmd"
       return $?
     fi
   else
@@ -574,8 +639,22 @@ run_updates_sequential() {
   local line
   for line in "$@"; do
     [[ -z "$line" ]] && continue
+    _parse_emit_line "$line"
+    local _res_type="$EMIT_TYPE" _res_name="$EMIT_NAME" _res_cmd="$EMIT_CMD"
+    local _start _end
+    _start=$(date +%s)
     _run_one_emit_line "$line"
     local ec=$?
+    _end=$(date +%s)
+    if [[ "$_res_type" == "uptodate" ]]; then
+      # _res_cmd carries the pre-check's own duration (whole seconds); use
+      # that for history instead of this near-instant synthetic "run".
+      local _dur_int="${_res_cmd%%.*}"
+      [[ "$_dur_int" =~ ^[0-9]+$ ]] && _start=$((_end - _dur_int))
+    fi
+    if [[ "$_res_type" == "known" || "$_res_type" == "bulk" || "$_res_type" == "uptodate" || "$_res_type" == "held" ]]; then
+      _UAC_RESULT_LINES+=("${_res_type}${_UAC_SEP}${_res_name}${_UAC_SEP}${_res_cmd}${_UAC_SEP}${ec}${_UAC_SEP}${_start}${_UAC_SEP}${_end}")
+    fi
     case "$ec" in
       0) ((UPDATE_OK++)) || true ;;
       3) ;;
@@ -607,7 +686,7 @@ run_updates_parallel() {
       fi
       # Remove completed PIDs from array
       local new_pids=()
-      for pid in "${pids[@]}"; do
+      for pid in "${pids[@]:-}"; do
         if kill -0 "$pid" 2>/dev/null; then
           new_pids+=("$pid")
         fi
@@ -621,35 +700,125 @@ run_updates_parallel() {
     (
       local result_file="$result_dir/$result_idx.result"
       SUPPRESS_TRACE=1
+      _parse_emit_line "$line"
+      local _res_type="$EMIT_TYPE" _res_name="$EMIT_NAME" _res_cmd="$EMIT_CMD"
+      local _start _end _ec _dur_int
+      _start=$(date +%s)
       _run_one_emit_line "$line"
-      echo $? > "$result_file"
+      _ec=$?
+      _end=$(date +%s)
+      if [[ "$_res_type" == "uptodate" ]]; then
+        _dur_int="${_res_cmd%%.*}"
+        [[ "$_dur_int" =~ ^[0-9]+$ ]] && _start=$((_end - _dur_int))
+      fi
+      {
+        echo "$_ec"
+        if [[ "$_res_type" == "known" || "$_res_type" == "bulk" || "$_res_type" == "uptodate" || "$_res_type" == "held" ]]; then
+          printf '%s\n' "${_res_type}${_UAC_SEP}${_res_name}${_UAC_SEP}${_res_cmd}${_UAC_SEP}${_ec}${_UAC_SEP}${_start}${_UAC_SEP}${_end}"
+        fi
+      } > "$result_file"
     ) &
     pids+=($!)
     _UAC_PIDS+=("$!")
   done
   # Wait for all remaining processes
-  for _pid in "${pids[@]}"; do
+  for _pid in "${pids[@]:-}"; do
     wait "$_pid" 2>/dev/null || true
   done
   _UAC_PIDS=()
-  # Count results from files
+  # Count results from files (line 1 = exit code; line 2, if present, is the
+  # kind/name/cmd/ec/start/end record for history-append).
   for result_file in "$result_dir"/*.result; do
     [[ -f "$result_file" ]] || continue
     local ec
-    ec=$(cat "$result_file")
+    ec=$(sed -n '1p' "$result_file")
     case "$ec" in
       0) ((UPDATE_OK++)) || true ;;
       3) ;;
       *) ((UPDATE_FAIL++)) || true ;;
     esac
+    local _rec
+    _rec=$(sed -n '2p' "$result_file")
+    [[ -n "$_rec" ]] && _UAC_RESULT_LINES+=("$_rec")
   done
   rm -rf "$result_dir"
+}
+
+# -------------------------------------------------------------------
+# Self-update: `git pull --ff-only` this script's own checkout, then
+# re-exec once so the run that follows uses the freshly-pulled code.
+# Off by default (--self-update / UPDATE_ALL_CLIS_SELF_UPDATE=1). Every
+# failure mode here (dirty tree, no network, diverged history, not a git
+# checkout, no `origin` remote, no `git` binary) is fail-open: print a
+# one-line warning and let the run continue on the current checkout.
+# -------------------------------------------------------------------
+_git_pull_with_timeout() {
+  # No portable `timeout`/`gtimeout` guarantee on macOS, so watch a
+  # backgrounded `git pull` ourselves and kill it if it runs too long.
+  local repo="$1" timeout_secs="$2"
+  local out_file pid waited=0 ec=0
+  out_file=$(mktemp)
+  ( git -C "$repo" pull --ff-only > "$out_file" 2>&1 ) &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if (( waited >= timeout_secs )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      echo "timed out after ${timeout_secs}s" >> "$out_file"
+      cat "$out_file"
+      rm -f "$out_file"
+      return 124
+    fi
+  done
+  wait "$pid" 2>/dev/null || ec=$?
+  cat "$out_file"
+  rm -f "$out_file"
+  return "$ec"
+}
+
+_self_update() {
+  [[ -z "$SELF_UPDATE" ]] && return 0
+  if [[ -n "${UAC_SELF_UPDATED:-}" ]]; then
+    debug "self-update: already re-exec'd once this run; skipping to avoid a loop"
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    warn "self-update: git not found; skipping"
+    return 0
+  fi
+  if ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    debug "self-update: $SCRIPT_DIR is not a git checkout; skipping"
+    return 0
+  fi
+  if ! git -C "$SCRIPT_DIR" remote get-url origin >/dev/null 2>&1; then
+    warn "self-update: no 'origin' remote configured for $SCRIPT_DIR; skipping"
+    return 0
+  fi
+  local _before _after _pull_out _ec=0
+  _before=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
+  _pull_out=$(_git_pull_with_timeout "$SCRIPT_DIR" 15) || _ec=$?
+  if (( _ec != 0 )); then
+    warn "self-update: git pull --ff-only failed (dirty tree, no network, or diverged history) — continuing with the current checkout: $(echo "$_pull_out" | head -1)"
+    return 0
+  fi
+  _after=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
+  if [[ -n "$_after" ]] && [[ "$_before" != "$_after" ]]; then
+    info "self-update: pulled new changes ($_before -> $_after); re-executing..."
+    UAC_SELF_UPDATED=1 exec "$0" "${_UAC_ORIG_ARGS[@]}"
+  else
+    debug "self-update: already up to date"
+  fi
+  return 0
 }
 
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
 main() {
+  _self_update
+
   if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Missing config: $CONFIG_FILE" >&2
     exit 1
@@ -704,26 +873,55 @@ main() {
     exit 0
   fi
 
+  if [[ -n "$HISTORY_MODE" ]]; then
+    python3 "$LIB_SCRIPT" history "$HISTORY_FILE" "$HISTORY_N"
+    exit 0
+  fi
+
+  if [[ -n "$HOLD_ADD" ]]; then
+    python3 "$LIB_SCRIPT" hold-add "$CONFIG_LOCAL_FILE" "$HOLD_ADD"
+    exit $?
+  fi
+
+  if [[ -n "$HOLD_REMOVE" ]]; then
+    python3 "$LIB_SCRIPT" hold-remove "$CONFIG_LOCAL_FILE" "$HOLD_REMOVE"
+    exit $?
+  fi
+
+  if [[ -n "$DOCTOR_MODE" ]]; then
+    ensure_cache
+    export CONFIG_FILE
+    export CONFIG_LOCAL_FILE
+    export UPDATE_ALL_CLIS_HISTORY_FILE="$HISTORY_FILE"
+    if [[ -n "$LIST_JSON" ]]; then
+      python3 "$LIB_SCRIPT" doctor "$CACHE_FILE" --json
+    else
+      python3 "$LIB_SCRIPT" doctor "$CACHE_FILE"
+    fi
+    exit $?
+  fi
+
   # Single-instance lock for anything that scans/writes the cache or runs
   # updates (read-only commands above already exited). Avoids overlapping runs
   # (LaunchAgent + manual, or two terminals) clobbering each other's cache.
-  # Non-blocking; exits if another run holds it. Held until cleanup kills it.
+  # A plain `mkdir` is atomic on POSIX filesystems, so this needs no helper
+  # process (the old approach spawned a python fcntl.flock coprocess and kept
+  # it alive for the whole run just to hold one lock). Non-blocking with a
+  # stale-lock steal: a lockdir older than the stale cap means a previous run
+  # crashed without cleaning up, so we reclaim it instead of refusing forever.
+  # Held until cleanup's `rm -rf "$LOCK_DIR"` removes it on exit.
   mkdir -p "$LOCK_DIR"
-  local _ilock_out _iwait=0
-  _ilock_out=$(mktemp)
-  python3 "$LIB_SCRIPT" try-hold-lock "$LOCK_DIR/run.lock" >"$_ilock_out" 2>/dev/null &
-  _UAC_RUN_LOCK_PID=$!
-  while (( _iwait < 50 )); do
-    if grep -q '^LOCKED$' "$_ilock_out" 2>/dev/null; then break; fi
-    if grep -q '^BUSY$' "$_ilock_out" 2>/dev/null; then
-      warn "another update-all-clis run is in progress; exiting"
-      rm -f "$_ilock_out"
-      exit 0
+  local _run_lockdir="$LOCK_DIR/run.lockdir"
+  if ! mkdir "$_run_lockdir" 2>/dev/null; then
+    if [[ -d "$_run_lockdir" ]] && (( $(_lockdir_age "$_run_lockdir") > _UAC_LOCK_STALE_SECS )); then
+      rmdir "$_run_lockdir" 2>/dev/null || true
+      mkdir "$_run_lockdir" 2>/dev/null || true
     fi
-    sleep 0.1
-    _iwait=$((_iwait + 1))
-  done
-  rm -f "$_ilock_out"
+  fi
+  if [[ ! -d "$_run_lockdir" ]]; then
+    warn "another update-all-clis run is in progress; exiting"
+    exit 0
+  fi
 
   if [[ -n "$JSON_PLAN" ]]; then
     ensure_cache
@@ -731,6 +929,10 @@ main() {
     export CONFIG_LOCAL_FILE
     export ONLY_ORIGINS
     export SKIP_ORIGINS
+    export UPDATE_ALL_CLIS_HISTORY_FILE="$HISTORY_FILE"
+    export UAC_QUARANTINE_AFTER
+    export UAC_INCLUDE_QUARANTINED="$INCLUDE_QUARANTINED"
+    export HOLD
     python3 "$LIB_SCRIPT" emit-json "$CACHE_FILE"
     exit 0
   fi
@@ -780,6 +982,35 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   export CONFIG_LOCAL_FILE
   export ONLY_ORIGINS
   export SKIP_ORIGINS
+  export UPDATE_ALL_CLIS_HISTORY_FILE="$HISTORY_FILE"
+  export UAC_QUARANTINE_AFTER
+  export UAC_INCLUDE_QUARANTINED="$INCLUDE_QUARANTINED"
+  export HOLD
+
+  # -----------------------------------------------------------------
+  # Outdated pre-checks: for bulk origins with a configured `check`
+  # command (tool_config.json's "check" section), run it first; an
+  # origin whose check says nothing is outdated skips its (expensive)
+  # bulk update entirely this run. Concurrent, read-only, fail-open.
+  # --dry-run never executes checks (some, like brew's, mutate state);
+  # it only reports which origins would have been checked.
+  # -----------------------------------------------------------------
+  local _precheck_file
+  _precheck_file=$(mktemp)
+  echo "{}" > "$_precheck_file"
+  if [[ -n "$DRY_RUN" ]]; then
+    local _precheck_would
+    _precheck_would=$(python3 "$LIB_SCRIPT" precheck-candidates 2>/dev/null || true)
+    [[ -n "$_precheck_would" ]] && info "Would pre-check (dry-run, not executed): $_precheck_would"
+  elif [[ -n "$NO_PRECHECK" ]]; then
+    debug "Pre-checks disabled (--no-precheck)"
+  else
+    info "Pre-checking bulk origins for outdated packages..."
+    python3 "$LIB_SCRIPT" precheck > "$_precheck_file" 2>/dev/null || echo "{}" > "$_precheck_file"
+    # Per-origin "✓ x: already up to date (pre-check)" lines print later,
+    # when the run loop processes each synthetic "uptodate" emit-line.
+  fi
+  export UAC_PRECHECK_UPTODATE_FILE="$_precheck_file"
 
   local emit_tmp
   emit_tmp=$(mktemp)
@@ -794,40 +1025,101 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   done < "$emit_tmp"
   rm -f "$emit_tmp"
 
+  # Collect quarantined names from the plan for the run summary (jobs skipped
+  # this run because they failed their last $UAC_QUARANTINE_AFTER attempts).
+  local _quarantined_snap
+  _quarantined_snap=$(mktemp)
+  {
+    local _qline
+    for _qline in "${lines[@]:-}"; do
+      [[ -z "$_qline" ]] && continue
+      _parse_emit_line "$_qline"
+      [[ "$EMIT_TYPE" == "quarantined" ]] && printf '%s\n' "$EMIT_NAME"
+    done
+  } | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" > "$_quarantined_snap" 2>/dev/null || echo "[]" > "$_quarantined_snap"
+
+  # Collect held names too (jobs pinned via the "hold" config or HOLD= env).
+  local _held_snap
+  _held_snap=$(mktemp)
+  {
+    local _hline
+    for _hline in "${lines[@]:-}"; do
+      [[ -z "$_hline" ]] && continue
+      _parse_emit_line "$_hline"
+      [[ "$EMIT_TYPE" == "held" ]] && printf '%s\n' "$EMIT_NAME"
+    done
+  } | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" > "$_held_snap" 2>/dev/null || echo "[]" > "$_held_snap"
+
   log "${BOLD}=== Logging unknown tools ===${NC}"
   export UNKNOWN_LOG_FILE
   python3 "$LIB_SCRIPT" log-unknowns "$CACHE_FILE" 2>/dev/null || true
 
+  # Run id shared by every history record from this run.
+  local RUN_ID
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
   local _emit_snap="" _before_snap="" _after_snap=""
-  if [[ -z "$DRY_RUN" ]] && { _want_notify_popup || [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; }; then
+  if [[ -z "$DRY_RUN" ]]; then
+    # Pre/post version snapshots are needed both for the desktop/email
+    # summary AND for history.jsonl's version_before/version_after fields,
+    # so (unlike before) we always take them on a real run, not just when
+    # --notify/UPDATE_ALL_CLIS_SUMMARY_FILE are set.
     _emit_snap=$(mktemp)
     _before_snap=$(mktemp)
     _after_snap=$(mktemp)
-    printf '%s\n' "${lines[@]}" > "$_emit_snap"
+    printf '%s\n' "${lines[@]:-}" > "$_emit_snap"
     # "before" reuses versions cached on the previous run (no subprocess spawns);
     # "after" probes fresh to capture what changed.
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "$CACHE_FILE" > "$_before_snap" 2>/dev/null || true
   fi
 
   if (( PARALLEL_JOBS < 2 )); then
-    run_updates_sequential "${lines[@]}"
+    run_updates_sequential "${lines[@]:-}"
   else
-    run_updates_parallel "$PARALLEL_JOBS" "${lines[@]}"
+    run_updates_parallel "$PARALLEL_JOBS" "${lines[@]:-}"
   fi
 
   if [[ -n "$_emit_snap" ]]; then
-    python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" > "$_after_snap" 2>/dev/null || true
+    # "" = no cache reuse; "$_before_snap" = mtime gate, reuse pre-run
+    # version for any tool whose binary mtime hasn't changed since then.
+    python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "" "$_before_snap" > "$_after_snap" 2>/dev/null || true
     if _want_notify_popup; then
-      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" 2>/dev/null || true
+      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" 2>/dev/null || true
     fi
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
-      python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+      python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
     fi
     # Update cache with new version information
     cat "$_after_snap" | python3 "$LIB_SCRIPT" update-cache-versions "$CACHE_FILE" 2>/dev/null || true
+
+    # Append this run's job results to history.jsonl (never on --dry-run).
+    if (( ${#_UAC_RESULT_LINES[@]} > 0 )); then
+      local _results_snap
+      _results_snap=$(mktemp)
+      printf '%s\n' "${_UAC_RESULT_LINES[@]}" > "$_results_snap"
+      python3 "$LIB_SCRIPT" history-append "$HISTORY_FILE" "$RUN_ID" "$_results_snap" "$_before_snap" "$_after_snap" 2>/dev/null || true
+      rm -f "$_results_snap"
+    fi
+
+    # Changelog digest (best-effort, offline-safe): only on --changelog /
+    # UPDATE_ALL_CLIS_CHANGELOG=1, never on --dry-run (handled above by this
+    # whole block being inside `if [[ -z "$DRY_RUN" ]]`-gated snapshotting).
+    # Bodies can be multi-KB; printed to stdout/summary file, never the
+    # macOS dialog (notify-diff above never sees it).
+    if [[ -n "$CHANGELOG" ]]; then
+      local _changelog_out
+      _changelog_out=$(python3 "$LIB_SCRIPT" changelog "$_before_snap" "$_after_snap" 2>/dev/null || true)
+      if [[ -n "$_changelog_out" ]]; then
+        log ""
+        log "$_changelog_out"
+        if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
+          { echo ""; echo "$_changelog_out"; } >> "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+        fi
+      fi
+    fi
     rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
   fi
-  rm -f "$_new_tools_snap"
+  rm -f "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_precheck_file"
 
   log ""
   log "${BOLD}=== Done! ===${NC}"

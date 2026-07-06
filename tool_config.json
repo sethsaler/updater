@@ -133,6 +133,37 @@
     "mise": "mise self-update 2>/dev/null || true",
     "pipx": "pipx upgrade-all 2>/dev/null || true",
     "grok": "grok update 2>/dev/null || true",
+    "rustup": "rustup update 2>/dev/null || true",
+    "gcloud": "gcloud components update --quiet 2>/dev/null || true",
+    "mas": "mas upgrade 2>/dev/null || true",
+    "tlmgr": "tlmgr update --self --all 2>/dev/null || true",
     "path": ""
+  },
+  "check": {
+    "npm": "npm outdated -g --parseable",
+    "brew": "brew update >/dev/null 2>&1 && brew outdated --quiet"
+  },
+  "hold": [],
+  "repos": {
+    "gh": "cli/cli",
+    "fzf": "junegunn/fzf",
+    "rg": "BurntSushi/ripgrep",
+    "starship": "starship/starship",
+    "uv": "astral-sh/uv",
+    "deno": "denoland/deno",
+    "bun": "oven-sh/bun",
+    "zoxide": "ajeetdsouza/zoxide",
+    "eza": "eza-community/eza",
+    "bat": "sharkdp/bat",
+    "fd": "sharkdp/fd",
+    "just": "casey/just",
+    "lazygit": "jesseduffield/lazygit",
+    "yazi": "sxyazi/yazi",
+    "atuin": "atuinsh/atuin",
+    "mise": "jdx/mise",
+    "gemini": "google-gemini/gemini-cli",
+    "opencode": "sst/opencode",
+    "rustup": "rust-lang/rustup",
+    "mas": "mas-cli/mas"
   }
 }

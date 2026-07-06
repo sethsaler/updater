@@ -2,7 +2,7 @@
 
 > One script to discover and update every CLI and package manager on your system.
 
-`update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, npm global bins (including `~/.npm-global/bin`, `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, `~/bin`, Wasmtime/Wasmer runtimes, and **all user-writable directories on `$PATH`** — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
+`update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, npm global bins (including `~/.npm-global/bin`, `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, pipx venvs, `~/bin`, Wasmtime/Wasmer runtimes, and **all user-writable directories on `$PATH`** — plus single-CLI managers detected by presence alone (rustup, gcloud, mas, tlmgr) — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
 
 Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), and [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning).
 
@@ -28,6 +28,11 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | pyenv | `pyenv update` |
 | rbenv | `brew upgrade rbenv ruby-build` (no-op if not installed via Homebrew; see below) |
 | SDKMAN | `sdk selfupdate` (via `sdkman-init.sh`) |
+| pipx (Python) | `pipx upgrade-all` |
+| rustup (Rust toolchains) | `rustup update` |
+| gcloud (Google Cloud SDK) | `gcloud components update --quiet` |
+| mas (Mac App Store CLI) | `mas upgrade` |
+| tlmgr (TeX Live) | `tlmgr update --self --all` |
 
 ### Known tools (individual commands)
 
@@ -85,11 +90,20 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 
 Tools not found on your system are silently skipped. Unknown tools are skipped silently. The script never updates things it can't update.
 
+A tool being in `known` never suppresses its origin's bulk update: e.g. `cline` (a `known` npm tool) gets its own `npm update -g cline`, but the origin's `npm update -g` bulk line **still runs once** to cover every *other* npm global that isn't individually tracked — those two are not redundant. (An earlier version of this script had a bug where the first `known` tool seen for an origin marked that origin's bulk update as already handled, so it silently never ran for origins — npm chief among them — that almost always have at least one `known` tool. Fixed; see the regression test `test_known_tool_does_not_suppress_origin_bulk`.)
+
 ### Origins with limited or environment-specific updates
 
 - **rbenv** — Bulk update uses Homebrew when `rbenv` / `ruby-build` are installed as formulas. If you installed rbenv only from git, run `git -C "$(rbenv root)" pull` yourself when needed.
 - **SDKMAN** — Runs `sdk selfupdate` (SDKMAN itself). Candidate SDK upgrades are not bulk-updated automatically.
+- **pipx** — Discovered via `~/.local/pipx/venvs/*/bin`; bulk update is `pipx upgrade-all`. No-op (both discovery and bulk command) if pipx isn't installed.
+- **rustup** — Rust *toolchains*, distinct from Cargo-installed binaries (which are handled by the existing `cargo` origin/bulk entry above). `rustup` itself isn't discovered from a bin directory; its presence is detected with `command -v rustup` and registered as a single synthetic tool, same as `fnm`. No-op if `rustup` isn't installed.
+- **gcloud** — `gcloud components update --quiet`, detected the same way as `rustup` (`command -v gcloud`). **Caveat, not machine-verified**: if your `gcloud` was installed via a Homebrew cask or another package manager (rather than the Google-provided installer), `gcloud components update` typically errors out because that installation method doesn't own its own component manifest — the command itself reports this clearly, and the origin's `2>/dev/null || true` guard keeps that failure from breaking the rest of the run, but it also means the update silently does nothing in that case. If this applies to you, update `gcloud` via your package manager instead (e.g. `brew upgrade google-cloud-sdk`) and consider adding a `known` override in `config.local.json` for the `gcloud` binary name pointing at that.
+- **mas** — Mac App Store CLI; `mas upgrade`, detected via `command -v mas`. No-op if not installed.
+- **tlmgr** — TeX Live package manager; `tlmgr update --self --all`, detected via `command -v tlmgr`. **Caveat, not machine-verified**: on a typical system-wide TeX Live install, `tlmgr` needs `sudo` to write to the system tree. This script **never invokes `sudo`** (and never will), so on such installs this bulk command will fail with a permissions error rather than silently doing nothing — the failure is visible in the run summary/history like any other failed job. If your TeX Live install needs elevated permissions, run `sudo tlmgr update --self --all` yourself, or reinstall TeX Live to a user-writable prefix.
 - **`path`** — **Enabled by default**. Binaries found under `$PATH` directories (excluding system dirs like `/usr/bin`, `/bin`, `/sbin`) get origin `path`. There is no default bulk update for `path`; add a `"path"` entry under `bulk` in [`config.local.json`](#configuration-merge-and-overrides) if you want a single command for all of them, or list tools under `known`. Use `--no-scan-path` to disable PATH scanning.
+
+None of pipx, rustup, gcloud, mas, or tlmgr were installed on the machine this was built on; every entry above is guarded to be a silent no-op in both discovery and the update command when the corresponding tool isn't present, but only `pipx` (pre-existing) had its wiring exercised end-to-end there. `check` pre-check commands and `repos` changelog slugs were deliberately **not** added for gcloud/tlmgr (no reliable/verifiable check command; no meaningful public-release-notes repo for gcloud, and TeX Live isn't a single-repo GitHub project). `rustup` (`rust-lang/rustup`) and `mas` (`mas-cli/mas`) do have verified `repos` slugs for the changelog digest.
 
 ## Installation
 
@@ -130,6 +144,17 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --validate-cache  # validate cache structure and show diagnostics (JSON)
 ./update_all_clis.sh --debug-cache     # show human-readable cache validation report
 ./update_all_clis.sh --suggest-known   # show tools updated via bulk but not in known list
+./update_all_clis.sh --history         # show the last 3 runs (ok/fail, version changes, failures)
+./update_all_clis.sh --history=10      # show the last 10 runs
+./update_all_clis.sh --include-quarantined  # force-run tools/origins currently quarantined
+./update_all_clis.sh --no-precheck    # always run every bulk update (skip outdated pre-checks)
+./update_all_clis.sh --hold=claude,brew     # pin tools/origins (persists in config.local.json) and exit
+./update_all_clis.sh --unhold=claude        # un-pin and exit
+HOLD=claude ./update_all_clis.sh            # one-run ad hoc hold (not persisted)
+./update_all_clis.sh --doctor         # read-only diagnostics report
+./update_all_clis.sh --doctor --json  # same, as JSON
+./update_all_clis.sh --changelog      # after a real run, best-effort release-notes digest
+./update_all_clis.sh --self-update    # git pull --ff-only this checkout before planning, then re-exec once
 SKIP=hermes,uv ./update_all_clis.sh
 ./update_all_clis.sh --skip=hermes,uv
 QUIET=1 ./update_all_clis.sh
@@ -144,15 +169,58 @@ The updater includes several performance optimizations:
 - **Rate limiting** — minimal delay between subprocess calls (0.01s default, configurable via `UAC_RATE_LIMIT_DELAY`)
 - **Parallel version probing** — uses 16 workers for concurrent version checks
 - **Fast failure detection** — 5-second timeout for unresponsive tools during version probing
+- **Outdated pre-checks** — a bulk origin with a configured `check` command (see below) skips its update entirely when the check says nothing's outdated
+- **mtime-gated post-run probing** — the post-update version snapshot only re-probes a tool/manager whose binary's mtime actually changed since the pre-run snapshot; everything else reuses the pre-run version string instead of spawning another `--version` call
+- **Incremental discovery scan** — directories are only re-listed when their mtime changed since the last scan (see below); `--rescan` forces a full walk
+- **Fewer `python3` spawns per run** — the per-job and single-instance locks used to each spawn a Python `fcntl.flock` coprocess; both are now a bash-native `mkdir` spin-lock (atomic on POSIX filesystems, no helper process, same stale-lock-steal and Ctrl+C-safe cleanup semantics). `--dry-run` also skips locking entirely now — it never mutates anything, so serializing "would-run" jobs against each other bought nothing but a lock round-trip per job.
+
+Measured on this machine (warmed cache, `--no-scan`, ~96 planned jobs):
+
+| | Before | After |
+|---|---|---|
+| `--dry-run` wall clock | ~11.7s | ~1.3s |
+| `--dry-run` `python3` invocations | ~104 | ~7 |
+| `--list` (repeat, warm cache) | ~1.7s | ~1.7s (unchanged — `--list` was already cheap; its `python3` calls are the incremental-scan/list-json ones, not per-job locks) |
+
+The `--dry-run` numbers are the ones that moved: removing the per-job lock spawn (dry-run never locks now) and replacing the two remaining Python-coprocess locks with `mkdir` accounts for essentially all of it. `--list`'s call count (6-7) is unrelated to job locking and was already small.
 
 Use `--validate-cache` and `--debug-cache` to diagnose cache health and performance.
 
+#### Outdated pre-checks (`check`)
+
+`tool_config.json` supports an optional top-level `"check"` object, mapping a **bulk origin** to a read-only shell command whose stdout decides whether that origin's (often expensive) bulk update is actually needed:
+
+```json
+"check": {
+  "npm": "npm outdated -g --parseable",
+  "brew": "brew update >/dev/null 2>&1 && brew outdated --quiet"
+}
+```
+
+Semantics: the check command runs; if it **exits 0** and its stdout (after trimming whitespace) is **empty**, `[]`, or `{}`, the origin is treated as up to date and its bulk update is skipped this run. Any other outcome — non-zero exit, real output, a missing command, or an error — fails open and the update runs exactly as before. Skipped origins print `✓ <origin>: already up to date (pre-check)`, count as `ok` in the run summary, and are recorded in `history.jsonl` with `status: "ok"` and the check's own duration.
+
+Checks run **concurrently**, before the plan executes, and only for **bulk origins** (known-tool commands are left alone in v1 — a known tool routed through the same manager as a pre-checked origin still runs its own command). `--dry-run` never executes checks (some, like brew's, refresh manager metadata as a side effect) — it only reports which origins would have been checked. Disable pre-checks entirely with `--no-precheck` or `UAC_NO_PRECHECK=1`.
+
+Only `npm` and `brew` ship with a `check` command — both were verified by hand on a real machine. `gem outdated` was tried and rejected: it always prints noisy `Ignoring ...` lines and a long list of un-upgradable system gems, so its stdout is never actually empty even when every user-installed gem is current. `cargo` (needs the `cargo-install-update` subcommand, not installed here), `dotnet`, and `krew` were not verified (missing/not installed) and were left out rather than guessed at — a good next step for whoever picks this up on a machine that has them.
+
+#### Incremental discovery scan
+
+`full_scan()` used to re-walk 20+ directories on every run. It now persists each scanned directory's mtime in the cache (`dir_mtimes`); on the next run, a directory whose mtime hasn't changed reuses its previously-cached tools instead of being re-listed (adding/removing a file changes a directory's own mtime on APFS and most other filesystems, so new installs are still always picked up). Directories whose source disappeared have their cached tools pruned. `--rescan` ignores stored mtimes and forces a full walk, refreshing every stored mtime.
+
+Two scan modes: a plain directory listing (most bin dirs), and a "tree" mode for one level of `*/bin` subdirectories (Homebrew's `opt/`, mise's `installs/`, uv's shared venvs) — for those, only the top-level directory's mtime is tracked, so an in-place upgrade that doesn't add/remove a top-level entry (formula symlink, install dir) won't retrigger a walk. That's an accepted trade-off: existing binary *names* don't change on an in-place upgrade either way, and `--rescan` remains available. `npm ls -g --json` (used to discover extra per-package `.bin` directories) still runs on every scan — gating it reliably needs its own signal, which was out of scope for this pass — but the actual filesystem walking it feeds into is gated the same as everything else.
+
 ### Configuration merge and overrides
 
-- **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known` and `bulk` objects are **merged on top of** `tool_config.json` so you can add or override commands without editing the repo file.
+- **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known`, `bulk`, `check`, and `repos` objects are **merged on top of** `tool_config.json` (local wins on key conflicts) and its `hold` array is **added to** (not replaced by) the base list, so you can add or override commands without editing the repo file.
 - **`CACHE_TTL_HOURS`** — cache freshness in hours (default **0**, i.e. every run does a fresh discovery scan so new installs are always picked up). Set to e.g. `24` to reuse a cache newer than 24h (unless `--rescan`).
 - **`ONLY_ORIGINS`** — comma-separated origins (and known tool names) to **restrict** what runs. When set, bulk updates run only for listed origins; known tools run only if their `origin` or `name` is listed.
 - **`SKIP_ORIGINS`** — comma-separated origins to skip for bulk updates; known tools whose `origin` is listed are skipped.
+- **`UPDATE_ALL_CLIS_HISTORY_FILE`** — path to the run-history JSONL file (default `~/.config/update-all-clis/history.jsonl`). See [Run history](#run-history).
+- **`UAC_QUARANTINE_AFTER`** — consecutive-failure threshold before a job is quarantined (default **3**; `0` disables quarantine).
+- **`UAC_INCLUDE_QUARANTINED`** — set to `1` to force quarantined jobs to run this pass (same as `--include-quarantined`).
+- **`UAC_NO_PRECHECK`** — set to `1` to skip outdated pre-checks entirely (same as `--no-precheck`).
+- **`HOLD`** — comma-separated one-run ad hoc hold (same as `--hold=` but non-persistent; see [Pin/hold tools](#pinhold-tools)).
+- **`UPDATE_ALL_CLIS_CHANGELOG`** — set to `1` to enable the changelog digest (same as `--changelog`).
 
 ### Desktop summary dialog (opt-in, non-blocking)
 
@@ -163,6 +231,105 @@ The dialog is **opt-in and never blocks the terminal** — it is spawned fully d
 - **Default:** no dialog.
 - **`--notify`** or **`UPDATE_ALL_CLIS_NOTIFY=1`** — show the dialog (non-blocking).
 - **`UPDATE_ALL_CLIS_NOTIFY=0`** or **`UPDATE_ALL_CLIS_NO_NOTIFY=1`** — never show it (set automatically for **LaunchAgent**/**systemd** schedules).
+
+### Run history
+
+Every real (non-`--dry-run`) run appends one JSON line per executed job to **`~/.config/update-all-clis/history.jsonl`** (override with `UPDATE_ALL_CLIS_HISTORY_FILE`). Each record captures the run id, timestamp, job kind (`known`/`bulk`/`uptodate`), name, command, duration, `ok`/`fail` status, and the version before/after (best effort). A pre-check skip (see [Outdated pre-checks](#outdated-pre-checks-check)) is recorded with kind `uptodate`, `status: "ok"`, and the check's own duration rather than a near-zero one. The file is pruned to the most recent ~2000 lines on every append, so it won't grow unbounded. `--dry-run` never writes to it.
+
+```bash
+./update_all_clis.sh --history        # last 3 runs: ok/fail counts, version changes, failures
+./update_all_clis.sh --history=10     # last 10 runs
+python3 lib_update_all_clis.py history ~/.config/update-all-clis/history.jsonl 5
+```
+
+**Slowest-first scheduling** — when building the parallel-run plan, jobs are ordered by their historical mean duration (last ~10 runs per job), descending, so the long pole (usually `brew`) kicks off first instead of last. Jobs with no history yet run after the known-slow ones, in their otherwise-stable original order.
+
+**Failure quarantine** — a job (known tool or bulk origin) that failed its last **`UAC_QUARANTINE_AFTER`** (default **3**, `0` disables) consecutive appearances in history is skipped automatically, with a warning:
+
+```
+!! skipped (quarantined after 3 consecutive failures): sometool — run with --include-quarantined to retry
+```
+
+Force a quarantined job to run anyway with **`--include-quarantined`** (or `UAC_INCLUDE_QUARANTINED=1`); a subsequent success naturally clears the streak since quarantine state is derived purely from `history.jsonl` — there's no separate state file to reset. Quarantined jobs are also listed in the run summary (desktop dialog / `UPDATE_ALL_CLIS_SUMMARY_FILE`) so they stay visible even when skipped silently in a scheduled run.
+
+### Pin/hold tools
+
+`tool_config.json` (and `config.local.json`) support an optional top-level **`"hold"`** array — known tool names and/or bulk origins that are pinned: skipped on every run until removed. Local `config.local.json` entries **add to** (never replace) the base list.
+
+```json
+"hold": ["claude", "brew"]
+```
+
+An entry may also be written `"name:major"` (e.g. `"claude:major"`). In v1 this is accepted and treated identically to a plain hold — for most package managers there's no reliable way to know the *target* version before the update runs, so a true "block major upgrades only" hold isn't safe to implement at the planning stage. What v1 gives you instead is **major-jump flagging in the run summary**: any tool whose version actually changed with a bump in the leading integer component (e.g. `1.9.0 → 2.0.0`) is marked `[MAJOR UPGRADE]` in the desktop dialog / `UPDATE_ALL_CLIS_SUMMARY_FILE` output, so you notice it after the fact even without a pre-run block.
+
+Two ways to manage the persistent hold list:
+
+```bash
+./update_all_clis.sh --hold=claude,brew   # add to hold (writes config.local.json) and exit
+./update_all_clis.sh --unhold=brew        # remove from hold and exit
+```
+
+For a one-run, non-persistent hold, use `HOLD=` (like `SKIP=`, but visibly reported rather than silently skipped):
+
+```bash
+HOLD=claude ./update_all_clis.sh
+```
+
+**Hold vs. `SKIP`/`SKIP_ORIGINS`:** `SKIP` is a per-run, silent exclusion — it never appears in the run summary and isn't persisted. A held job is **persistent** (via config, until you `--unhold`) or explicitly one-run (`HOLD=`), and always shows up: the shell prints `!! held (config): <name> — remove from "hold" to resume updates` (or `!! held (env HOLD=): <name> — …` for the ad hoc form), a held job is recorded in `history.jsonl` with `status: "held"` and `"held": true` (never counted toward quarantine's failure streak), and it appears in its own "Held" section of the run summary.
+
+### Doctor
+
+`--doctor` runs a read-only diagnostics pass over the existing cache, history, and config — no updates are executed:
+
+```bash
+./update_all_clis.sh --doctor         # human-readable report
+./update_all_clis.sh --doctor --json  # machine-readable report
+```
+
+Checks (each is independent — one crashing doesn't prevent the rest from reporting):
+
+1. **Broken symlinks** — dead symlinks in every scanned bin directory (from the cache) plus every directory on `$PATH`.
+2. **Shadowed duplicates** — a binary name discovered under 2+ origins (e.g. both `npm` and a `path`-scanned copy); reports which absolute path currently wins per your live `$PATH` order.
+3. **Chronic failures** — jobs with 3+ failures in their last 10 `history.jsonl` records, surfaced even if they haven't (yet) hit the consecutive-failure quarantine threshold.
+4. **Config issues** — `known` entries whose binary no longer exists on `$PATH`; `hold` entries matching nothing; `check` entries for an origin with no corresponding `bulk` command.
+5. **Cache health** — reuses `validate_cache()` (same as `--validate-cache`) rather than duplicating that logic.
+
+Exit code is **0** with no findings, **1** if any check surfaced something.
+
+### Changelog digest
+
+`tool_config.json` supports an optional top-level **`"repos"`** object mapping a tool or bulk-origin name to a GitHub `owner/repo` slug:
+
+```json
+"repos": {
+  "gh": "cli/cli",
+  "fzf": "junegunn/fzf"
+}
+```
+
+With **`--changelog`** (or `UPDATE_ALL_CLIS_CHANGELOG=1`) on a **real** run (never `--dry-run`), after the update finishes the script fetches best-effort release notes for every tool whose version actually changed and has a `repos` mapping, matching releases whose tag falls in `(version_before, version_after]` (tolerant of a leading `v` on tags). Prefers `gh api` when the `gh` CLI is available (works with your existing auth, higher rate limit); otherwise falls back to an unauthenticated `https://api.github.com` request (60 req/hour limit) — capped at **5 tools per run** either way, noting when the cap was hit. Each release body is truncated to ~400 characters. The whole digest is capped at a **~10s** wall-clock budget; any single tool's failure (offline, rate-limited, no matching tag) just omits that tool rather than aborting the digest.
+
+Output is appended as a "Changelog highlights" section to stdout and to `UPDATE_ALL_CLIS_SUMMARY_FILE` (if set) — **never** to the macOS dialog, since release notes can run to several KB.
+
+Only tools with a **verified** repo slug ship in `tool_config.json` by default (`gh`, `fzf`, `rg`→ripgrep, `starship`, `uv`, `deno`, `bun`, `zoxide`, `eza`, `bat`, `fd`, `just`, `lazygit`, `yazi`, `atuin`, `mise`, `gemini`, `opencode`). Add more in `config.local.json`'s `"repos"` — local entries merge on top of (and can override) the base mapping.
+
+### Self-update
+
+`--self-update` (or `UPDATE_ALL_CLIS_SELF_UPDATE=1`) makes the script update its own checkout before planning anything:
+
+```bash
+./update_all_clis.sh --self-update
+```
+
+If `SCRIPT_DIR` (wherever `update_all_clis.sh` lives) is a git checkout with an `origin` remote, it runs `git -C "$SCRIPT_DIR" pull --ff-only` (capped at 15s — no `flock`/`gtimeout` dependency; a backgrounded pull is watched and killed if it overruns). If that changes `HEAD`, the script re-execs itself once with the same arguments, so the run that follows uses the freshly-pulled code, config, and library. A `UAC_SELF_UPDATED=1` marker prevents a re-exec loop.
+
+**Off by default**, and fail-open in every way that matters — none of the following ever fails the run, they just print a one-line warning (or, for the boring "nothing to pull" case, nothing at all) and continue on the current checkout:
+
+- no `git` binary
+- `SCRIPT_DIR` isn't a git checkout
+- no `origin` remote configured
+- `git pull --ff-only` fails for **any** reason — a dirty working tree with conflicting local changes, no network, or diverged history all surface as a non-zero exit from `git pull`, which is treated identically: warn and continue. **The script never runs `git stash`, `git reset`, `git checkout --`, or anything else that could discard uncommitted local changes** — if `--ff-only` can't fast-forward cleanly, it simply doesn't, and neither does this wrapper.
+- pull takes longer than the timeout — killed and treated as a failure, same fail-open path
 
 ### Suggest command for unknown tools
 
@@ -227,7 +394,7 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
 7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs).
-8. **Concurrency safety** — a **single-instance lock** (`fcntl.flock`) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. Parallel updates of the same package manager are serialized with reliable OS locks (no busy-waiting). **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`.
+8. **Concurrency safety** — a **single-instance lock** (`mkdir`-based, with stale-lock detection) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. Parallel updates of the same package manager are serialized the same way — no `flock` binary or helper process needed on macOS, and no busy-waiting (a lock older than the stale cap is assumed abandoned and reclaimed rather than waited on forever). `--dry-run` skips locking entirely since it never mutates anything. **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`, and its `EXIT`/`INT`/`TERM` trap removes the whole lock directory so a crash never leaves a stale lock behind for long.
 
 ## Adding a new tool
 
@@ -246,10 +413,10 @@ python3 lib_update_all_clis.py suggest ~/.config/update-all-clis/cache.json
 
 ## CLI version status
 
-See [`CLI_LAST_UPDATED.md`](CLI_LAST_UPDATED.md) for per-tool versions (regenerate with `python3 scripts/generate_cli_report.py`).
+See [`CLI_LAST_UPDATED.md`](CLI_LAST_UPDATED.md) for per-tool versions (regenerate with `python3 scripts/generate_cli_report.py`) — that file is the current source of truth, not the table below.
 
 <details>
-<summary>Legacy inline table (may be stale)</summary>
+<summary>⚠️ Stale snapshot — do not treat as current. Kept only for history; see <code>CLI_LAST_UPDATED.md</code> above instead.</summary>
 
 | CLI | Last Modified | Version |
 |-----|---------------|---------|
@@ -307,6 +474,8 @@ See [`CLI_LAST_UPDATED.md`](CLI_LAST_UPDATED.md) for per-tool versions (regenera
 | zoxide | not installed |  |
 
 Last modified is the file timestamp of the binary on disk (when it was last installed or updated). Regenerate with `python3 scripts/generate_cli_report.py`.
+
+</details>
 
 ## Requirements
 
