@@ -2154,11 +2154,15 @@ def doctor_broken_symlinks(dirs: list[str]) -> list[str]:
 
 
 def doctor_shadowed_duplicates(cache_path: str) -> list[dict[str, Any]]:
-    """Binary names present under 2+ distinct origins in the cache.
+    """Binary names whose cache entries resolve to 2+ genuinely different files.
 
-    Reports which origins provide the name and which absolute path
-    currently wins on `$PATH` (via shutil.which, so it reflects the live
-    system's actual PATH order, not just the cache).
+    A name discovered under several origins is normal — e.g. an npm global
+    seen by both the npm query and the `$PATH` scan of `~/.npm-global/bin`
+    resolves to the same real file and is NOT shadowing. Only names whose
+    entries resolve (via realpath) to distinct existing files are reported:
+    for those, which copy runs genuinely depends on `$PATH` order. Reports
+    the distinct real paths and which absolute path currently wins on the
+    live system's `$PATH` (via shutil.which).
     """
     try:
         with open(cache_path, encoding="utf-8") as f:
@@ -2166,17 +2170,33 @@ def doctor_shadowed_duplicates(cache_path: str) -> list[dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return []
     tools = [t for t in data if isinstance(t, dict) and "name" in t]
-    by_name: dict[str, set[str]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
     for t in tools:
-        by_name.setdefault(t["name"], set()).add(str(t.get("origin", "?")))
+        by_name.setdefault(t["name"], []).append(t)
     out: list[dict[str, Any]] = []
     for name in sorted(by_name):
-        origins = by_name[name]
-        if len(origins) < 2:
+        entries = by_name[name]
+        if len(entries) < 2:
+            continue
+        origins: set[str] = set()
+        real_paths: set[str] = set()
+        for t in entries:
+            origins.add(str(t.get("origin", "?")))
+            d = t.get("dir")
+            if not d:
+                continue
+            full = os.path.join(os.path.expanduser(str(d)), name)
+            try:
+                if os.path.exists(full):
+                    real_paths.add(os.path.realpath(full))
+            except OSError:
+                continue
+        if len(real_paths) < 2:
             continue
         out.append({
             "name": name,
             "origins": sorted(origins),
+            "paths": sorted(real_paths),
             "winner_path": shutil.which(name),
         })
     return out
@@ -2203,17 +2223,24 @@ def doctor_chronic_failures(
     return out
 
 
+def doctor_not_installed(cfg: dict[str, Any]) -> list[str]:
+    """`known` entries with no binary on PATH — informational only.
+
+    tool_config.json deliberately ships update commands for tools you
+    *might* install; the updater silently skips absent ones, so these are
+    not findings and don't affect the doctor exit status.
+    """
+    known = cfg.get("known", {}) or {}
+    return [name for name in sorted(known) if not shutil.which(name)]
+
+
 def doctor_config_issues(cfg: dict[str, Any]) -> list[str]:
-    """Config-level issues: dead `known` entries, dangling `hold`/`check` entries."""
+    """Config-level issues: dangling `hold`/`check` entries."""
     issues: list[str] = []
     known = cfg.get("known", {}) or {}
     bulk = cfg.get("bulk", {}) or {}
     hold = cfg.get("hold", []) or []
     check = cfg.get("check", {}) or {}
-
-    for name in sorted(known):
-        if not shutil.which(name):
-            issues.append(f"known entry '{name}' has no binary on PATH")
 
     valid_targets = set(known) | set(bulk)
     for entry in sorted(normalize_hold_entries(hold)):
@@ -2225,6 +2252,17 @@ def doctor_config_issues(cfg: dict[str, Any]) -> list[str]:
             issues.append(f"check entry for origin '{origin}' has no corresponding bulk command")
 
     return issues
+
+
+# Mirrors the scan exclusions in update_all_clis.sh: system dirs the user
+# can't (or shouldn't) modify, so broken symlinks there aren't actionable.
+_DOCTOR_SYSTEM_DIRS = ("/usr/bin", "/bin", "/sbin", "/usr/sbin", "/usr/libexec",
+                       "/run/current-system/sw/bin")
+_DOCTOR_SYSTEM_PREFIXES = ("/System/", "/nix/")
+
+
+def _doctor_dir_excluded(d: str) -> bool:
+    return d in _DOCTOR_SYSTEM_DIRS or d.startswith(_DOCTOR_SYSTEM_PREFIXES)
 
 
 def doctor_report(
@@ -2240,6 +2278,7 @@ def doctor_report(
         "shadowed_duplicates": [],
         "chronic_failures": [],
         "config_issues": [],
+        "not_installed": [],
         "errors": [],
     }
 
@@ -2257,7 +2296,8 @@ def doctor_report(
                 if isinstance(t, dict) and t.get("dir"):
                     dirs.add(t["dir"])
         dirs.update(p for p in os.environ.get("PATH", "").split(os.pathsep) if p)
-        report["broken_symlinks"] = doctor_broken_symlinks(sorted(dirs))
+        report["broken_symlinks"] = doctor_broken_symlinks(
+            sorted(d for d in dirs if not _doctor_dir_excluded(d)))
     except Exception as e:
         report["errors"].append(f"broken symlink check failed: {e}")
 
@@ -2276,14 +2316,22 @@ def doctor_report(
     except Exception as e:
         report["errors"].append(f"config issue check failed: {e}")
 
+    try:
+        report["not_installed"] = doctor_not_installed(cfg)
+    except Exception as e:
+        report["errors"].append(f"not-installed check failed: {e}")
+
     return report
 
 
 def doctor_has_findings(report: dict[str, Any]) -> bool:
+    # Informational sections don't count as findings: `not_installed`
+    # (config catalogs tools you might install) and cache warnings
+    # (duplicate names across origins are normal — see shadowed check).
     cv = report.get("cache_validation", {}) or {}
     return bool(
         (not cv.get("valid", True))
-        or cv.get("warnings")
+        or cv.get("errors")
         or report.get("broken_symlinks")
         or report.get("shadowed_duplicates")
         or report.get("chronic_failures")
@@ -2319,6 +2367,8 @@ def format_doctor_report(report: dict[str, Any]) -> str:
                 f"  {d['name']}  [origins: {', '.join(d['origins'])}]  "
                 f"winner: {d.get('winner_path') or '?'}"
             )
+            for p in d.get("paths", []) or []:
+                lines.append(f"    - {p}")
     else:
         lines.append("  (none)")
     lines.append("")
@@ -2338,6 +2388,12 @@ def format_doctor_report(report: dict[str, Any]) -> str:
         lines.extend(f"  {issue}" for issue in ci)
     else:
         lines.append("  (none)")
+
+    ni = report.get("not_installed", []) or []
+    if ni:
+        lines.append("")
+        lines.append(f"Known but not installed ({len(ni)}, informational — these are skipped):")
+        lines.append("  " + ", ".join(ni))
 
     errs = report.get("errors", []) or []
     if errs:

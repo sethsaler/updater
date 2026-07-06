@@ -17,7 +17,7 @@ from lib_update_all_clis import (
     normalize_hold_entries, edit_local_hold, format_run_summary,
     is_major_upgrade, leading_major,
     doctor_broken_symlinks, doctor_shadowed_duplicates,
-    doctor_chronic_failures, doctor_config_issues, doctor_report,
+    doctor_chronic_failures, doctor_config_issues, doctor_not_installed, doctor_report,
     doctor_has_findings, format_doctor_report,
     tag_in_range, tag_to_version, truncate_changelog_body,
     format_changelog_section, changed_tools_with_repos, build_changelog_digest,
@@ -1310,20 +1310,64 @@ class TestDoctorBrokenSymlinks(unittest.TestCase):
 
 
 class TestDoctorShadowedDuplicates(unittest.TestCase):
-    def test_two_origins_reported(self):
-        dirpath = tempfile.mkdtemp()
-        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+    def _write_cache(self, dirpath, entries):
         cache_path = os.path.join(dirpath, "cache.json")
         with open(cache_path, "w") as f:
-            json.dump([
-                {"name": "foo", "origin": "npm"},
-                {"name": "foo", "origin": "path"},
-                {"name": "bar", "origin": "npm"},
-            ], f)
+            json.dump(entries, f)
+        return cache_path
+
+    def test_distinct_real_files_reported(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        dir_a = os.path.join(dirpath, "a")
+        dir_b = os.path.join(dirpath, "b")
+        os.makedirs(dir_a)
+        os.makedirs(dir_b)
+        for d in (dir_a, dir_b):
+            with open(os.path.join(d, "foo"), "w") as f:
+                f.write(d)  # distinct contents, distinct real files
+        cache_path = self._write_cache(dirpath, [
+            {"name": "foo", "origin": "npm", "dir": dir_a},
+            {"name": "foo", "origin": "path", "dir": dir_b},
+            {"name": "bar", "origin": "npm", "dir": dir_a},
+        ])
         dupes = doctor_shadowed_duplicates(cache_path)
         self.assertEqual(len(dupes), 1)
         self.assertEqual(dupes[0]["name"], "foo")
         self.assertEqual(dupes[0]["origins"], ["npm", "path"])
+        self.assertEqual(
+            dupes[0]["paths"],
+            sorted([os.path.realpath(os.path.join(dir_a, "foo")),
+                    os.path.realpath(os.path.join(dir_b, "foo"))]),
+        )
+
+    def test_same_real_file_via_two_origins_not_reported(self):
+        # An npm global seen by both the npm query and the $PATH scan is
+        # one file, not shadowing — the pre-fix check false-positived here.
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        dir_a = os.path.join(dirpath, "a")
+        dir_b = os.path.join(dirpath, "b")
+        os.makedirs(dir_a)
+        os.makedirs(dir_b)
+        real = os.path.join(dir_a, "foo")
+        with open(real, "w") as f:
+            f.write("x")
+        os.symlink(real, os.path.join(dir_b, "foo"))
+        cache_path = self._write_cache(dirpath, [
+            {"name": "foo", "origin": "npm", "dir": dir_a},
+            {"name": "foo", "origin": "path", "dir": dir_b},
+        ])
+        self.assertEqual(doctor_shadowed_duplicates(cache_path), [])
+
+    def test_entries_without_dirs_not_reported(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_path = self._write_cache(dirpath, [
+            {"name": "foo", "origin": "npm"},
+            {"name": "foo", "origin": "path"},
+        ])
+        self.assertEqual(doctor_shadowed_duplicates(cache_path), [])
 
     def test_missing_cache_returns_empty(self):
         self.assertEqual(doctor_shadowed_duplicates("/definitely/not/a/real/cache.json"), [])
@@ -1374,10 +1418,17 @@ class TestDoctorConfigIssues(unittest.TestCase):
         issues = doctor_config_issues(cfg)
         self.assertFalse(any("npm" in i for i in issues))
 
-    def test_known_entry_missing_binary_reported(self):
+    def test_known_entry_missing_binary_is_informational_not_issue(self):
+        # Known entries are a catalog of tools you *might* install; the
+        # updater skips absent ones, so they're not config issues.
         cfg = {"known": {"definitely-not-a-real-binary-xyz": "echo hi"}, "bulk": {}}
-        issues = doctor_config_issues(cfg)
-        self.assertTrue(any("definitely-not-a-real-binary-xyz" in i for i in issues))
+        self.assertEqual(doctor_config_issues(cfg), [])
+        self.assertEqual(
+            doctor_not_installed(cfg), ["definitely-not-a-real-binary-xyz"])
+
+    def test_not_installed_excludes_present_binaries(self):
+        cfg = {"known": {"sh": "true"}, "bulk": {}}  # /bin/sh always exists
+        self.assertEqual(doctor_not_installed(cfg), [])
 
 
 class TestDoctorReport(unittest.TestCase):
