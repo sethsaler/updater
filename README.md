@@ -288,13 +288,13 @@ HOLD=claude ./update_all_clis.sh
 
 Checks (each is independent — one crashing doesn't prevent the rest from reporting):
 
-1. **Broken symlinks** — dead symlinks in every scanned bin directory (from the cache) plus every directory on `$PATH`.
-2. **Shadowed duplicates** — a binary name discovered under 2+ origins (e.g. both `npm` and a `path`-scanned copy); reports which absolute path currently wins per your live `$PATH` order.
+1. **Broken symlinks** — dead symlinks in every scanned bin directory (from the cache) plus every user-serviceable directory on `$PATH` (SIP/system dirs like `/usr/bin` and `/usr/sbin` are excluded — findings there wouldn't be actionable).
+2. **Shadowed duplicates** — a binary name whose cache entries resolve (via realpath) to **2+ genuinely different files**, so which copy runs depends on `$PATH` order. The same file discovered through several origins (e.g. an npm global seen by both the npm query and the `$PATH` scan) is *not* reported. Intentional shadows — e.g. a wrapper shim in `~/.local/bin` that sets env vars and `exec`s the managed copy — can be acknowledged with a top-level **`"doctor_ignore"`** array (usually in `config.local.json`); ignored names are listed informationally and don't affect the exit code.
 3. **Chronic failures** — jobs with 3+ failures in their last 10 `history.jsonl` records, surfaced even if they haven't (yet) hit the consecutive-failure quarantine threshold.
-4. **Config issues** — `known` entries whose binary no longer exists on `$PATH`; `hold` entries matching nothing; `check` entries for an origin with no corresponding `bulk` command.
-5. **Cache health** — reuses `validate_cache()` (same as `--validate-cache`) rather than duplicating that logic.
+4. **Config issues** — `hold` entries matching nothing; `check` entries for an origin with no corresponding `bulk` command. (`known` entries for tools that aren't installed are **informational only** — the config deliberately catalogs tools you might install, and absent ones are skipped.)
+5. **Cache health** — reuses `validate_cache()` (same as `--validate-cache`) rather than duplicating that logic. Cache *warnings* are informational; only cache errors count as findings.
 
-Exit code is **0** with no findings, **1** if any check surfaced something.
+Exit code is **0** with no findings, **1** if any check surfaced something actionable.
 
 ### Changelog digest
 

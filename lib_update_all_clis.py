@@ -90,18 +90,20 @@ def load_merge(base_path: str, local_path: Optional[str]) -> dict[str, Any]:
                 base.setdefault(key, {})
                 base[key].update(loc[key])
                 logger.debug(f"Merged {len(loc[key])} entries from local config {key}")
-        # "hold" is a flat list, not a dict: local entries ADD to (rather than
-        # replace) the base list, deduplicated, preserving base order first.
-        if "hold" in loc and isinstance(loc["hold"], list):
-            base_hold = base.get("hold", [])
-            if not isinstance(base_hold, list):
-                base_hold = []
-            merged_hold = list(base_hold)
-            for entry in loc["hold"]:
-                if entry not in merged_hold:
-                    merged_hold.append(entry)
-            base["hold"] = merged_hold
-            logger.debug(f"Merged hold list, now {len(merged_hold)} entries")
+        # "hold" and "doctor_ignore" are flat lists, not dicts: local entries
+        # ADD to (rather than replace) the base list, deduplicated, preserving
+        # base order first.
+        for key in ("hold", "doctor_ignore"):
+            if key in loc and isinstance(loc[key], list):
+                base_list = base.get(key, [])
+                if not isinstance(base_list, list):
+                    base_list = []
+                merged = list(base_list)
+                for entry in loc[key]:
+                    if entry not in merged:
+                        merged.append(entry)
+                base[key] = merged
+                logger.debug(f"Merged {key} list, now {len(merged)} entries")
     return base
 
 
@@ -147,6 +149,15 @@ def validate(cfg: dict[str, Any]) -> None:
         for entry in cfg["hold"]:
             if not isinstance(entry, str) or not entry.strip():
                 raise ValueError(f"hold entries must be non-empty strings, got {entry!r}")
+
+    # Validate optional "doctor_ignore" list (tool names whose shadowed-
+    # duplicate findings are acknowledged as intentional, e.g. wrapper shims).
+    if "doctor_ignore" in cfg:
+        if not isinstance(cfg["doctor_ignore"], list):
+            raise ValueError("'doctor_ignore' must be an array of strings")
+        for entry in cfg["doctor_ignore"]:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(f"doctor_ignore entries must be non-empty strings, got {entry!r}")
 
     # Validate optional "repos" mapping (tool/origin name -> GitHub owner/repo,
     # used for the best-effort changelog digest).
@@ -2302,7 +2313,10 @@ def doctor_report(
         report["errors"].append(f"broken symlink check failed: {e}")
 
     try:
-        report["shadowed_duplicates"] = doctor_shadowed_duplicates(cache_path)
+        shadows = doctor_shadowed_duplicates(cache_path)
+        ignore = set(cfg.get("doctor_ignore", []) or [])
+        report["shadowed_duplicates"] = [s for s in shadows if s["name"] not in ignore]
+        report["ignored_shadows"] = sorted(s["name"] for s in shadows if s["name"] in ignore)
     except Exception as e:
         report["errors"].append(f"shadowed duplicate check failed: {e}")
 
@@ -2394,6 +2408,11 @@ def format_doctor_report(report: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"Known but not installed ({len(ni)}, informational — these are skipped):")
         lines.append("  " + ", ".join(ni))
+
+    ig = report.get("ignored_shadows", []) or []
+    if ig:
+        lines.append("")
+        lines.append(f"Ignored shadows ({len(ig)}, via doctor_ignore): " + ", ".join(ig))
 
     errs = report.get("errors", []) or []
     if errs:

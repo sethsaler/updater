@@ -35,6 +35,14 @@
         "minLength": 1
       }
     },
+    "doctor_ignore": {
+      "type": "array",
+      "description": "Tool names whose shadowed-duplicate doctor findings are acknowledged as intentional (e.g. wrapper shims that delegate to the managed copy). Listed informationally, excluded from findings and exit status.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "repos": {
       "type": "object",
       "description": "Tool/origin name -> GitHub 'owner/repo', used for the best-effort changelog digest.",

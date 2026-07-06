@@ -1431,6 +1431,58 @@ class TestDoctorConfigIssues(unittest.TestCase):
         self.assertEqual(doctor_not_installed(cfg), [])
 
 
+class TestDoctorIgnore(unittest.TestCase):
+    def _cache_with_real_shadow(self, dirpath, name):
+        dir_a = os.path.join(dirpath, "a")
+        dir_b = os.path.join(dirpath, "b")
+        os.makedirs(dir_a)
+        os.makedirs(dir_b)
+        for d in (dir_a, dir_b):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(d)
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": name, "origin": "npm", "dir": dir_a},
+                {"name": name, "origin": "path", "dir": dir_b},
+            ], f)
+        return cache_path
+
+    def test_ignored_shadow_moved_to_informational(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_path = self._cache_with_real_shadow(dirpath, "wrapped")
+        cfg = {"known": {}, "bulk": {}, "doctor_ignore": ["wrapped"]}
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = ""
+        try:
+            report = doctor_report(cache_path, cfg, history_path=os.path.join(dirpath, "h.jsonl"))
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertEqual(report["shadowed_duplicates"], [])
+        self.assertEqual(report["ignored_shadows"], ["wrapped"])
+        self.assertFalse(doctor_has_findings(report))
+
+    def test_doctor_ignore_merged_additively(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        base = os.path.join(dirpath, "base.json")
+        local = os.path.join(dirpath, "local.json")
+        with open(base, "w") as f:
+            json.dump({"known": {}, "bulk": {}, "doctor_ignore": ["a"]}, f)
+        with open(local, "w") as f:
+            json.dump({"doctor_ignore": ["b", "a"]}, f)
+        cfg = load_merge(base, local)
+        self.assertEqual(cfg["doctor_ignore"], ["a", "b"])
+        validate(cfg)
+
+    def test_doctor_ignore_validation(self):
+        with self.assertRaises(ValueError):
+            validate({"known": {}, "bulk": {}, "doctor_ignore": "notalist"})
+        with self.assertRaises(ValueError):
+            validate({"known": {}, "bulk": {}, "doctor_ignore": [""]})
+
+
 class TestDoctorReport(unittest.TestCase):
     def test_isolates_check_failures(self):
         import lib_update_all_clis as m
