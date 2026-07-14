@@ -143,6 +143,7 @@ _kill_tree() {
   kill "$parent" 2>/dev/null || true
 }
 
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via the EXIT/INT/TERM trap
 _cleanup() {
   # Stop background update subshells and any commands they spawned.
   local _pid
@@ -153,7 +154,9 @@ _cleanup() {
   pkill -P $$ 2>/dev/null || true
   # Remove the lock directory: releases the single-instance run.lockdir and
   # any per-origin job lockdirs (mkdir-based; see _run_with_mkdir_lock).
-  [[ -d "$LOCK_DIR" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+  if [[ -d "$LOCK_DIR" ]]; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+  fi
 }
 trap _cleanup EXIT INT TERM
 
@@ -1148,7 +1151,7 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
       python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
     fi
     # Update cache with new version information
-    cat "$_after_snap" | python3 "$LIB_SCRIPT" update-cache-versions "$CACHE_FILE" 2>/dev/null || true
+    python3 "$LIB_SCRIPT" update-cache-versions "$CACHE_FILE" < "$_after_snap" 2>/dev/null || true
 
     # Append this run's job results to history.jsonl (never on --dry-run).
     if (( ${#_UAC_RESULT_LINES[@]} > 0 )); then
