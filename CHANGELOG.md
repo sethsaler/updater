@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.1
+
+**Hang protection: one stuck update can no longer stall the run**
+- Per-job watchdog: every update command now runs under `UAC_JOB_TIMEOUT` (default 900s, `--job-timeout=N`, 0 disables). A job still running past the timeout has its whole process tree killed, is reported as timed out (with a hint that something — e.g. an open app blocking a cask upgrade — was probably holding it), and counts as failed while the rest of the run continues.
+- stdin is now `/dev/null` for every update command, so anything that tries to prompt (sudo, npm questions, installer "close the app" prompts) reads EOF immediately instead of waiting forever — including in sequential (`--parallel=1`) runs, which previously inherited the terminal's stdin.
+- Bounded lock waits: parallel jobs waiting on a same-package-manager `flock` now give up after the watchdog window (+60s slack; 1h when the watchdog is disabled) and proceed, matching the existing mkdir-fallback cap, instead of blocking indefinitely behind a wedged sibling.
+
+**Discovery: npm CLIs installed into `~/.local/bin` are now routed correctly**
+- When the npm global prefix is `~/.local`, npm globals (e.g. `pi`, `qwen`) land in `~/.local/bin` — the same directory scanned as origin `uv/pip` — and were previously misattributed to uv's bulk update. Symlink inference now also applies to uv-ish origins: a binary whose symlink resolves into `node_modules` is rerouted to the npm bulk update, so freshly installed npm CLIs are picked up by the discovery sweep and updated on the next run with no manual config.
+
 ## 0.7.0
 
 Four rounds of work on top of 0.6.0; the script's `--version` was bumped to `0.7.0` partway through (incremental discovery scan) but this is the first changelog entry covering all of it.

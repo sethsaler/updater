@@ -53,6 +53,98 @@ class TestLockGroup(unittest.TestCase):
     def test_fallback_to_name(self):
         self.assertEqual(lock_group_for("manual", "unknown command", "toolname"), "toolname")
 
+class TestInferOriginFromSymlink(unittest.TestCase):
+    """npm globals installed under an npm prefix of ~/.local land in
+    ~/.local/bin (scanned as origin uv/pip); their symlinks resolve into
+    node_modules, so they must be rerouted to the npm bulk update."""
+
+    def setUp(self):
+        import lib_update_all_clis as m
+        self.m = m
+        self.tmp = tempfile.mkdtemp()
+        self.bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin_dir)
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = self.bin_dir
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        import shutil as _sh
+        _sh.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_symlink_tool(self, name, target_rel):
+        target = os.path.join(self.tmp, target_rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(target, 0o755)
+        link = os.path.join(self.bin_dir, name)
+        os.symlink(target, link)
+        os.chmod(link, 0o755)
+        return link
+
+    def test_uv_pip_origin_node_modules_symlink_reroutes_to_npm(self):
+        self._make_symlink_tool("pi", "lib/node_modules/@scope/pi/dist/cli.js")
+        self.assertEqual(self.m._infer_origin_from_symlink("pi", "uv/pip"), "npm")
+
+    def test_uv_origin_non_node_modules_symlink_stays(self):
+        self._make_symlink_tool("realuv", "share/uv/tools/realuv/bin/realuv")
+        self.assertIsNone(self.m._infer_origin_from_symlink("realuv", "uv/pip"))
+
+    def test_uv_origin_regular_file_stays(self):
+        p = os.path.join(self.bin_dir, "plainbin")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(p, 0o755)
+        self.assertIsNone(self.m._infer_origin_from_symlink("plainbin", "uv"))
+
+    def test_path_origin_node_modules_symlink_reroutes_to_npm(self):
+        self._make_symlink_tool("qwen", "lib/node_modules/@qwen/qwen/cli.js")
+        self.assertEqual(self.m._infer_origin_from_symlink("qwen", "path"), "npm")
+
+    def test_known_pm_origin_untouched(self):
+        self.assertIsNone(self.m._infer_origin_from_symlink("anything", "brew"))
+
+
+class TestEmitReroutesNpmSymlinkFromUvDir(unittest.TestCase):
+    """End-to-end through collect_emit_lines: a cache entry with origin
+    uv/pip whose on-disk binary is a node_modules symlink emits the npm
+    bulk line (not just uv), so new npm CLIs like pi/qwen get updated."""
+
+    def setUp(self):
+        import lib_update_all_clis as m
+        self.m = m
+        self.tmp = tempfile.mkdtemp()
+        self.bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin_dir)
+        target = os.path.join(self.tmp, "lib/node_modules/@scope/pi/cli.js")
+        os.makedirs(os.path.dirname(target))
+        with open(target, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(target, 0o755)
+        link = os.path.join(self.bin_dir, "pi")
+        os.symlink(target, link)
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = self.bin_dir
+        self.cache_path = os.path.join(self.tmp, "cache.json")
+        with open(self.cache_path, "w") as f:
+            json.dump([{"name": "pi", "origin": "uv/pip", "dir": self.bin_dir}], f)
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        import shutil as _sh
+        _sh.rmtree(self.tmp, ignore_errors=True)
+
+    def test_bulk_npm_emitted_for_uv_pip_node_symlink(self):
+        cfg = {
+            "known": {},
+            "bulk": {"npm": "npm update -g", "uv/pip": "uv tool upgrade --all"},
+        }
+        lines = collect_emit_lines(self.cache_path, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "npm"), kinds)
+
+
 class TestLoadMerge(unittest.TestCase):
     def setUp(self):
         self.base_path = tempfile.mktemp(suffix=".json")

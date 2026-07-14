@@ -11,6 +11,9 @@
 #   --skip-origins=   Skip bulk (and known) for these origins
 #   --no-scan-path    Skip scanning directories on $PATH (origin: path)
 #   --parallel=N      Run up to N updates concurrently (default 8)
+#   --job-timeout=N   Kill any single update still running after N seconds
+#                     (default 900; 0 disables; also: UAC_JOB_TIMEOUT=N).
+#                     A killed job counts as failed; other updates continue.
 #   --json-summary    Print JSON ok/failed counts on stdout after run
 #   --list --json     Machine-readable tool list (with --list)
 #   --report-unknown  Show tools discovered with no update path
@@ -41,7 +44,7 @@
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.7.0"
+UAC_VERSION="0.7.1"
 
 set -uo pipefail
 
@@ -63,6 +66,12 @@ HISTORY_FILE="${UPDATE_ALL_CLIS_HISTORY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/
 # Quarantine: a job (known tool or bulk origin) that failed its last N
 # consecutive appearances in history.jsonl is skipped by default. 0 disables.
 UAC_QUARANTINE_AFTER="${UAC_QUARANTINE_AFTER:-3}"
+
+# Per-job watchdog: an update command still running after this many seconds
+# is killed (whole process tree) and counted as failed, so one wedged update
+# (e.g. a cask upgrade waiting on an open app) can't stall the rest of the
+# run. 0 disables. Override per-run with --job-timeout=N.
+UAC_JOB_TIMEOUT="${UAC_JOB_TIMEOUT:-900}"
 
 # Default 0: every run does a fresh discovery scan so new installs are
 # always picked up. Set CACHE_TTL_HOURS=N to reuse a recent cache instead.
@@ -184,6 +193,7 @@ while [[ $# -gt 0 ]]; do
     --history=*)       HISTORY_MODE=1; HISTORY_N="${1#*=}"; shift ;;
     --include-quarantined) INCLUDE_QUARANTINED=1; shift ;;
     --no-precheck)     NO_PRECHECK=1; shift ;;
+    --job-timeout=*)   UAC_JOB_TIMEOUT="${1#*=}"; shift ;;
     --hold=*)          HOLD_ADD="${1#*=}"; shift ;;
     --unhold=*)        HOLD_REMOVE="${1#*=}"; shift ;;
     --doctor)          DOCTOR_MODE=1; shift ;;
@@ -211,6 +221,10 @@ if ! [[ "$PARALLEL_JOBS" =~ ^[1-9][0-9]*$ ]] && ! [[ "$PARALLEL_JOBS" == "0" ]];
 fi
 if [[ "$PARALLEL_JOBS" == "0" ]]; then
   echo "--parallel must be at least 1" >&2
+  exit 1
+fi
+if ! [[ "$UAC_JOB_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --job-timeout / UAC_JOB_TIMEOUT value (use seconds, 0 disables): $UAC_JOB_TIMEOUT" >&2
   exit 1
 fi
 
@@ -485,7 +499,16 @@ ensure_cache() {
 }
 
 # -------------------------------------------------------------------
-# Run an update command (bash -c instead of eval)
+# Run an update command (bash -c instead of eval).
+#
+# Two hang protections, so one stuck update can never stall the run:
+#   1. stdin is /dev/null — an update that tries to prompt (sudo, npm
+#      questions, a cask installer asking to close a running app) reads
+#      EOF instead of waiting forever on input.
+#   2. A per-job watchdog: any update still running after UAC_JOB_TIMEOUT
+#      seconds (default 900) has its whole process tree killed and is
+#      counted as a failure; the rest of the run continues normally.
+#      Tune with UAC_JOB_TIMEOUT=N or --job-timeout=N (0 disables).
 # -------------------------------------------------------------------
 run_update() {
   local group="$1"
@@ -499,10 +522,32 @@ run_update() {
   [[ -z "$QUIET" ]] && log "  ${BOLD}→${NC} $cmd"
 
   local output ec=0
+  local _outfile
+  _outfile=$(mktemp)
   if [[ -n "$TRACE" ]] && [[ -z "${SUPPRESS_TRACE:-}" ]]; then
-    output=$(bash -x -c "$cmd" 2>&1) || ec=$?
+    bash -x -c "$cmd" </dev/null >"$_outfile" 2>&1 &
   else
-    output=$(bash -c "$cmd" 2>&1) || ec=$?
+    bash -c "$cmd" </dev/null >"$_outfile" 2>&1 &
+  fi
+  local _cmd_pid=$!
+  local _elapsed=0 _timed_out=""
+  while kill -0 "$_cmd_pid" 2>/dev/null; do
+    if (( UAC_JOB_TIMEOUT > 0 )) && (( _elapsed >= UAC_JOB_TIMEOUT )); then
+      _timed_out=1
+      _kill_tree "$_cmd_pid"
+      break
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+  wait "$_cmd_pid" 2>/dev/null || ec=$?
+  output=$(<"$_outfile")
+  rm -f "$_outfile"
+
+  if [[ -n "$_timed_out" ]]; then
+    warn "$group timed out after ${UAC_JOB_TIMEOUT}s and was killed — it was probably waiting on something (e.g. an open app blocking a cask upgrade, or a prompt). Other updates were not blocked."
+    [[ -z "$QUIET" ]] && echo "$output" | tail -3 | sed 's/^/   /'
+    return 1
   fi
 
   if [[ $ec -eq 0 ]]; then
@@ -625,7 +670,20 @@ _run_one_emit_line() {
   if (( PARALLEL_JOBS >= 2 )) && [[ "$cmd_type" != "skip" ]] && [[ -n "$lock_group" ]]; then
     mkdir -p "$LOCK_DIR"
     if command -v flock >/dev/null 2>&1; then
-      { flock -x 200; _run_one_emit_line_core "$cmd_type" "$name" "$cmd"; } 200>"$LOCK_DIR/${lock_group}.lock"
+      # Bounded wait: if a sibling job sharing this lock is wedged, don't
+      # block behind it forever. The bound tracks the per-job watchdog
+      # (which kills a wedged holder anyway) plus slack; when the watchdog
+      # is disabled, fall back to a 1-hour cap. On lock timeout, proceed
+      # without the lock — same behavior as the mkdir fallback's cap.
+      local _lock_wait
+      if (( UAC_JOB_TIMEOUT > 0 )); then
+        _lock_wait=$((UAC_JOB_TIMEOUT + 60))
+      else
+        _lock_wait=3600
+      fi
+      { flock -x -w "$_lock_wait" 200 || warn "lock '$lock_group' busy after ${_lock_wait}s; running $name without it"
+        _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
+      } 200>"$LOCK_DIR/${lock_group}.lock"
     else
       _run_with_mkdir_lock "$lock_group" "$cmd_type" "$name" "$cmd"
       return $?

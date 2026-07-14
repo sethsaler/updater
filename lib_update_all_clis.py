@@ -265,7 +265,23 @@ def lock_group_for(origin: str, cmd: str, name: str) -> str:
 
 
 def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
-    """If the binary is a symlink into a known package-manager tree, return that origin."""
+    """If the binary is a symlink into a known package-manager tree, return that origin.
+
+    Also handles uv-ish origins: when the npm global prefix is ~/.local, npm
+    globals land in ~/.local/bin — the same directory scanned as "uv/pip" —
+    so a freshly installed npm CLI (e.g. `pi`, `qwen`) would otherwise be
+    misattributed to uv and ride the wrong bulk update. A real uv tool's
+    symlink resolves into ~/.local/share/uv/tools (never node_modules), so
+    rerouting only on a node_modules target is safe.
+    """
+    if origin in _UV_ORIGINS:
+        path = shutil.which(name)
+        if not path or not os.path.islink(path):
+            return None
+        target = os.path.realpath(path)
+        if "node_modules" in target:
+            return "npm"
+        return None
     if origin not in ("manual", "path", "?"):
         return None
     path = shutil.which(name)

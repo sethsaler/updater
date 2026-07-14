@@ -138,6 +138,7 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --trace         # bash -x when running each update command
 ./update_all_clis.sh --no-scan-path  # skip scanning directories on $PATH
 ./update_all_clis.sh --parallel=8    # run up to 8 updates at once (default 8)
+./update_all_clis.sh --job-timeout=900  # kill any single update stuck longer than N seconds (default 900; 0 disables)
 ./update_all_clis.sh --notify       # show the non-blocking desktop summary dialog
 ./update_all_clis.sh --only-origins=brew,npm
 ./update_all_clis.sh --skip-origins=gem
@@ -389,11 +390,11 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 
 1. **Discovery scan** — walks 20+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`.
 2. **Version caching** — after each update run, tool versions are cached to speed up future runs. The cache preserves version information across rescans to avoid redundant version probing.
-3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update.
+3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update. This includes binaries scanned under uv-ish origins (`uv`, `uv/pip`, `uv/venv`): when the npm global prefix is `~/.local`, npm CLIs land in `~/.local/bin` alongside uv tools, and a `node_modules` symlink target reroutes them to the npm bulk update so they're never misattributed to uv.
 4. **Cache** — by default every run performs a fresh discovery scan (**`CACHE_TTL_HOURS=0`**) so newly installed tools are always found. Set `CACHE_TTL_HOURS=N` to reuse a cache newer than N hours. A normal run performs **at most one** full scan.
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
-7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs).
+7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs). Every update command runs with **stdin redirected to `/dev/null`** (a command that tries to prompt reads EOF instead of waiting forever) and under a **per-job watchdog** (`--job-timeout=N` / `UAC_JOB_TIMEOUT`, default 900s, 0 disables): a job still running past the timeout has its whole process tree killed and is counted as failed — e.g. a `brew upgrade` cask waiting on an open app can't stall the rest of the run. Jobs waiting on a same-manager lock are bounded too (watchdog + 60s slack), so a wedged sibling never blocks the queue indefinitely.
 8. **Concurrency safety** — a **single-instance lock** (`mkdir`-based, with stale-lock detection) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. Parallel updates of the same package manager are serialized the same way — no `flock` binary or helper process needed on macOS, and no busy-waiting (a lock older than the stale cap is assumed abandoned and reclaimed rather than waited on forever). `--dry-run` skips locking entirely since it never mutates anything. **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`, and its `EXIT`/`INT`/`TERM` trap removes the whole lock directory so a crash never leaves a stale lock behind for long.
 
 ## Adding a new tool
