@@ -1144,11 +1144,28 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     # "" = no cache reuse; "$_before_snap" = mtime gate, reuse pre-run
     # version for any tool whose binary mtime hasn't changed since then.
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "" "$_before_snap" > "$_after_snap" 2>/dev/null || true
+    # Terminal version-change list (before → after). Same text as the
+    # desktop/email summary so every run surfaces what actually moved.
+    local _summary_out=""
+    _summary_out=$(python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" 2>/dev/null || true)
+    if [[ -n "$_summary_out" ]] && [[ -z "$QUIET" ]]; then
+      log ""
+      log "${BOLD}=== Packages updated ===${NC}"
+      # Skip the leading "update-all-clis" / "Steps: …" header — those are
+      # already covered by the run's own Done summary below.
+      printf '%s\n' "$_summary_out" | awk 'BEGIN{skip=1} /^Upgraded /{skip=0} !skip{print}' | while IFS= read -r _sline || [[ -n "$_sline" ]]; do
+        log "$_sline"
+      done
+    fi
     if _want_notify_popup; then
       python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" 2>/dev/null || true
     fi
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
-      python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+      if [[ -n "$_summary_out" ]]; then
+        printf '%s' "$_summary_out" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}"
+      else
+        python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+      fi
     fi
     # Update cache with new version information
     python3 "$LIB_SCRIPT" update-cache-versions "$CACHE_FILE" < "$_after_snap" 2>/dev/null || true
