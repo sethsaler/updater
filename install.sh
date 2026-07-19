@@ -23,6 +23,7 @@ install_script() {
   cp "$SCRIPT_DIR/update_all_clis.sh" "$INSTALL_DIR/"
   cp "$SCRIPT_DIR/tool_config.json" "$INSTALL_DIR/"
   cp "$SCRIPT_DIR/lib_update_all_clis.py" "$INSTALL_DIR/"
+  cp "$SCRIPT_DIR/tui_update_all_clis.py" "$INSTALL_DIR/"
   chmod +x "$INSTALL_DIR/update_all_clis.sh"
   if [[ -d "$SCRIPT_DIR/scripts" ]]; then
     mkdir -p "$INSTALL_DIR/scripts"

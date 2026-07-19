@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.0
+
+**Broader discovery: 9 new scan origins + `qwen` known tool**
+- New scan directories: macOS Python user installs (`~/Library/Python/3.x/bin`, origin `pip`), Volta (`~/.volta/bin`), asdf (`~/.asdf/shims`), proto (`~/.proto/bin`), Rye (`~/.rye/shims`, `~/.local/share/rye/shims`), Foundry (`~/.foundry/bin`), aqua (`~/.aqua/bin`, `~/.local/share/aquaproj-aqua/bin`), and Mason/Neovim LSP (`~/.local/share/nvim/mason/bin`). Each is a silent no-op when the directory doesn't exist.
+- New bulk origins with update commands: `pip` (upgrades pip/setuptools/wheel), `asdf` (`asdf update`), `proto` (`proto update`), `volta` (`volta update`), `rye` (`rye self update`), `foundry` (`foundryup`), `aqua` (`aqua update`). `mason` is discovery-only (no bulk update command).
+- `qwen` added to the `known` list with `qwen update` (self-update, same pattern as claude/grok/kimi).
+- PATH exclusion list updated so the new directories aren't double-counted by the `$PATH` scan.
+- `probe_bulk`, `_BULK_ORIGIN_BINARY`, and `_TRACKABLE_ORIGINS` in `lib_update_all_clis.py` extended for all new origins.
+- 12 new unit tests: bulk emit for each new origin, mason empty-cmd skip, lock-group mapping, qwen known emit, and qwen-doesn't-suppress-npm-bulk regression.
+
+## 0.8.0
+
+**Live TUI dashboard for the update run**
+- On interactive terminals the update phase now renders a live dashboard: per-job rows with a braille spinner, status, elapsed time, and rolling last output line; a progress bar with ok/failed tallies; queued/finished jobs windowed to fit the screen. After the run closes, the usual summary sections print below it, so scrollback keeps the full record.
+- Implemented as a new stdlib-only Python executor (`tui_update_all_clis.py`, installed next to the other files) that runs the identical plan with identical semantics — parallel cap, per-origin lock-group serialization (in-process, replacing the per-run mkdir/flock dance for TUI runs), per-job watchdog timeout with process-group kills, `/dev/null` stdin, exit-code conventions — and writes result records in the byte-exact format the bash executor's `*.result` files use. Everything before and after the update phase (discovery, prechecks, snapshots, run summary, history, notify, changelog) is untouched.
+- **On by default** when stdout is a TTY; `--tui` forces on, `--no-tui` / `UAC_TUI=0` disables. Automatically off (previous plain output) for non-terminals (LaunchAgent/CI/pipes), `--dry-run`, `--quiet`, `--trace`, `NO_COLOR`, `TERM=dumb`, tiny terminals, or when the TUI file is missing — those paths run byte-identical to 0.7.1.
+- `Ctrl+C` aborts gracefully from the dashboard: running jobs' process trees are killed, in-flight jobs are recorded as failed, the terminal is restored, and the post-run summary still prints.
+- Failure exit-code fidelity: the runner keeps each command's real exit code for display (`failed (exit 3)`) while normalizing records to the shell's 0/1/3 convention, so a real `exit 3` can no longer alias the "skipped" sentinel in ok/fail counters.
+- 33 new unit tests cover emit-line parsing, the executor (lock serialization, parallel cap, watchdog tree-kill, instant kinds, result format), and the frame renderer (width/height fitting, windowing).
+
 ## 0.7.1
 
 **Hang protection: one stuck update can no longer stall the run**

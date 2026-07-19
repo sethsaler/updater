@@ -41,10 +41,16 @@
 #                     and re-exec once if it updated (also: UPDATE_ALL_CLIS_SELF_UPDATE=1)
 #                     Off by default; any failure (dirty tree, no network, diverged,
 #                     not a git checkout) warns and continues — never fails the run.
+#   --tui             Force the live TUI dashboard on for the update run
+#   --no-tui          Force the live TUI dashboard off (plain log output)
+#                     (default: on when stdout is an interactive terminal and
+#                     tui_update_all_clis.py is present; also: UAC_TUI=1|0.
+#                     Always off for --dry-run/--quiet/--trace/--list/JSON modes
+#                     and non-terminals: LaunchAgent/CI runs are unaffected.)
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.7.1"
+UAC_VERSION="0.9.0"
 
 set -uo pipefail
 
@@ -54,6 +60,7 @@ _UAC_ORIG_ARGS=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_SCRIPT="${LIB_SCRIPT:-$SCRIPT_DIR/lib_update_all_clis.py}"
+TUI_SCRIPT="${TUI_SCRIPT:-$SCRIPT_DIR/tui_update_all_clis.py}"
 CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/tool_config.json}"
 CONFIG_LOCAL_FILE="${CONFIG_LOCAL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/config.local.json}"
 
@@ -100,6 +107,9 @@ HOLD_ADD=""; HOLD_REMOVE=""; DOCTOR_MODE=""
 HOLD="${HOLD:-}"
 CHANGELOG="${UPDATE_ALL_CLIS_CHANGELOG:-}"
 SELF_UPDATE="${UPDATE_ALL_CLIS_SELF_UPDATE:-}"
+# Live TUI dashboard for the update run: "auto" (on for interactive
+# terminals), "1" (forced), "0" (disabled). See _tui_wanted.
+TUI_MODE="${UAC_TUI:-auto}"
 
 # Background-job bookkeeping for the cleanup trap (parallel updates + locks).
 _UAC_PIDS=()
@@ -202,6 +212,8 @@ while [[ $# -gt 0 ]]; do
     --doctor)          DOCTOR_MODE=1; shift ;;
     --changelog)       CHANGELOG=1; shift ;;
     --self-update)     SELF_UPDATE=1; shift ;;
+    --tui)             TUI_MODE="1"; shift ;;
+    --no-tui)          TUI_MODE="0"; shift ;;
     --version|-V)      echo "update-all-clis $UAC_VERSION"; exit 0 ;;
     --help|-h)         grep "^# " "$0" | sed 's/^# //'; exit 0 ;;
     *)
@@ -408,6 +420,25 @@ full_scan() {
   _scan_row "$HOME/.wasmtime/bin" "manual" "dir"
   _scan_row "$HOME/.wasmer/bin" "manual" "dir"
 
+  # macOS: pip install --user lands binaries in ~/Library/Python/3.x/bin
+  if [[ "$(uname)" == "Darwin" ]]; then
+    local _pyuser_bin
+    for _pyuser_bin in "$HOME"/Library/Python/3.*/bin; do
+      [[ -d "$_pyuser_bin" ]] && _scan_row "$_pyuser_bin" "pip" "dir"
+    done
+  fi
+
+  # Version managers and tool directories not covered above
+  _scan_row "$HOME/.volta/bin" "volta" "dir"
+  _scan_row "$HOME/.asdf/shims" "asdf" "dir"
+  _scan_row "$HOME/.proto/bin" "proto" "dir"
+  _scan_row "$HOME/.rye/shims" "rye" "dir"
+  _scan_row "$HOME/.local/share/rye/shims" "rye" "dir"
+  _scan_row "$HOME/.foundry/bin" "foundry" "dir"
+  _scan_row "$HOME/.aqua/bin" "aqua" "dir"
+  _scan_row "$HOME/.local/share/aquaproj-aqua/bin" "aqua" "dir"
+  _scan_row "$HOME/.local/share/nvim/mason/bin" "mason" "dir"
+
   [[ -d "$HOME/.fnm" ]] && TOOLS_ARRAY+=("fnm|fnm")
 
   # rustup/gcloud/mas/tlmgr are single system-wide CLIs, not directories of
@@ -426,7 +457,8 @@ full_scan() {
       [[ -n "$pdir" ]] || continue
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
-        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin") continue ;;
+        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin"|"$HOME/.volta/bin"|"$HOME/.asdf/shims"|"$HOME/.proto/bin"|"$HOME/.rye/shims"|"$HOME/.local/share/rye/shims"|"$HOME/.foundry/bin"|"$HOME/.aqua/bin"|"$HOME/.local/share/aquaproj-aqua/bin"|"$HOME/.local/share/nvim/mason/bin"|"$HOME/.dotnet/tools"|"$HOME/.krew/bin"|"$HOME/.local/share/mise/shims"|"$HOME/.wasmtime/bin"|"$HOME/.wasmer/bin") continue ;;
+        "$HOME"/Library/Python/3.*/bin) continue ;;
       esac
       [[ -n "${go_bin_dir:-}" ]] && [[ "$pdir" == "$go_bin_dir" ]] && continue
       [[ -n "${GOBIN:-}" ]] && [[ "$pdir" == "$GOBIN" ]] && continue
@@ -806,6 +838,62 @@ run_updates_parallel() {
 }
 
 # -------------------------------------------------------------------
+# Live TUI executor (Feature: live dashboard).
+#
+# When active, the update phase is delegated to tui_update_all_clis.py,
+# which runs the exact same plan with the same semantics (parallel cap,
+# per-origin lock serialization, per-job watchdog, exit-code conventions)
+# and writes result records in the same format run_updates_parallel's
+# *.result files use. Everything before (discovery, prechecks, planning)
+# and after (snapshots, run summary, history, notify, changelog) is
+# unchanged.
+# -------------------------------------------------------------------
+_tui_wanted() {
+  [[ "$TUI_MODE" == "0" ]] && return 1
+  # These modes own stdout in ways a full-screen dashboard would break.
+  [[ -n "$DRY_RUN" || -n "$QUIET" || -n "$TRACE" ]] && return 1
+  [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" ]] && return 1
+  [[ -f "$TUI_SCRIPT" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  if [[ "$TUI_MODE" == "1" ]]; then return 0; fi
+  [[ "$TUI_MODE" == "auto" && -t 1 ]]
+}
+
+run_updates_tui() {
+  local _emit_file _results_file _rc=0
+  _emit_file=$(mktemp)
+  _results_file=$(mktemp)
+  printf '%s\n' "$@" > "$_emit_file"
+  python3 "$TUI_SCRIPT" \
+    --emit-file "$_emit_file" \
+    --results-file "$_results_file" \
+    --parallel "$PARALLEL_JOBS" \
+    --timeout "$UAC_JOB_TIMEOUT" \
+    --skip "$SKIP" \
+    --version-string "$UAC_VERSION" || _rc=$?
+  # 130 = interrupted (Ctrl+C): the runner already reported it; don't warn.
+  if (( _rc != 0 && _rc != 130 )); then
+    warn "TUI runner exited with status $_rc — results may be incomplete"
+  fi
+  # Ingest results exactly like run_updates_parallel ingests *.result files:
+  # each line is "<ec>\x1e<record>" (record empty for skip/quarantined).
+  local _rline _ec _rec
+  while IFS= read -r _rline || [[ -n "$_rline" ]]; do
+    [[ -z "$_rline" ]] && continue
+    _ec="${_rline%%"${_UAC_SEP}"*}"
+    _rec="${_rline#*"${_UAC_SEP}"}"
+    [[ "$_ec" =~ ^[0-9]+$ ]] || continue
+    case "$_ec" in
+      0) ((UPDATE_OK++)) || true ;;
+      3) ;;
+      *) ((UPDATE_FAIL++)) || true ;;
+    esac
+    [[ -n "$_rec" ]] && _UAC_RESULT_LINES+=("$_rec")
+  done < "$_results_file"
+  rm -f "$_emit_file" "$_results_file"
+}
+
+# -------------------------------------------------------------------
 # Self-update: `git pull --ff-only` this script's own checkout, then
 # re-exec once so the run that follows uses the freshly-pulled code.
 # Off by default (--self-update / UPDATE_ALL_CLIS_SELF_UPDATE=1). Every
@@ -1134,7 +1222,9 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "$CACHE_FILE" > "$_before_snap" 2>/dev/null || true
   fi
 
-  if (( PARALLEL_JOBS < 2 )); then
+  if _tui_wanted; then
+    run_updates_tui "${lines[@]:-}"
+  elif (( PARALLEL_JOBS < 2 )); then
     run_updates_sequential "${lines[@]:-}"
   else
     run_updates_parallel "$PARALLEL_JOBS" "${lines[@]:-}"

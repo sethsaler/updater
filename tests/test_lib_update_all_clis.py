@@ -1821,5 +1821,119 @@ class TestLoadMergeHold(unittest.TestCase):
         self.assertEqual(cfg["repos"], {"fzf": "junegunn/fzf", "gh": "cli/cli"})
 
 
+class TestNewOrigins(unittest.TestCase):
+    """Tests for newly added origins (pip, asdf, proto, volta, rye, foundry, aqua, mason)."""
+
+    def _cache_with_tool(self, name, origin):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        cache_path = os.path.join(tmp, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": name, "origin": origin, "dir": "/fake"}], f)
+        return cache_path
+
+    def test_asdf_origin_emits_bulk(self):
+        cache = self._cache_with_tool("node", "asdf")
+        cfg = {"known": {}, "bulk": {"asdf": "asdf update 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "asdf"), kinds)
+
+    def test_proto_origin_emits_bulk(self):
+        cache = self._cache_with_tool("node", "proto")
+        cfg = {"known": {}, "bulk": {"proto": "proto update 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "proto"), kinds)
+
+    def test_volta_origin_emits_bulk(self):
+        cache = self._cache_with_tool("node", "volta")
+        cfg = {"known": {}, "bulk": {"volta": "volta update 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "volta"), kinds)
+
+    def test_pip_origin_emits_bulk(self):
+        cache = self._cache_with_tool("some-tool", "pip")
+        cfg = {"known": {}, "bulk": {"pip": "pip3 install --upgrade pip 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "pip"), kinds)
+
+    def test_rye_origin_emits_bulk(self):
+        cache = self._cache_with_tool("python", "rye")
+        cfg = {"known": {}, "bulk": {"rye": "rye self update 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "rye"), kinds)
+
+    def test_foundry_origin_emits_bulk(self):
+        cache = self._cache_with_tool("forge", "foundry")
+        cfg = {"known": {}, "bulk": {"foundry": "foundryup 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "foundry"), kinds)
+
+    def test_aqua_origin_emits_bulk(self):
+        cache = self._cache_with_tool("aqua-tool", "aqua")
+        cfg = {"known": {}, "bulk": {"aqua": "aqua update 2>/dev/null || true"}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("bulk", "aqua"), kinds)
+
+    def test_mason_origin_empty_cmd_skips(self):
+        cache = self._cache_with_tool("lua-language-server", "mason")
+        cfg = {"known": {}, "bulk": {"mason": ""}}
+        lines = collect_emit_lines(cache, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("skip", "lua-language-server"), kinds)
+
+    def test_new_origins_lock_groups(self):
+        self.assertEqual(lock_group_for("asdf", "", "x"), "asdf")
+        self.assertEqual(lock_group_for("proto", "", "x"), "proto")
+        self.assertEqual(lock_group_for("volta", "", "x"), "volta")
+        self.assertEqual(lock_group_for("pip", "", "x"), "pip")
+        self.assertEqual(lock_group_for("rye", "", "x"), "rye")
+        self.assertEqual(lock_group_for("foundry", "", "x"), "foundry")
+        self.assertEqual(lock_group_for("aqua", "", "x"), "aqua")
+        self.assertEqual(lock_group_for("mason", "", "x"), "mason")
+
+
+class TestQwenKnown(unittest.TestCase):
+    """qwen is in the known list with a self-update command."""
+
+    def test_qwen_known_emits_known_line(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        cache_path = os.path.join(tmp, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": "qwen", "origin": "npm", "dir": "/fake"}], f)
+        cfg = {
+            "known": {"qwen": "qwen update 2>/dev/null || true"},
+            "bulk": {"npm": "npm update -g"},
+        }
+        lines = collect_emit_lines(cache_path, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("known", "qwen"), kinds)
+
+    def test_qwen_known_does_not_suppress_npm_bulk(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        cache_path = os.path.join(tmp, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "qwen", "origin": "npm", "dir": "/fake"},
+                {"name": "other-npm-tool", "origin": "npm", "dir": "/fake"},
+            ], f)
+        cfg = {
+            "known": {"qwen": "qwen update 2>/dev/null || true"},
+            "bulk": {"npm": "npm update -g"},
+        }
+        lines = collect_emit_lines(cache_path, cfg, None, None)
+        kinds = [(l.split(EMIT_SEP)[0], l.split(EMIT_SEP)[1]) for l in lines]
+        self.assertIn(("known", "qwen"), kinds)
+        self.assertIn(("bulk", "npm"), kinds)
+
+
 if __name__ == "__main__":
     unittest.main()

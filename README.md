@@ -2,9 +2,9 @@
 
 > One script to discover and update every CLI and package manager on your system.
 
-`update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, npm global bins (including `~/.npm-global/bin`, `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, pipx venvs, `~/bin`, Wasmtime/Wasmer runtimes, and **all user-writable directories on `$PATH`** — plus single-CLI managers detected by presence alone (rustup, gcloud, mas, tlmgr) — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
+`update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, npm global bins (including `~/.npm-global/bin`, `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, pipx venvs, `~/bin`, Wasmtime/Wasmer runtimes, macOS Python user installs (`~/Library/Python/3.x/bin`), Volta, asdf, proto, Rye, Foundry, aqua, Mason (Neovim LSP), and **all user-writable directories on `$PATH`** — plus single-CLI managers detected by presence alone (rustup, gcloud, mas, tlmgr) — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
 
-Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), and [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning).
+Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning), and [`tui_update_all_clis.py`](tui_update_all_clis.py) (the live dashboard executor — see "Live TUI dashboard" below).
 
 ## Supported update mechanisms
 
@@ -33,6 +33,14 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | gcloud (Google Cloud SDK) | `gcloud components update --quiet` |
 | mas (Mac App Store CLI) | `mas upgrade` |
 | tlmgr (TeX Live) | `tlmgr update --self --all` |
+| pip (macOS user installs) | `pip3 install --upgrade pip setuptools wheel` |
+| asdf (version manager) | `asdf update` |
+| proto (version manager) | `proto update` |
+| Volta (Node) | `volta update` |
+| Rye (Python) | `rye self update` |
+| Foundry (Ethereum) | `foundryup` |
+| aqua (CLI installer) | `aqua update` |
+| Mason (Neovim LSP) | _(discovery only; no bulk update)_ |
 
 ### Known tools (individual commands)
 
@@ -78,6 +86,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | OpenClaw | `npm update -g openclaw` |
 | OpenCode | `opencode upgrade` |
 | Printing Press | `go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest` |
+| Qwen Code | `qwen update` |
 | Readwise | `npm update -g @readwise/cli` |
 | Recipe Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/food-and-dining/recipe-goat/cmd/recipe-goat-pp-cli@latest` |
 | ripgrep (rg) | `brew upgrade ripgrep` |
@@ -119,6 +128,7 @@ Or run directly (download all three files into the same directory):
 curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/update_all_clis.sh -o update_all_clis.sh
 curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/tool_config.json -o tool_config.json
 curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/lib_update_all_clis.py -o lib_update_all_clis.py
+curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/tui_update_all_clis.py -o tui_update_all_clis.py
 chmod +x update_all_clis.sh
 ```
 
@@ -159,7 +169,17 @@ HOLD=claude ./update_all_clis.sh            # one-run ad hoc hold (not persisted
 SKIP=hermes,uv ./update_all_clis.sh
 ./update_all_clis.sh --skip=hermes,uv
 QUIET=1 ./update_all_clis.sh
+./update_all_clis.sh --no-tui      # plain log output even on an interactive terminal
+./update_all_clis.sh --tui         # force the live dashboard on
 ```
+
+### Live TUI dashboard
+
+On an interactive terminal, the update run renders a live dashboard instead of interleaved log lines: one row per job with a spinner, per-job elapsed time, and its latest output line, plus a progress bar with ok/failed tallies. `Ctrl+C` aborts cleanly — running updates (whole process trees) are killed and the terminal is restored.
+
+- **On by default** when stdout is a TTY. Force with `--tui`, disable with `--no-tui` or `UAC_TUI=0`.
+- **Automatically off** (plain log output, exactly as before) for non-terminals (LaunchAgent, systemd, CI, pipes), `--dry-run`, `--quiet`, `--trace`, `--list`/JSON modes, `NO_COLOR`, `TERM=dumb`, very small terminals, and when `tui_update_all_clis.py` isn't installed next to the script.
+- The dashboard is a stdlib-only Python executor (`tui_update_all_clis.py`) that runs the same plan with the same semantics — parallel cap, per-origin lock serialization, per-job watchdog timeout, process-tree kills — and reports results back in the format the shell's own executors produce, so run history, summaries, notify dialogs, and changelog digests are unaffected. No third-party dependencies.
 
 ### Performance
 

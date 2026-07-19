@@ -821,6 +821,13 @@ def probe_bulk(origin: str) -> str:
         "mise": ("mise", "--version"),
         "pipx": ("pipx", "--version"),
         "grok": ("grok", "--version"),
+        "asdf": ("asdf", "--version"),
+        "proto": ("proto", "--version"),
+        "volta": ("volta", "--version"),
+        "rye": ("rye", "--version"),
+        "foundry": ("forge", "--version"),
+        "aqua": ("aqua", "--version"),
+        "mason": (),
         "path": (),
     }
     if origin == "path":
@@ -885,7 +892,8 @@ _BULK_ORIGIN_BINARY = {
     "uv": "uv", "uv/pip": "uv", "uv/venv": "uv", "fnm": "fnm", "bun": "bun",
     "deno": "deno", "pyenv": "pyenv", "rbenv": "rbenv", "conda": "conda",
     "opencode": "opencode", "dotnet": "dotnet", "mise": "mise", "pipx": "pipx",
-    "grok": "grok",
+    "grok": "grok", "asdf": "asdf", "proto": "proto", "volta": "volta",
+    "rye": "rye", "foundry": "forge", "aqua": "aqua",
 }
 
 
@@ -1061,6 +1069,7 @@ _TRACKABLE_ORIGINS = frozenset({
     "npm", "cargo", "go", "gem", "pipx", "manual", "path",
     "uv", "uv/pip", "uv/venv", "fnm", "bun", "deno",
     "mise", "opencode", "grok", "conda", "dotnet", "krew",
+    "pip", "asdf", "proto", "volta", "rye", "foundry", "aqua", "mason",
 })
 
 

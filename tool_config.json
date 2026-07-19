@@ -93,6 +93,7 @@
     "pnx": "npm update -g pnx 2>/dev/null || true",
     "printing-press": "go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest 2>/dev/null || true",
     "python3.11": "uv tool upgrade python3.11 2>/dev/null || true",
+    "qwen": "qwen update 2>/dev/null || true",
     "readwise": "npm update -g @readwise/cli 2>/dev/null || true",
     "readwise-mcp": "npm update -g readwise-mcp 2>/dev/null || true",
     "recipe-goat-pp-cli": "go install github.com/mvanhorn/printing-press-library/library/food-and-dining/recipe-goat/cmd/recipe-goat-pp-cli@latest 2>/dev/null || true",
@@ -137,6 +138,14 @@
     "gcloud": "gcloud components update --quiet 2>/dev/null || true",
     "mas": "mas upgrade 2>/dev/null || true",
     "tlmgr": "tlmgr update --self --all 2>/dev/null || true",
+    "pip": "pip3 install --upgrade pip setuptools wheel 2>/dev/null || true",
+    "asdf": "asdf update 2>/dev/null || true",
+    "proto": "proto update 2>/dev/null || true",
+    "volta": "volta update 2>/dev/null || true",
+    "rye": "rye self update 2>/dev/null || true",
+    "foundry": "foundryup 2>/dev/null || true",
+    "aqua": "aqua update 2>/dev/null || true",
+    "mason": "",
     "path": ""
   },
   "check": {
