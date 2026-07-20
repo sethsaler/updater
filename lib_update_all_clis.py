@@ -1722,6 +1722,27 @@ def _scan_dir_entries(dir_path: str) -> list[str]:
     return names
 
 
+def _count_dir_entries(dir_path: str) -> int:
+    """Count visible, non-excluded directory entries without stat() calls.
+
+    Mirrors the name filters in `_scan_dir_entries` so a change in the
+    number of candidate entries reliably indicates the directory contents
+    changed even when the directory's mtime has not advanced (e.g. several
+    installs completed within the same filesystem timestamp tick).
+    """
+    try:
+        with os.scandir(dir_path) as it:
+            return sum(
+                1
+                for entry in it
+                if not entry.name.startswith(".")
+                and entry.name not in _SCAN_EXCLUDE_NAMES
+                and not entry.name.startswith("git-")
+            )
+    except OSError:
+        return 0
+
+
 def _sdkman_candidate_binaries(dir_path: str) -> list[str]:
     """Names of executables in `$dir/*/current/bin/*` (sdkman's layout)."""
     names: list[str] = []
@@ -1746,6 +1767,45 @@ def _tree_scan_entries(dir_path: str) -> list[str]:
     return names
 
 
+def _coerce_dir_stats(value: Any, mode: str) -> Optional[dict[str, Any]]:
+    """Convert legacy dir_mtimes values or dicts into a stats dict."""
+    if isinstance(value, dict):
+        stats = dict(value)
+        if "mtime" not in stats:
+            return None
+        return stats
+    try:
+        return {"mtime": float(value), "size": 0, "nlink": 0}
+    except (TypeError, ValueError):
+        return None
+
+
+def _dir_stats(dir_path: str, mode: str) -> Optional[dict[str, Any]]:
+    """Filesystem stats used to decide whether a directory needs re-listing."""
+    try:
+        st = os.stat(dir_path)
+    except OSError:
+        return None
+    stats: dict[str, Any] = {"mtime": st.st_mtime, "size": st.st_size, "nlink": st.st_nlink}
+    if mode == "dir":
+        stats["count"] = _count_dir_entries(dir_path)
+    return stats
+
+
+def _stats_unchanged(cur: dict[str, Any], old: dict[str, Any], mode: str) -> bool:
+    """Return True if every tracked stat (including entry count for dir mode) matches."""
+    for key in ("mtime", "size", "nlink"):
+        if cur.get(key) != old.get(key):
+            return False
+    if mode == "dir":
+        old_count = old.get("count")
+        if old_count is None:
+            return False
+        if cur.get("count") != old_count:
+            return False
+    return True
+
+
 def incremental_scan_merge(
     rows: list[tuple[str, str, str, bool]],
     cache_path: str,
@@ -1762,19 +1822,19 @@ def incremental_scan_merge(
     shell — a row with exists=False prunes any cached tools tagged to that
     directory (their source disappeared).
 
-    A directory whose mtime matches what's stored in the cache's
-    "dir_mtimes" record reuses the tools cached under that directory
-    instead of re-listing it. `force=True` (--rescan) ignores stored
-    mtimes and re-walks everything, refreshing all stored mtimes.
+    A directory is skipped (its cached tools reused) only when every tracked
+    stat is unchanged: mtime, size, and link count. For flat "dir"
+    directories we also track a candidate-entry count; this catches new
+    installs that complete within the same filesystem timestamp tick, where
+    the directory mtime may not advance. `force=True` (--rescan) ignores
+    stored stats and re-walks everything, refreshing all stored stats.
 
-    Top-level directory mtime is sufficient for "dir" (adding/removing a
-    file changes the parent dir's mtime on APFS/most filesystems) but NOT
-    for deep changes inside a "tree"/"sdkman" node's subdirectories (e.g. a
-    Homebrew Cellar upgrade that doesn't add/remove a top-level symlink).
-    For those, only *new/removed* top-level entries are guaranteed to be
-    noticed; that's judged acceptable since existing binary *names* don't
-    change on an in-place upgrade, and `--rescan` remains available to force
-    a full walk.
+    Top-level directory stats are sufficient for "dir" and "tree"/"sdkman"
+    additions/removals, but an in-place upgrade that doesn't add/remove a
+    top-level entry (formula symlink, install dir) won't retrigger a walk.
+    That's judged acceptable since existing binary *names* don't change on
+    an in-place upgrade, and `--rescan` remains available to force a full
+    walk.
     """
     existing: list[Any] = []
     if os.path.isfile(cache_path):
@@ -1785,8 +1845,13 @@ def incremental_scan_merge(
             existing = []
 
     cached_tools = [t for t in existing if isinstance(t, dict) and "name" in t]
-    mtimes_rec = next((t for t in existing if isinstance(t, dict) and "dir_mtimes" in t), None)
-    old_mtimes: dict[str, float] = mtimes_rec.get("dir_mtimes", {}) if mtimes_rec else {}
+    stats_rec = next(
+        (t for t in existing if isinstance(t, dict) and ("dir_mtimes" in t or "dir_stats" in t)),
+        None,
+    )
+    old_stats: dict[str, Any] = {}
+    if stats_rec is not None:
+        old_stats = stats_rec.get("dir_stats", stats_rec.get("dir_mtimes", {}))
     existing_versions = {t["name"]: t["version"] for t in cached_tools if "version" in t}
 
     cached_by_dir: dict[str, list[dict[str, Any]]] = {}
@@ -1796,13 +1861,13 @@ def incremental_scan_merge(
             cached_by_dir.setdefault(d, []).append(t)
 
     out_tools: list[dict[str, Any]] = []
-    new_mtimes: dict[str, float] = {}
+    new_stats: dict[str, Any] = {}
     handled_dirs: set[str] = set()
     # Dedup by (name, origin) only — matching the old `sort -u` on "name|origin"
     # lines. The SAME (name, origin) can legitimately turn up from more than
     # one directory (e.g. a brew keg's opt/*/bin entry and a top-level
     # /opt/homebrew/bin symlink); only the first directory's tag is kept for
-    # future mtime-gating, but only one final tool record is emitted.
+    # future stat-gating, but only one final tool record is emitted.
     seen_keys: set[tuple[str, str]] = set()
 
     def emit(name: str, origin: str, dir_tag: Optional[str]) -> None:
@@ -1821,12 +1886,11 @@ def incremental_scan_merge(
         handled_dirs.add(dir_path)
         if not exists:
             continue
-        try:
-            cur_mtime = os.stat(dir_path).st_mtime
-        except OSError:
+        cur_stats = _dir_stats(dir_path, mode)
+        if cur_stats is None:
             continue
-        old_mtime = old_mtimes.get(dir_path)
-        if (not force) and old_mtime is not None and cur_mtime == old_mtime and dir_path in cached_by_dir:
+        old = _coerce_dir_stats(old_stats.get(dir_path), mode)
+        if (not force) and old is not None and _stats_unchanged(cur_stats, old, mode) and dir_path in cached_by_dir:
             for t in cached_by_dir[dir_path]:
                 emit(t["name"], origin, dir_path)
         else:
@@ -1838,20 +1902,20 @@ def incremental_scan_merge(
                 names = _scan_dir_entries(dir_path)
             for n in names:
                 emit(n, origin, dir_path)
-        new_mtimes[dir_path] = cur_mtime
+        new_stats[dir_path] = cur_stats
 
     # Non-directory-gated entries the shell adds directly (currently just
     # the fnm sentinel: fnm's own binary lives under a version-manager
-    # shim, not a plain bin dir worth mtime-tracking).
+    # shim, not a plain bin dir worth stat-tracking).
     for name, origin in (extra_tools or []):
         emit(name, origin, None)
 
-    # Carry forward mtimes for directories not mentioned at all this run
+    # Carry forward stats for directories not mentioned at all this run
     # (e.g. a manager whose whole resolution path is conditional and wasn't
     # even attempted, such as npm's dirs when npm itself isn't installed).
-    for d, mt in old_mtimes.items():
+    for d, stats in old_stats.items():
         if d not in handled_dirs:
-            new_mtimes[d] = mt
+            new_stats[d] = stats
 
     # Carry forward cached tools whose directory wasn't touched this run,
     # and any tool with no "dir" tag at all (pre-migration cache entries,
@@ -1862,7 +1926,7 @@ def incremental_scan_merge(
             emit(t["name"], t.get("origin", "?"), d)
 
     out_tools.append({"scanned_at": scanned_at, "count": len(out_tools)})
-    out_tools.append({"dir_mtimes": new_mtimes})
+    out_tools.append({"dir_mtimes": new_stats})
     return json.dumps(out_tools, indent=2)
 
 
