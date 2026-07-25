@@ -85,7 +85,7 @@ def load_merge(base_path: str, local_path: Optional[str]) -> dict[str, Any]:
                 loc = json.load(f)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in local config file {local_path}: {e}")
-        for key in ("known", "bulk", "check", "repos"):
+        for key in ("known", "bulk", "check", "repos", "fix"):
             if key in loc and isinstance(loc[key], dict):
                 base.setdefault(key, {})
                 base[key].update(loc[key])
@@ -138,6 +138,18 @@ def validate(cfg: dict[str, Any]) -> None:
                 raise ValueError(f"check key must be a non-empty string, got {k!r}")
             if not isinstance(v, str):
                 raise ValueError(f"check.{k!r} must be a string command")
+
+    # Validate optional "fix" mapping (tool/origin name -> repair command run
+    # once after an update has failed all its retries; overrides the
+    # auto-derived reinstall command).
+    if "fix" in cfg:
+        if not isinstance(cfg["fix"], dict):
+            raise ValueError("'fix' must be an object mapping name to a fix command")
+        for k, v in cfg["fix"].items():
+            if not isinstance(k, str) or not k:
+                raise ValueError(f"fix key must be a non-empty string, got {k!r}")
+            if not isinstance(v, str):
+                raise ValueError(f"fix.{k!r} must be a string command")
 
     # Validate optional "hold" list (pinned tools/origins). Each entry is
     # either a plain known-tool name / bulk-origin name, or "name:major" —
@@ -264,6 +276,135 @@ def lock_group_for(origin: str, cmd: str, name: str) -> str:
     return name
 
 
+# Auto-derived "fix" commands (Feature: fix-after-retries). When a known
+# tool's update command fails all its retries, the executors run a one-shot
+# repair — normally a force-reinstall at latest — derived from the update
+# command itself. An explicit entry in config's "fix" object always wins.
+# Only patterns whose repair is safe and idempotent are listed; anything
+# unrecognized (e.g. a tool's own self-updater like `claude update`) gets no
+# auto-fix, because there is no generic way to reinstall it.
+#
+# Matching is token-based (shlex), not regex: a flag that isn't in the
+# manager's known-valueless allowlist might consume the next token as its
+# value (`npm update -g --registry https://x pkg`), so rather than risk
+# reinstalling a flag value as a "package", derivation bails and leaves
+# repair to an explicit config "fix" entry.
+_FIX_TEMPLATES = {
+    "npm": "npm install -g {pkg}@latest --force",
+    "brew": "brew reinstall {pkg}",
+    "uv": "uv tool install {pkg} --force --reinstall",
+    "pipx": "pipx reinstall {pkg}",
+    "cargo": "cargo install {pkg} --locked --force",
+    "gem": "gem install {pkg} --user-install",
+}
+
+# manager -> (accepted verb-token prefixes, flags known to take NO value)
+_FIX_MATCHERS: list[tuple[str, tuple[tuple[str, ...], ...], frozenset[str]]] = [
+    ("npm", (("npm", "update"), ("npm", "install"), ("npm", "i")),
+     frozenset({"-g", "--global", "--no-fund", "--no-audit", "--silent",
+                "--quiet", "-q", "--force", "-f", "--no-save"})),
+    ("brew", (("brew", "upgrade"),),
+     frozenset({"--cask", "--formula", "--quiet", "-q", "--greedy",
+                "--force", "-f"})),
+    ("uv", (("uv", "tool", "upgrade"),),
+     frozenset({"--quiet", "-q", "--no-progress"})),
+    ("pipx", (("pipx", "upgrade"),),
+     frozenset({"--quiet", "-q", "--verbose"})),
+    ("cargo", (("cargo", "install"),),
+     frozenset({"--locked", "--force", "-f", "--quiet", "-q"})),
+    ("gem", (("gem", "update"),),
+     frozenset({"--user-install", "--quiet", "-q"})),
+]
+
+_FIX_PKG_RE = re.compile(r"@?[A-Za-z0-9][A-Za-z0-9._/@-]*\Z")
+
+
+def _fix_tokens(cmd: str) -> Optional[list[str]]:
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return None
+
+
+def _same_command(a: str, b: str) -> bool:
+    """Whitespace-insensitive command equality (shlex token lists)."""
+    ta, tb = _fix_tokens(a), _fix_tokens(b)
+    if ta is None or tb is None:
+        return a.strip() == b.strip()
+    return ta == tb
+
+# Update commands that already ARE a from-scratch reinstall — rerunning them
+# is the fix, so no separate fix command is derived.
+_FIX_SELF_HEALING_RE = re.compile(r"^go\s+install\s")
+
+
+def _cmd_head(cmd: str) -> str:
+    """The first simple command in a shell string (before any operator).
+
+    Config commands routinely carry suffixes like `2>/dev/null || true`;
+    fix derivation only cares about the leading `npm update -g pkg` part.
+    """
+    head = re.split(r"\s*(?:\|\||&&|;|\|)\s*", cmd, maxsplit=1)[0]
+    head = re.split(r"\s+(?:[012]?>>?|<)", head, maxsplit=1)[0]
+    return head.strip()
+
+
+def derive_fix_command(
+    kind: str, name: str, cmd: str, fix_cfg: Optional[dict[str, str]] = None,
+) -> str:
+    """Repair command to run after `cmd` has failed all retries ("" = none).
+
+    Explicit config ("fix" object, keyed by tool/origin name) always wins,
+    for both known tools and bulk origins. Auto-derivation applies to known
+    tools only: bulk commands (whole-manager sweeps like `npm update -g`)
+    have no single package to reinstall.
+    """
+    if fix_cfg and name in fix_cfg:
+        fix = fix_cfg[name].strip()
+        # A configured fix identical to the failing command is just a
+        # disguised extra retry, not a repair.
+        return "" if _same_command(fix, cmd) else fix
+    if kind != "known":
+        return ""
+    head = _cmd_head(cmd)
+    if _FIX_SELF_HEALING_RE.match(head):
+        return ""
+    toks = _fix_tokens(head)
+    if not toks:
+        return ""
+    for mgr, prefixes, valueless in _FIX_MATCHERS:
+        prefix = next(
+            (p for p in prefixes if tuple(toks[: len(p)]) == p), None)
+        if prefix is None:
+            continue
+        rest = toks[len(prefix):]
+        pkgs = []
+        for tok in rest:
+            if tok.startswith("-"):
+                # `--flag=value` is self-contained; a bare unknown flag
+                # might take the next token as its value — bail rather
+                # than guess.
+                if "=" in tok or tok in valueless:
+                    continue
+                return ""
+            pkgs.append(tok)
+        # Exactly one unambiguous package token, or no auto-fix.
+        if len(pkgs) != 1 or not _FIX_PKG_RE.fullmatch(pkgs[0]):
+            return ""
+        pkg = pkgs[0]
+        if mgr == "npm":
+            if not any(t in ("-g", "--global") for t in rest):
+                return ""
+            # An npm spec that already pins a tag/version (`pkg@latest`)
+            # would otherwise double up as `pkg@latest@latest`.
+            if "@" in pkg[1:]:
+                pkg = pkg[: pkg.rindex("@")]
+        fix = _FIX_TEMPLATES[mgr].format(pkg=pkg)
+        # Never emit a fix identical to the failing command.
+        return "" if _same_command(fix, head) else fix
+    return ""
+
+
 def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
     """If the binary is a symlink into a known package-manager tree, return that origin.
 
@@ -280,7 +421,7 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
             return None
         target = os.path.realpath(path)
         if "node_modules" in target:
-            return "npm"
+            return _origin_from_target_path(target) or "npm"
         return None
     if origin not in ("manual", "path", "?"):
         return None
@@ -290,14 +431,43 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
     if not os.path.islink(path):
         return None
     target = os.path.realpath(path)
+    return _origin_from_target_path(target)
+
+
+def _origin_from_target_path(target: str) -> str | None:
+    """Map a resolved binary path to the package manager that owns it.
+
+    Checked in specificity order: more specific trees (uv tools, pipx venvs,
+    Homebrew Cellar) before the generic substring patterns, so a freshly
+    discovered binary in a scanned PATH directory rides the right bulk
+    update instead of being reported as unknown.
+    """
+    if "/uv/tools/" in target or ".local/share/uv" in target:
+        return "uv"
+    if "pipx/venvs" in target or ".pipx" in target:
+        return "pipx"
+    if "/Cellar/" in target or "/homebrew/" in target.lower() or "/linuxbrew/" in target:
+        return "brew"
+    # pnpm and yarn global trees contain "node_modules" too — check them
+    # before the generic node_modules → npm fallback.
+    if "/pnpm/" in target or "Library/pnpm" in target or ".local/share/pnpm" in target:
+        return "pnpm"
+    if ".yarn/" in target or ".config/yarn/global" in target:
+        return "yarn"
     if "node_modules" in target:
         return "npm"
-    if ".cargo" in target or "cargo" in target:
+    if ".bun/" in target:
+        return "bun"
+    if ".deno/" in target:
+        return "deno"
+    if ".volta/" in target:
+        return "volta"
+    if "/mise/installs/" in target or "/mise/shims/" in target:
+        return "mise"
+    if ".cargo/" in target:
         return "cargo"
     if ".dotnet" in target:
         return "dotnet"
-    if ".pipx" in target:
-        return "pipx"
     return None
 
 
@@ -560,9 +730,12 @@ def collect_emit_lines(
             return False
         return True
 
+    fix_cfg = cfg.get("fix") if isinstance(cfg.get("fix"), dict) else {}
+
     def write_line(kind: str, name: str, cmd: str, origin: str) -> None:
         lock = lock_group_for(origin, cmd, name)
-        lines.append(f"{kind}{EMIT_SEP}{name}{EMIT_SEP}{cmd}{EMIT_SEP}{lock}")
+        fix = derive_fix_command(kind, name, cmd, fix_cfg)
+        lines.append(f"{kind}{EMIT_SEP}{name}{EMIT_SEP}{cmd}{EMIT_SEP}{lock}{EMIT_SEP}{fix}")
 
     for t in tools:
         name = t["name"]
@@ -722,14 +895,17 @@ def emit_plan_json(
         history_path, quarantine_after, include_quarantined, precheck_uptodate,
         held_config, held_adhoc,
     ):
-        parts = line.split(EMIT_SEP, 3)
+        parts = line.split(EMIT_SEP)
         if len(parts) < 3:
             continue
         kind, name, cmd = parts[0], parts[1], parts[2]
         lock = parts[3] if len(parts) > 3 else name
+        fix = parts[4] if len(parts) > 4 else ""
         entry: dict[str, str] = {"type": kind, "name": name, "command": cmd}
         if lock:
             entry["lock_group"] = lock
+        if fix:
+            entry["fix_command"] = fix
         plan.append(entry)
     print(json.dumps({"plan": plan, "count": len(plan)}, indent=2))
 
@@ -888,7 +1064,8 @@ def _load_cached_versions(cache_path: Optional[str]) -> tuple[dict[str, str], di
 # "manual", "sdkman") always get re-probed since there's nothing cheap to
 # gate on.
 _BULK_ORIGIN_BINARY = {
-    "brew": "brew", "npm": "npm", "cargo": "cargo", "gem": "gem", "pip": "pip3",
+    "brew": "brew", "npm": "npm", "pnpm": "pnpm", "yarn": "yarn",
+    "cargo": "cargo", "gem": "gem", "pip": "pip3",
     "uv": "uv", "uv/pip": "uv", "uv/venv": "uv", "fnm": "fnm", "bun": "bun",
     "deno": "deno", "pyenv": "pyenv", "rbenv": "rbenv", "conda": "conda",
     "opencode": "opencode", "dotnet": "dotnet", "mise": "mise", "pipx": "pipx",
@@ -1066,7 +1243,7 @@ def suggest_config(cache_path: str, cfg: dict[str, Any]) -> None:
 # Origins where individual tool entries make sense (exclude brew which is
 # mostly system-level library binaries that aren't worth tracking individually)
 _TRACKABLE_ORIGINS = frozenset({
-    "npm", "cargo", "go", "gem", "pipx", "manual", "path",
+    "npm", "pnpm", "yarn", "cargo", "go", "gem", "pipx", "manual", "path",
     "uv", "uv/pip", "uv/venv", "fnm", "bun", "deno",
     "mise", "opencode", "grok", "conda", "dotnet", "krew",
     "pip", "asdf", "proto", "volta", "rye", "foundry", "aqua", "mason",

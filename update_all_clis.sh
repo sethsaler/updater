@@ -14,6 +14,15 @@
 #   --job-timeout=N   Kill any single update still running after N seconds
 #                     (default 900; 0 disables; also: UAC_JOB_TIMEOUT=N).
 #                     A killed job counts as failed; other updates continue.
+#   --retries=N       Retry a failed update up to N times before giving up
+#                     (default 1; 0 disables; also: UAC_RETRIES=N).
+#                     Timeouts are never retried, only real failures.
+#   --retry-delay=N   Seconds to wait between retries (default 10;
+#                     also: UAC_RETRY_DELAY=N)
+#   --no-fix          Don't attempt the one-shot fix (force-reinstall) after
+#                     an update has failed all its retries (also: UAC_FIX=0).
+#                     Fix commands are auto-derived (npm/brew/uv/pipx/cargo/gem
+#                     reinstalls) or set per tool in config's "fix" object.
 #   --json-summary    Print JSON ok/failed counts on stdout after run
 #   --list --json     Machine-readable tool list (with --list)
 #   --report-unknown  Show tools discovered with no update path
@@ -50,7 +59,7 @@
 #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.9.0"
+UAC_VERSION="0.10.0"
 
 set -uo pipefail
 
@@ -79,6 +88,15 @@ UAC_QUARANTINE_AFTER="${UAC_QUARANTINE_AFTER:-3}"
 # (e.g. a cask upgrade waiting on an open app) can't stall the rest of the
 # run. 0 disables. Override per-run with --job-timeout=N.
 UAC_JOB_TIMEOUT="${UAC_JOB_TIMEOUT:-900}"
+
+# Retry-then-fix (Feature: fix failing packages): a failed update is retried
+# up to UAC_RETRIES times (UAC_RETRY_DELAY seconds apart); if it still fails
+# and a fix command exists (auto-derived force-reinstall, or config "fix"
+# entry), that fix runs once and its success counts as ok. Timeouts are not
+# retried — a wedged job would just burn the watchdog twice.
+UAC_RETRIES="${UAC_RETRIES:-1}"
+UAC_RETRY_DELAY="${UAC_RETRY_DELAY:-10}"
+UAC_FIX="${UAC_FIX:-1}"
 
 # Default 0: every run does a fresh discovery scan so new installs are
 # always picked up. Set CACHE_TTL_HOURS=N to reuse a recent cache instead.
@@ -207,6 +225,9 @@ while [[ $# -gt 0 ]]; do
     --include-quarantined) INCLUDE_QUARANTINED=1; shift ;;
     --no-precheck)     NO_PRECHECK=1; shift ;;
     --job-timeout=*)   UAC_JOB_TIMEOUT="${1#*=}"; shift ;;
+    --retries=*)       UAC_RETRIES="${1#*=}"; shift ;;
+    --retry-delay=*)   UAC_RETRY_DELAY="${1#*=}"; shift ;;
+    --no-fix)          UAC_FIX=0; shift ;;
     --hold=*)          HOLD_ADD="${1#*=}"; shift ;;
     --unhold=*)        HOLD_REMOVE="${1#*=}"; shift ;;
     --doctor)          DOCTOR_MODE=1; shift ;;
@@ -240,6 +261,14 @@ if [[ "$PARALLEL_JOBS" == "0" ]]; then
 fi
 if ! [[ "$UAC_JOB_TIMEOUT" =~ ^[0-9]+$ ]]; then
   echo "Invalid --job-timeout / UAC_JOB_TIMEOUT value (use seconds, 0 disables): $UAC_JOB_TIMEOUT" >&2
+  exit 1
+fi
+if ! [[ "$UAC_RETRIES" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --retries / UAC_RETRIES value (use a non-negative integer, 0 disables): $UAC_RETRIES" >&2
+  exit 1
+fi
+if ! [[ "$UAC_RETRY_DELAY" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --retry-delay / UAC_RETRY_DELAY value (use seconds): $UAC_RETRY_DELAY" >&2
   exit 1
 fi
 
@@ -371,12 +400,14 @@ full_scan() {
     done
   fi
 
-  if [[ -d "$HOME/.local/pipx/venvs" ]]; then
-    local pipx_bin
-    for pipx_bin in "$HOME/.local/pipx/venvs"/*/bin; do
+  # pipx: legacy (~/.local/pipx) and modern (~/.local/share/pipx) venv roots
+  local pipx_root pipx_bin
+  for pipx_root in "$HOME/.local/pipx/venvs" "$HOME/.local/share/pipx/venvs"; do
+    [[ -d "$pipx_root" ]] || continue
+    for pipx_bin in "$pipx_root"/*/bin; do
       [[ -d "$pipx_bin" ]] && _scan_row "$pipx_bin" "pipx" "dir"
     done
-  fi
+  done
 
   local gem_home
   gem_home=$(gem env home 2>/dev/null || true)
@@ -397,17 +428,24 @@ full_scan() {
   _scan_row "$HOME/bin" "manual" "dir"
 
   if [[ -n "${PNPM_HOME:-}" ]]; then
-    _scan_row "$PNPM_HOME" "npm" "dir"
+    _scan_row "$PNPM_HOME" "pnpm" "dir"
   else
-    _scan_row "$HOME/.local/share/pnpm/bin" "npm" "dir"
+    # pnpm's default global dir: ~/Library/pnpm on macOS, ~/.local/share/pnpm
+    # on Linux. Scan both; a missing dir is pruned harmlessly.
+    _scan_row "$HOME/Library/pnpm" "pnpm" "dir"
+    _scan_row "$HOME/.local/share/pnpm/bin" "pnpm" "dir"
+    _scan_row "$HOME/.local/share/pnpm" "pnpm" "dir"
   fi
+
+  # yarn global installs (`yarn global add`) default bin dir
+  _scan_row "$HOME/.yarn/bin" "yarn" "dir"
 
   local _npm_packages="$HOME/.npm-packages/bin"
   if [[ -z "$npm_prefix" ]] || [[ "${npm_prefix}/lib/node_modules/.bin" != "$_npm_packages" ]]; then
     _scan_row "$_npm_packages" "npm" "dir"
   fi
 
-  _scan_row "$HOME/.config/yarn/global/node_modules/.bin" "npm" "dir"
+  _scan_row "$HOME/.config/yarn/global/node_modules/.bin" "yarn" "dir"
 
   _scan_row "$HOME/.dotnet/tools" "dotnet" "dir"
 
@@ -457,7 +495,7 @@ full_scan() {
       [[ -n "$pdir" ]] || continue
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
-        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin"|"$HOME/.volta/bin"|"$HOME/.asdf/shims"|"$HOME/.proto/bin"|"$HOME/.rye/shims"|"$HOME/.local/share/rye/shims"|"$HOME/.foundry/bin"|"$HOME/.aqua/bin"|"$HOME/.local/share/aquaproj-aqua/bin"|"$HOME/.local/share/nvim/mason/bin"|"$HOME/.dotnet/tools"|"$HOME/.krew/bin"|"$HOME/.local/share/mise/shims"|"$HOME/.wasmtime/bin"|"$HOME/.wasmer/bin") continue ;;
+        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin"|"$HOME/.volta/bin"|"$HOME/.asdf/shims"|"$HOME/.proto/bin"|"$HOME/.rye/shims"|"$HOME/.local/share/rye/shims"|"$HOME/.foundry/bin"|"$HOME/.aqua/bin"|"$HOME/.local/share/aquaproj-aqua/bin"|"$HOME/.local/share/nvim/mason/bin"|"$HOME/.dotnet/tools"|"$HOME/.krew/bin"|"$HOME/.local/share/mise/shims"|"$HOME/.wasmtime/bin"|"$HOME/.wasmer/bin"|"$HOME/Library/pnpm"|"$HOME/.local/share/pnpm"|"$HOME/.local/share/pnpm/bin"|"$HOME/.yarn/bin"|"${PNPM_HOME:-/nonexistent-pnpm-home}") continue ;;
         "$HOME"/Library/Python/3.*/bin) continue ;;
       esac
       [[ -n "${go_bin_dir:-}" ]] && [[ "$pdir" == "$go_bin_dir" ]] && continue
@@ -488,10 +526,22 @@ full_scan() {
   [[ -n "$RESCAN" ]] && force_flag="1"
 
   debug "Planning scan over ${#_SCAN_ROWS[@]} directories (force=$force_flag)"
-  python3 "$LIB_SCRIPT" incremental-scan "$CACHE_FILE" "$scanned_at" "$force_flag" "$rows_file" "$extra_file" > "$tmpfile" 2>/dev/null
-  mv "$tmpfile" "$CACHE_FILE"
+  # Only replace the cache when the scan actually succeeded and produced
+  # output — an unconditional mv here used to clobber a good cache with an
+  # empty file whenever the Python scanner failed, breaking discovery until
+  # the next successful --rescan.
+  if python3 "$LIB_SCRIPT" incremental-scan "$CACHE_FILE" "$scanned_at" "$force_flag" "$rows_file" "$extra_file" > "$tmpfile" 2>/dev/null && [[ -s "$tmpfile" ]]; then
+    mv "$tmpfile" "$CACHE_FILE"
+    debug "Cache written to: $CACHE_FILE"
+  else
+    rm -f "$tmpfile"
+    if [[ -f "$CACHE_FILE" ]]; then
+      warn "discovery scan failed — keeping the previous cache at $CACHE_FILE (run with UAC_DEBUG=1 to investigate)"
+    else
+      warn "discovery scan failed and no previous cache exists — no tools will be planned this run"
+    fi
+  fi
   rm -f "$rows_file" "$extra_file"
-  debug "Cache written to: $CACHE_FILE"
 }
 
 # -------------------------------------------------------------------
@@ -545,19 +595,12 @@ ensure_cache() {
 #      counted as a failure; the rest of the run continues normally.
 #      Tune with UAC_JOB_TIMEOUT=N or --job-timeout=N (0 disables).
 # -------------------------------------------------------------------
-run_update() {
-  local group="$1"
-  local cmd="$2"
-
-  if [[ -n "$DRY_RUN" ]]; then
-    log "  [dry-run] $cmd"
-    return 0
-  fi
-
-  [[ -z "$QUIET" ]] && log "  ${BOLD}→${NC} $cmd"
-
-  local output ec=0
+# One watchdog-guarded attempt. Sets _RUN_EC, _RUN_OUTPUT, _RUN_TIMED_OUT.
+_run_cmd_once() {
+  local cmd="$1"
+  local ec=0
   local _outfile
+  _RUN_TIMED_OUT=""
   _outfile=$(mktemp)
   if [[ -n "$TRACE" ]] && [[ -z "${SUPPRESS_TRACE:-}" ]]; then
     bash -x -c "$cmd" </dev/null >"$_outfile" 2>&1 &
@@ -565,10 +608,10 @@ run_update() {
     bash -c "$cmd" </dev/null >"$_outfile" 2>&1 &
   fi
   local _cmd_pid=$!
-  local _elapsed=0 _timed_out=""
+  local _elapsed=0
   while kill -0 "$_cmd_pid" 2>/dev/null; do
     if (( UAC_JOB_TIMEOUT > 0 )) && (( _elapsed >= UAC_JOB_TIMEOUT )); then
-      _timed_out=1
+      _RUN_TIMED_OUT=1
       _kill_tree "$_cmd_pid"
       break
     fi
@@ -576,23 +619,70 @@ run_update() {
     _elapsed=$((_elapsed + 1))
   done
   wait "$_cmd_pid" 2>/dev/null || ec=$?
-  output=$(<"$_outfile")
+  _RUN_OUTPUT=$(<"$_outfile")
   rm -f "$_outfile"
+  _RUN_EC=$ec
+}
 
-  if [[ -n "$_timed_out" ]]; then
-    warn "$group timed out after ${UAC_JOB_TIMEOUT}s and was killed — it was probably waiting on something (e.g. an open app blocking a cask upgrade, or a prompt). Other updates were not blocked."
-    [[ -z "$QUIET" ]] && echo "$output" | tail -3 | sed 's/^/   /'
-    return 1
+run_update() {
+  local group="$1"
+  local cmd="$2"
+  local fix="${3:-}"
+
+  if [[ -n "$DRY_RUN" ]]; then
+    log "  [dry-run] $cmd"
+    if [[ -n "$fix" ]] && [[ "$UAC_FIX" != "0" ]]; then
+      log "  [dry-run]   (on failure, after $UAC_RETRIES retries: $fix)"
+    fi
+    return 0
   fi
 
-  if [[ $ec -eq 0 ]]; then
-    ok "$group"
-  else
-    warn "$group failed (exit $ec)"
-    [[ -z "$QUIET" ]] && echo "$output" | grep -v "^npm warn" | grep -v "^brew warn" | head -3 | sed 's/^/   /'
-    return 1
+  [[ -z "$QUIET" ]] && log "  ${BOLD}→${NC} $cmd"
+
+  # Retry loop: real failures are retried up to UAC_RETRIES times; a
+  # watchdog timeout is not (a wedged job would just wedge again and eat
+  # another full UAC_JOB_TIMEOUT), and it skips the fix for the same reason.
+  local attempt=0
+  while :; do
+    _run_cmd_once "$cmd"
+    if [[ -n "$_RUN_TIMED_OUT" ]]; then
+      warn "$group timed out after ${UAC_JOB_TIMEOUT}s and was killed — it was probably waiting on something (e.g. an open app blocking a cask upgrade, or a prompt). Other updates were not blocked."
+      [[ -z "$QUIET" ]] && echo "$_RUN_OUTPUT" | tail -3 | sed 's/^/   /'
+      return 1
+    fi
+    if [[ $_RUN_EC -eq 0 ]]; then
+      if (( attempt > 0 )); then
+        ok "$group (succeeded on retry $attempt)"
+      else
+        ok "$group"
+      fi
+      return 0
+    fi
+    if (( attempt < UAC_RETRIES )); then
+      attempt=$((attempt + 1))
+      warn "$group failed (exit $_RUN_EC) — retrying in ${UAC_RETRY_DELAY}s (retry $attempt/$UAC_RETRIES)"
+      sleep "$UAC_RETRY_DELAY"
+      continue
+    fi
+    break
+  done
+
+  warn "$group failed (exit $_RUN_EC)"
+  [[ -z "$QUIET" ]] && echo "$_RUN_OUTPUT" | grep -v "^npm warn" | grep -v "^brew warn" | head -3 | sed 's/^/   /'
+
+  # Retries exhausted: one-shot fix (force-reinstall). Its success counts
+  # as ok — a reinstall at latest achieves what the update was trying to do.
+  if [[ -n "$fix" ]] && [[ "$UAC_FIX" != "0" ]]; then
+    info "Attempting fix for $group: $fix"
+    _run_cmd_once "$fix"
+    if [[ -z "$_RUN_TIMED_OUT" ]] && [[ $_RUN_EC -eq 0 ]]; then
+      ok "$group (fixed via: $fix)"
+      return 0
+    fi
+    warn "$group fix failed"
+    [[ -z "$QUIET" ]] && echo "$_RUN_OUTPUT" | head -3 | sed 's/^/   /'
   fi
-  return 0
+  return 1
 }
 
 # -------------------------------------------------------------------
@@ -600,18 +690,28 @@ run_update() {
 # -------------------------------------------------------------------
 _parse_emit_line() {
   local line="$1"
+  EMIT_TYPE="${line%%$'\x1e'*}"
   local rest="${line#*$'\x1e'}"
   EMIT_NAME="${rest%%$'\x1e'*}"
+  EMIT_CMD="" EMIT_LOCK="" EMIT_FIX=""
+  # Fields 4 (lock group) and 5 (fix command) are optional: `${rest#*SEP}`
+  # leaves rest unchanged when no separator remains, so guard each step or
+  # a short line would smear its last field into the next variable.
+  [[ "$rest" == *$'\x1e'* ]] || return 0
   rest="${rest#*$'\x1e'}"
   EMIT_CMD="${rest%%$'\x1e'*}"
-  EMIT_LOCK="${rest#*$'\x1e'}"
-  EMIT_TYPE="${line%%$'\x1e'*}"
+  [[ "$rest" == *$'\x1e'* ]] || return 0
+  rest="${rest#*$'\x1e'}"
+  EMIT_LOCK="${rest%%$'\x1e'*}"
+  [[ "$rest" == *$'\x1e'* ]] && EMIT_FIX="${rest#*$'\x1e'}"
+  return 0
 }
 
 _run_one_emit_line_core() {
   local cmd_type="$1"
   local name="$2"
   local cmd="$3"
+  local fix="${4:-}"
   case "$cmd_type" in
     skip) return 3 ;;
     quarantined)
@@ -632,7 +732,7 @@ _run_one_emit_line_core() {
       ;;
     bulk)
       info "Updating all $name..."
-      run_update "$name" "$cmd"
+      run_update "$name" "$cmd" "$fix"
       ;;
     known)
       if is_skipped "$name"; then
@@ -640,7 +740,7 @@ _run_one_emit_line_core() {
         return 3
       fi
       info "Updating $name..."
-      run_update "$name" "$cmd"
+      run_update "$name" "$cmd" "$fix"
       ;;
   esac
 }
@@ -686,19 +786,20 @@ _run_with_mkdir_lock() {
 
 _run_one_emit_line() {
   local line="$1"
-  local cmd_type name cmd lock_group
+  local cmd_type name cmd lock_group fix
   _parse_emit_line "$line"
   cmd_type="$EMIT_TYPE"
   name="$EMIT_NAME"
   cmd="$EMIT_CMD"
   lock_group="${EMIT_LOCK:-$name}"
+  fix="$EMIT_FIX"
 
   # Dry-run never mutates anything, so locking (which only exists to
   # serialize concurrent *writes* from the same package manager) is pointless
   # overhead there — every dry-run "job" is a near-instant echo of the
   # command it would run, so skip the lock round-trip entirely.
   if [[ -n "$DRY_RUN" ]]; then
-    _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
+    _run_one_emit_line_core "$cmd_type" "$name" "$cmd" "$fix"
     return $?
   fi
 
@@ -717,14 +818,14 @@ _run_one_emit_line() {
         _lock_wait=3600
       fi
       { flock -x -w "$_lock_wait" 200 || warn "lock '$lock_group' busy after ${_lock_wait}s; running $name without it"
-        _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
+        _run_one_emit_line_core "$cmd_type" "$name" "$cmd" "$fix"
       } 200>"$LOCK_DIR/${lock_group}.lock"
     else
-      _run_with_mkdir_lock "$lock_group" "$cmd_type" "$name" "$cmd"
+      _run_with_mkdir_lock "$lock_group" "$cmd_type" "$name" "$cmd" "$fix"
       return $?
     fi
   else
-    _run_one_emit_line_core "$cmd_type" "$name" "$cmd"
+    _run_one_emit_line_core "$cmd_type" "$name" "$cmd" "$fix"
   fi
 }
 
@@ -864,11 +965,16 @@ run_updates_tui() {
   _emit_file=$(mktemp)
   _results_file=$(mktemp)
   printf '%s\n' "$@" > "$_emit_file"
+  local _tui_fix="1"
+  [[ "$UAC_FIX" == "0" ]] && _tui_fix="0"
   python3 "$TUI_SCRIPT" \
     --emit-file "$_emit_file" \
     --results-file "$_results_file" \
     --parallel "$PARALLEL_JOBS" \
     --timeout "$UAC_JOB_TIMEOUT" \
+    --retries "$UAC_RETRIES" \
+    --retry-delay "$UAC_RETRY_DELAY" \
+    --fix "$_tui_fix" \
     --skip "$SKIP" \
     --version-string "$UAC_VERSION" || _rc=$?
   # 130 = interrupted (Ctrl+C): the runner already reported it; don't warn.

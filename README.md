@@ -13,6 +13,8 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Origin / Manager | Update command |
 |---|---|
 | npm global packages | `npm update -g` |
+| pnpm global packages | `pnpm update -g` |
+| Yarn global packages | `yarn global upgrade` |
 | Homebrew (macOS) | `brew update && brew upgrade` |
 | Ruby Gems | `gem update --user-install` |
 | Cargo (Rust) | `cargo install-update -a` |
@@ -149,6 +151,9 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --no-scan-path  # skip scanning directories on $PATH
 ./update_all_clis.sh --parallel=8    # run up to 8 updates at once (default 8)
 ./update_all_clis.sh --job-timeout=900  # kill any single update stuck longer than N seconds (default 900; 0 disables)
+./update_all_clis.sh --retries=2      # retry a failed update up to N times (default 1; 0 disables)
+./update_all_clis.sh --retry-delay=30 # seconds between retries (default 10)
+./update_all_clis.sh --no-fix         # don't attempt the one-shot repair after retries are exhausted
 ./update_all_clis.sh --notify       # show the non-blocking desktop summary dialog
 ./update_all_clis.sh --only-origins=brew,npm
 ./update_all_clis.sh --skip-origins=gem
@@ -172,6 +177,40 @@ QUIET=1 ./update_all_clis.sh
 ./update_all_clis.sh --no-tui      # plain log output even on an interactive terminal
 ./update_all_clis.sh --tui         # force the live dashboard on
 ```
+
+### Retries and auto-fix (repair after failure)
+
+A failed update is no longer a dead end — and no longer invisible: known-tool commands in `tool_config.json` used to end in `|| true`, which masked every real failure as success; those masks are removed so failures actually surface (the existing quarantine still silences a tool after 3 consecutive failed runs). Both executors (shell and TUI) apply the same policy:
+
+1. **Retry** — a real command failure (non-zero exit) is retried up to **`--retries=N`** times (`UAC_RETRIES`, default **1**, `0` disables), waiting **`--retry-delay=N`** seconds between attempts (`UAC_RETRY_DELAY`, default **10**).
+2. **Fix** — if every retry fails and the job has a *fix command*, that repair runs **once**. If it exits 0, the job counts as **ok** (`✓ tool (fixed via: ...)`); otherwise it stays failed. Disable with **`--no-fix`** / `UAC_FIX=0`.
+
+**Timeouts are never retried or fixed** — a job killed by the watchdog was probably waiting on something (an open app blocking a cask, a prompt); rerunning it would just burn another timeout.
+
+Where fix commands come from:
+
+- **Auto-derived** for known tools whose update command matches a recognized manager — the repair is a force-reinstall at latest:
+
+  | Update command | Auto-derived fix |
+  |---|---|
+  | `npm update -g pkg` / `npm install -g pkg` | `npm install -g pkg@latest --force` |
+  | `brew upgrade pkg` | `brew reinstall pkg` |
+  | `uv tool upgrade pkg` | `uv tool install pkg --force --reinstall` |
+  | `pipx upgrade pkg` | `pipx reinstall pkg` |
+  | `cargo install pkg` | `cargo install pkg --locked --force` |
+  | `gem update pkg` | `gem install pkg --user-install` |
+
+  `go install ...` gets no separate fix — it already *is* a from-scratch reinstall. Anything unrecognized gets no auto-fix: a tool's own self-updater (`claude update`), a command with an unrecognized flag that might take a value (`--registry https://x`), or one with more than one package argument — deriving a wrong reinstall would be worse than not repairing.
+- **Explicit** via an optional top-level **`"fix"`** object in `tool_config.json` or `config.local.json`, keyed by tool or origin name — this always wins over auto-derivation, and is the only way a **bulk** origin gets a fix (whole-manager sweeps have no single package to reinstall, so they're never auto-fixed):
+
+  ```json
+  "fix": {
+    "mytool": "npm install -g mytool@latest --force",
+    "brew": "brew doctor && brew update-reset"
+  }
+  ```
+
+`--dry-run` shows the repair that would run: `[dry-run]   (on failure, after 1 retries: ...)`.
 
 ### Live TUI dashboard
 
@@ -232,7 +271,7 @@ Two scan modes: a plain directory listing (most bin dirs), and a "tree" mode for
 
 ### Configuration merge and overrides
 
-- **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known`, `bulk`, `check`, and `repos` objects are **merged on top of** `tool_config.json` (local wins on key conflicts) and its `hold` array is **added to** (not replaced by) the base list, so you can add or override commands without editing the repo file.
+- **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known`, `bulk`, `check`, `repos`, and `fix` objects are **merged on top of** `tool_config.json` (local wins on key conflicts) and its `hold` array is **added to** (not replaced by) the base list, so you can add or override commands without editing the repo file.
 - **`CACHE_TTL_HOURS`** — cache freshness in hours (default **0**, i.e. every run does a fresh discovery scan so new installs are always picked up). Set to e.g. `24` to reuse a cache newer than 24h (unless `--rescan`).
 - **`ONLY_ORIGINS`** — comma-separated origins (and known tool names) to **restrict** what runs. When set, bulk updates run only for listed origins; known tools run only if their `origin` or `name` is listed.
 - **`SKIP_ORIGINS`** — comma-separated origins to skip for bulk updates; known tools whose `origin` is listed are skipped.
@@ -240,6 +279,9 @@ Two scan modes: a plain directory listing (most bin dirs), and a "tree" mode for
 - **`UAC_QUARANTINE_AFTER`** — consecutive-failure threshold before a job is quarantined (default **3**; `0` disables quarantine).
 - **`UAC_INCLUDE_QUARANTINED`** — set to `1` to force quarantined jobs to run this pass (same as `--include-quarantined`).
 - **`UAC_NO_PRECHECK`** — set to `1` to skip outdated pre-checks entirely (same as `--no-precheck`).
+- **`UAC_RETRIES`** — how many times a failed update is retried (default **1**; `0` disables; same as `--retries=N`).
+- **`UAC_RETRY_DELAY`** — seconds between retries (default **10**; same as `--retry-delay=N`).
+- **`UAC_FIX`** — set to `0` to disable the one-shot fix after retries are exhausted (same as `--no-fix`).
 - **`HOLD`** — comma-separated one-run ad hoc hold (same as `--hold=` but non-persistent; see [Pin/hold tools](#pinhold-tools)).
 - **`UPDATE_ALL_CLIS_CHANGELOG`** — set to `1` to enable the changelog digest (same as `--changelog`).
 
@@ -408,13 +450,13 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 
 ## How it works
 
-1. **Discovery scan** — walks 20+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`.
+1. **Discovery scan** — walks 25+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, pipx — both legacy `~/.local/pipx/venvs` and modern `~/.local/share/pipx/venvs` — pnpm (`~/Library/pnpm` on macOS, `~/.local/share/pnpm` on Linux), Yarn (`~/.yarn/bin`), etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`. A scan that fails or produces nothing **preserves the previous cache** instead of clobbering it.
 2. **Version caching** — after each update run, tool versions are cached to speed up future runs. The cache preserves version information across rescans to avoid redundant version probing.
-3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update. This includes binaries scanned under uv-ish origins (`uv`, `uv/pip`, `uv/venv`): when the npm global prefix is `~/.local`, npm CLIs land in `~/.local/bin` alongside uv tools, and a `node_modules` symlink target reroutes them to the npm bulk update so they're never misattributed to uv.
+3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update. This includes binaries scanned under uv-ish origins (`uv`, `uv/pip`, `uv/venv`): when the npm global prefix is `~/.local`, npm CLIs land in `~/.local/bin` alongside uv tools, and a `node_modules` symlink target reroutes them to the npm bulk update so they're never misattributed to uv. Target-path inference recognizes the install trees of uv, pipx, Homebrew, bun, deno, Volta, mise, pnpm/Yarn/npm (`node_modules`), Cargo, and dotnet.
 4. **Cache** — by default every run performs a fresh discovery scan (**`CACHE_TTL_HOURS=0`**) so newly installed tools are always found. Set `CACHE_TTL_HOURS=N` to reuse a cache newer than N hours. A normal run performs **at most one** full scan.
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
-7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs). Every update command runs with **stdin redirected to `/dev/null`** (a command that tries to prompt reads EOF instead of waiting forever) and under a **per-job watchdog** (`--job-timeout=N` / `UAC_JOB_TIMEOUT`, default 900s, 0 disables): a job still running past the timeout has its whole process tree killed and is counted as failed — e.g. a `brew upgrade` cask waiting on an open app can't stall the rest of the run. Jobs waiting on a same-manager lock are bounded too (watchdog + 60s slack), so a wedged sibling never blocks the queue indefinitely.
+7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs). Every update command runs with **stdin redirected to `/dev/null`** (a command that tries to prompt reads EOF instead of waiting forever) and under a **per-job watchdog** (`--job-timeout=N` / `UAC_JOB_TIMEOUT`, default 900s, 0 disables): a job still running past the timeout has its whole process tree killed and is counted as failed — e.g. a `brew upgrade` cask waiting on an open app can't stall the rest of the run. Jobs waiting on a same-manager lock are bounded too (watchdog + 60s slack), so a wedged sibling never blocks the queue indefinitely. A real command failure is retried and can trigger a one-shot repair (see [Retries and auto-fix](#retries-and-auto-fix-repair-after-failure)); a timeout is neither retried nor fixed.
 8. **Concurrency safety** — a **single-instance lock** (`mkdir`-based, with stale-lock detection) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. Parallel updates of the same package manager are serialized the same way — no `flock` binary or helper process needed on macOS, and no busy-waiting (a lock older than the stale cap is assumed abandoned and reclaimed rather than waited on forever). `--dry-run` skips locking entirely since it never mutates anything. **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`, and its `EXIT`/`INT`/`TERM` trap removes the whole lock directory so a crash never leaves a stale lock behind for long.
 
 ## Adding a new tool

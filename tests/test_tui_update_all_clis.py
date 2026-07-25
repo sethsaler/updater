@@ -20,8 +20,8 @@ from tui_update_all_clis import (
 )
 
 
-def make_emit_line(kind, name, cmd="", lock=""):
-    return SEP.join([kind, name, cmd, lock])
+def make_emit_line(kind, name, cmd="", lock="", fix=""):
+    return SEP.join([kind, name, cmd, lock, fix])
 
 
 class TestParseEmitLine(unittest.TestCase):
@@ -198,10 +198,14 @@ class TestBuildFrame(unittest.TestCase):
 
 
 class ExecutorTestBase(unittest.IsolatedAsyncioTestCase):
-    def make_executor(self, jobs, parallel=4, timeout=0, skip=frozenset()):
+    def make_executor(self, jobs, parallel=4, timeout=0, skip=frozenset(),
+                      retries=0, retry_delay=0.0, do_fix=True):
+        # retries=0 by default so pre-retry tests keep their exact semantics
+        # (and stay fast); retry/fix behavior has its own dedicated tests.
         results = io.StringIO()
         renderer = BaseRenderer(jobs)
-        ex = Executor(jobs, parallel, timeout, set(skip), results, renderer)
+        ex = Executor(jobs, parallel, timeout, set(skip), results, renderer,
+                      retries=retries, retry_delay=retry_delay, do_fix=do_fix)
         return ex, results
 
     def parse_results(self, results: io.StringIO):
@@ -276,6 +280,84 @@ class TestExecutorBasic(ExecutorTestBase):
         ex, _ = self.make_executor(jobs)
         await ex.run()
         self.assertEqual(jobs[0].last_line, "three")
+
+
+class TestExecutorRetryAndFix(ExecutorTestBase):
+    async def test_retry_recovers_flaky_command(self):
+        # Fails the first time, succeeds the second: a marker file
+        # distinguishes the attempts.
+        with tempfile.TemporaryDirectory() as td:
+            marker = os.path.join(td, "attempted")
+            cmd = f"if [ -e {marker} ]; then exit 0; else touch {marker}; exit 1; fi"
+            jobs = [parse_emit_line(make_emit_line("known", "flaky", cmd, "flaky"))]
+            ex, results = self.make_executor(jobs, retries=1, retry_delay=0.0)
+            await ex.run()
+        self.assertEqual(jobs[0].status, ST_DONE)
+        self.assertEqual(jobs[0].ec, 0)
+        self.assertIn("retry", jobs[0].note)
+        ec, _ = self.parse_results(results)[0]
+        self.assertEqual(ec, 0)
+
+    async def test_retries_exhausted_marks_failed(self):
+        jobs = [parse_emit_line(make_emit_line("known", "bad", "exit 5", "bad"))]
+        ex, results = self.make_executor(jobs, retries=2, retry_delay=0.0)
+        await ex.run()
+        self.assertEqual(jobs[0].status, ST_FAILED)
+        self.assertEqual(jobs[0].raw_ec, 5)
+        self.assertEqual(self.parse_results(results)[0][0], 1)
+
+    async def test_fix_success_counts_as_ok(self):
+        jobs = [parse_emit_line(make_emit_line(
+            "known", "fixable", "exit 1", "fixable", fix="true"))]
+        ex, results = self.make_executor(jobs, retries=1, retry_delay=0.0)
+        await ex.run()
+        self.assertEqual(jobs[0].status, ST_DONE)
+        self.assertEqual(jobs[0].ec, 0)
+        self.assertIn("fixed", jobs[0].note)
+        self.assertEqual(self.parse_results(results)[0][0], 0)
+
+    async def test_fix_failure_marks_failed(self):
+        jobs = [parse_emit_line(make_emit_line(
+            "known", "unfixable", "exit 1", "unfixable", fix="exit 2"))]
+        ex, results = self.make_executor(jobs, retries=0, retry_delay=0.0)
+        await ex.run()
+        self.assertEqual(jobs[0].status, ST_FAILED)
+        self.assertEqual(jobs[0].note, "fix failed")
+        # The displayed exit code is the fix's own, not the earlier update's.
+        self.assertEqual(jobs[0].raw_ec, 2)
+        self.assertEqual(self.parse_results(results)[0][0], 1)
+
+    async def test_fix_output_not_polluted_by_update_attempt(self):
+        # Each attempt clears the tail: a failing fix must not display
+        # leftover output from the failed update run.
+        jobs = [parse_emit_line(make_emit_line(
+            "known", "stale", "echo update-noise; exit 1", "stale",
+            fix="exit 2"))]
+        ex, results = self.make_executor(jobs, retries=0, retry_delay=0.0)
+        await ex.run()
+        self.assertEqual(jobs[0].status, ST_FAILED)
+        self.assertNotIn("update-noise", list(jobs[0].tail))
+
+    async def test_fix_disabled(self):
+        jobs = [parse_emit_line(make_emit_line(
+            "known", "nofix", "exit 1", "nofix", fix="true"))]
+        ex, results = self.make_executor(jobs, retries=0, do_fix=False)
+        await ex.run()
+        self.assertEqual(jobs[0].status, ST_FAILED)
+        self.assertEqual(self.parse_results(results)[0][0], 1)
+
+    async def test_timeout_not_retried_and_no_fix(self):
+        # A wedged command must fail once on the watchdog: no retry, no fix.
+        jobs = [parse_emit_line(make_emit_line(
+            "known", "wedged", "sleep 30", "wedged", fix="true"))]
+        ex, results = self.make_executor(jobs, timeout=1, retries=3,
+                                         retry_delay=0.0)
+        start = time.monotonic()
+        await ex.run()
+        elapsed = time.monotonic() - start
+        self.assertEqual(jobs[0].status, ST_FAILED)
+        self.assertIn("timed out", jobs[0].note)
+        self.assertLess(elapsed, 10)  # one watchdog window, not four
 
 
 class TestExecutorInstantKinds(ExecutorTestBase):

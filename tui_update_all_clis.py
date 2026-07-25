@@ -99,6 +99,7 @@ class Job:
     name: str
     cmd: str
     lock: str
+    fix: str = ""  # one-shot repair command run after retries are exhausted
     seq: int = 0  # position in the plan (display order)
     status: str = ST_PENDING
     ec: Optional[int] = None
@@ -120,11 +121,13 @@ class Job:
 
 def parse_emit_line(line: str, seq: int = 0) -> Job:
     """Parse one emit line into a Job. Mirrors the shell's _parse_emit_line,
-    including its empty-lock -> job-name fallback."""
+    including its empty-lock -> job-name fallback. Field 5 (fix command) is
+    optional: older 4-field lines leave it empty."""
     parts = line.rstrip("\n").split(SEP)
-    parts += [""] * (4 - len(parts))
-    kind, name, cmd, lock = parts[:4]
-    return Job(kind=kind, name=name, cmd=cmd, lock=lock or name, seq=seq)
+    parts += [""] * (5 - len(parts))
+    kind, name, cmd, lock, fix = parts[:5]
+    return Job(kind=kind, name=name, cmd=cmd, lock=lock or name, seq=seq,
+               fix=fix)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +170,8 @@ def job_detail(job: Job) -> str:
         shown = job.raw_ec if job.raw_ec is not None else job.ec
         base = f"exit {shown}" if shown is not None else "failed"
         return f"{base} — {job.note}" if job.note else base
+    if job.status == ST_DONE and job.note:
+        return job.note
     if job.status == ST_UPTODATE:
         return "already up to date (pre-check)"
     if job.status == ST_SKIPPED:
@@ -417,7 +422,8 @@ class PlainRenderer(BaseRenderer):
                 self._print(s.bold("==>") + f" Updating {job.name}...")
             self._print(f"  {s.bold('→')} {job.cmd}")
         elif job.status == ST_DONE:
-            self._print(s.green("✓") + f" {job.name}")
+            suffix = f" ({job.note})" if job.note else ""
+            self._print(s.green("✓") + f" {job.name}{suffix}")
         elif job.status == ST_UPTODATE:
             self._print(s.green("✓") + f" {job.name}: already up to date (pre-check)")
         elif job.status == ST_FAILED:
@@ -565,13 +571,18 @@ async def kill_proc_tree(proc: asyncio.subprocess.Process) -> None:
 
 class Executor:
     def __init__(self, jobs: list[Job], parallel: int, timeout: int,
-                 skip: set[str], results: IO[str], renderer: BaseRenderer):
+                 skip: set[str], results: IO[str], renderer: BaseRenderer,
+                 retries: int = 1, retry_delay: float = 10.0,
+                 do_fix: bool = True):
         self.jobs = jobs
         self.parallel = max(1, parallel)
         self.timeout = max(0, timeout)
         self.skip = skip
         self.results = results
         self.renderer = renderer
+        self.retries = max(0, retries)
+        self.retry_delay = max(0.0, retry_delay)
+        self.do_fix = do_fix
         self.sem = asyncio.Semaphore(self.parallel)
         self.group_locks: dict[str, asyncio.Lock] = {}
         self.procs: set[asyncio.subprocess.Process] = set()
@@ -681,8 +692,58 @@ class Executor:
         job.mono_start = time.monotonic()
         self.renderer.job_event(job)
 
+        # Retry loop (mirrors the shell executor's run_update): real
+        # failures are retried up to self.retries times; a watchdog timeout
+        # is not retried and skips the fix — a wedged job would just wedge
+        # again and eat another full timeout.
+        attempt = 0
+        while True:
+            rc, timed_out = await self._exec_once(job, job.cmd)
+            if timed_out:
+                self._complete(job, ST_FAILED, 1,
+                               note=f"timed out after {self.timeout}s")
+                return
+            if rc == 0:
+                job.raw_ec = rc
+                note = f"succeeded on retry {attempt}" if attempt else ""
+                self._complete(job, ST_DONE, 0, note=note)
+                return
+            if attempt < self.retries:
+                attempt += 1
+                job.last_line = (f"exit {rc} — retrying in "
+                                 f"{self.retry_delay:.0f}s "
+                                 f"(retry {attempt}/{self.retries})")
+                self.renderer.line_event(job)
+                await asyncio.sleep(self.retry_delay)
+                continue
+            break
+
+        job.raw_ec = rc
+        # Retries exhausted: one-shot fix (force-reinstall). Its success
+        # counts as ok — a reinstall at latest achieves what the update was
+        # trying to do.
+        if job.fix and self.do_fix:
+            job.last_line = f"fix: {job.fix}"
+            self.renderer.line_event(job)
+            fix_rc, fix_timed_out = await self._exec_once(job, job.fix)
+            if not fix_timed_out and fix_rc == 0:
+                self._complete(job, ST_DONE, 0, note="fixed via reinstall")
+                return
+            # Report the fix's own exit code, not the earlier update's.
+            job.raw_ec = fix_rc
+            note = "fix timed out" if fix_timed_out else "fix failed"
+            self._complete(job, ST_FAILED, 1, note=note)
+            return
+        self._complete(job, ST_FAILED, 1)
+
+    async def _exec_once(self, job: Job, cmd: str) -> tuple[int, bool]:
+        """One watchdog-guarded subprocess run; returns (rc, timed_out)."""
+        # Each attempt (retry or fix) reports its own output — don't let a
+        # short fix failure display leftovers from an earlier attempt.
+        job.tail.clear()
+        job.last_line = ""
         proc = await asyncio.create_subprocess_exec(
-            "bash", "-c", job.cmd,
+            "bash", "-c", cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -707,14 +768,8 @@ class Executor:
         finally:
             self.procs.discard(proc)
 
-        if timed_out:
-            self._complete(job, ST_FAILED, 1,
-                           note=f"timed out after {self.timeout}s")
-        else:
-            rc = proc.returncode if proc.returncode is not None else 1
-            job.raw_ec = rc
-            self._complete(job, ST_DONE if rc == 0 else ST_FAILED,
-                           0 if rc == 0 else 1)
+        rc = proc.returncode if proc.returncode is not None else 1
+        return rc, timed_out
 
     async def _pump(self, job: Job, proc: asyncio.subprocess.Process) -> None:
         """Read job output in chunks, splitting on \\r and \\n so progress
@@ -766,6 +821,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="max concurrent updates (default 8)")
     p.add_argument("--timeout", type=int, default=900,
                    help="per-job watchdog seconds; 0 disables (default 900)")
+    p.add_argument("--retries", type=int, default=1,
+                   help="retry a failed update up to N times (default 1; "
+                        "0 disables; timeouts are never retried)")
+    p.add_argument("--retry-delay", type=float, default=10.0,
+                   help="seconds between retries (default 10)")
+    p.add_argument("--fix", choices=("0", "1"), default="1",
+                   help="run the one-shot fix command after retries are "
+                        "exhausted (default 1; 0 disables)")
     p.add_argument("--skip", default="",
                    help="comma-separated known-tool names to skip")
     p.add_argument("--mode", choices=("auto", "live", "plain"), default="auto",
@@ -804,7 +867,10 @@ async def amain(argv: list[str]) -> int:
 
     with open(args.results_file, "w", encoding="utf-8") as results:
         executor = Executor(jobs, args.parallel, args.timeout, skip,
-                            results, renderer)
+                            results, renderer,
+                            retries=args.retries,
+                            retry_delay=args.retry_delay,
+                            do_fix=(args.fix == "1"))
         await renderer.start()
         try:
             await executor.run()

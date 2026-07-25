@@ -293,6 +293,200 @@ class TestEmitLines(unittest.TestCase):
         bulk_npm = [l for l in lines if self.parts(l)[0] == "bulk" and self.parts(l)[1] == "npm"]
         self.assertEqual(len(bulk_npm), 1)
 
+class TestDeriveFixCommand(unittest.TestCase):
+    def d(self, cmd, kind="known", name="tool", fix_cfg=None):
+        from lib_update_all_clis import derive_fix_command
+        return derive_fix_command(kind, name, cmd, fix_cfg)
+
+    def test_npm_update(self):
+        self.assertEqual(self.d("npm update -g @google/gemini-cli"),
+                         "npm install -g @google/gemini-cli@latest --force")
+
+    def test_npm_with_shell_suffix(self):
+        self.assertEqual(self.d("npm update -g cline 2>/dev/null || true"),
+                         "npm install -g cline@latest --force")
+
+    def test_npm_pinned_tag_not_doubled(self):
+        self.assertEqual(self.d("npm update -g foo@latest"),
+                         "npm install -g foo@latest --force")
+
+    def test_brew_upgrade(self):
+        self.assertEqual(self.d("brew upgrade bat"), "brew reinstall bat")
+
+    def test_brew_with_flags(self):
+        self.assertEqual(self.d("brew upgrade --cask obsidian 2>/dev/null || true"),
+                         "brew reinstall obsidian")
+
+    def test_uv_tool_upgrade(self):
+        self.assertEqual(self.d("uv tool upgrade agy 2>/dev/null || true"),
+                         "uv tool install agy --force --reinstall")
+
+    def test_pipx_upgrade(self):
+        self.assertEqual(self.d("pipx upgrade httpie"), "pipx reinstall httpie")
+
+    def test_cargo_install_forced(self):
+        self.assertEqual(self.d("cargo install eza --locked"),
+                         "cargo install eza --locked --force")
+
+    def test_gem_update(self):
+        self.assertEqual(self.d("gem update foo"),
+                         "gem install foo --user-install")
+
+    def test_go_install_is_self_healing(self):
+        self.assertEqual(self.d("go install example.com/x/tool@latest"), "")
+
+    def test_self_updater_has_no_fix(self):
+        self.assertEqual(self.d("claude update"), "")
+
+    def test_flag_not_captured_as_package(self):
+        # `gem update --user-install` is a whole-manager sweep, not a package.
+        self.assertEqual(self.d("gem update --user-install"), "")
+
+    def test_bulk_gets_no_auto_fix(self):
+        self.assertEqual(self.d("npm update -g foo", kind="bulk", name="npm"), "")
+
+    def test_config_fix_wins(self):
+        self.assertEqual(
+            self.d("brew upgrade bat", fix_cfg={"tool": "my custom fix"}),
+            "my custom fix")
+
+    def test_config_fix_applies_to_bulk(self):
+        self.assertEqual(
+            self.d("npm update -g", kind="bulk", name="npm",
+                   fix_cfg={"npm": "npm cache clean --force && npm update -g"}),
+            "npm cache clean --force && npm update -g")
+
+    def test_config_fix_identical_to_cmd_suppressed(self):
+        # A configured fix that just reruns the failing command is a
+        # disguised extra retry, not a repair.
+        self.assertEqual(
+            self.d("brew upgrade bat", fix_cfg={"tool": "brew  upgrade  bat"}),
+            "")
+
+    def test_unknown_value_taking_flag_bails(self):
+        # `--registry` consumes the next token; deriving would reinstall
+        # the flag's value as a "package".
+        self.assertEqual(
+            self.d("npm update -g --registry https://registry.example pkg"),
+            "")
+        self.assertEqual(self.d("cargo install --version 1.2.3 foo"), "")
+
+    def test_self_contained_flag_value_ok(self):
+        self.assertEqual(
+            self.d("npm update -g --loglevel=silent pkg"),
+            "npm install -g pkg@latest --force")
+
+    def test_multiple_packages_bail(self):
+        self.assertEqual(self.d("brew upgrade rbenv ruby-build"), "")
+
+    def test_derived_fix_identical_to_cmd_suppressed(self):
+        self.assertEqual(self.d("cargo install eza --locked --force"), "")
+
+    def test_npm_without_global_flag_bails(self):
+        self.assertEqual(self.d("npm update pkg"), "")
+
+
+class TestEmitLinesFixField(unittest.TestCase):
+    def setUp(self):
+        self.cache_path = tempfile.mktemp(suffix=".json")
+        with open(self.cache_path, "w") as f:
+            json.dump([
+                {"name": "bar", "origin": "npm"},
+                {"scanned_at": "2026-01-01T00:00:00Z", "count": 1},
+            ], f)
+
+    def tearDown(self):
+        if os.path.isfile(self.cache_path):
+            os.unlink(self.cache_path)
+
+    def test_known_line_carries_fix(self):
+        cfg = {"known": {"bar": "npm update -g bar || true"},
+               "bulk": {"npm": "npm update -g || true"}}
+        lines = collect_emit_lines(self.cache_path, cfg, None, None)
+        bar = next(l for l in lines if l.split(EMIT_SEP)[1] == "bar")
+        self.assertEqual(bar.split(EMIT_SEP)[4],
+                         "npm install -g bar@latest --force")
+
+    def test_bulk_line_has_empty_fix_without_config(self):
+        cfg = {"known": {}, "bulk": {"npm": "npm update -g || true"}}
+        lines = collect_emit_lines(self.cache_path, cfg, None, None)
+        bulk = next(l for l in lines if l.split(EMIT_SEP)[0] == "bulk")
+        self.assertEqual(bulk.split(EMIT_SEP)[4], "")
+
+    def test_config_fix_reaches_emit_line(self):
+        cfg = {"known": {"bar": "bar self-update"},
+               "bulk": {"npm": "npm update -g || true"},
+               "fix": {"bar": "npm install -g bar --force"}}
+        lines = collect_emit_lines(self.cache_path, cfg, None, None)
+        bar = next(l for l in lines if l.split(EMIT_SEP)[1] == "bar")
+        self.assertEqual(bar.split(EMIT_SEP)[4], "npm install -g bar --force")
+
+
+class TestOriginFromTargetPath(unittest.TestCase):
+    def t(self, target):
+        from lib_update_all_clis import _origin_from_target_path
+        return _origin_from_target_path(target)
+
+    def test_uv_tools(self):
+        self.assertEqual(
+            self.t("/Users/u/.local/share/uv/tools/httpie/bin/http"), "uv")
+
+    def test_pipx_venvs(self):
+        self.assertEqual(
+            self.t("/Users/u/.local/share/pipx/venvs/x/bin/x"), "pipx")
+
+    def test_homebrew_cellar(self):
+        self.assertEqual(self.t("/opt/homebrew/Cellar/bat/0.24.0/bin/bat"),
+                         "brew")
+
+    def test_node_modules(self):
+        self.assertEqual(
+            self.t("/Users/u/.npm-global/lib/node_modules/x/bin/x.js"), "npm")
+
+    def test_pnpm(self):
+        self.assertEqual(self.t("/Users/u/Library/pnpm/nodejs/22/bin/x"), "pnpm")
+
+    def test_pnpm_global_node_modules_not_npm(self):
+        # pnpm's global tree contains node_modules; it must map to pnpm,
+        # not fall through to the generic node_modules → npm rule.
+        self.assertEqual(
+            self.t("/Users/u/Library/pnpm/global/5/node_modules/x/bin/x.js"),
+            "pnpm")
+
+    def test_yarn_global(self):
+        self.assertEqual(
+            self.t("/Users/u/.config/yarn/global/node_modules/x/bin/x.js"),
+            "yarn")
+
+    def test_cargo_substring_not_matched(self):
+        # "cargo" in an unrelated path must not infer the cargo origin.
+        self.assertIsNone(self.t("/Users/u/projects/cargo-tools/bin/x"))
+
+    def test_bun(self):
+        self.assertEqual(self.t("/Users/u/.bun/install/global/x"), "bun")
+
+    def test_mise(self):
+        self.assertEqual(
+            self.t("/Users/u/.local/share/mise/installs/node/22/bin/node"),
+            "mise")
+
+    def test_unknown(self):
+        self.assertIsNone(self.t("/usr/local/opt/something/bin/x"))
+
+
+class TestValidateFixSection(unittest.TestCase):
+    def test_valid_fix(self):
+        validate({"known": {}, "bulk": {}, "fix": {"a": "cmd"}})
+
+    def test_fix_not_dict(self):
+        with self.assertRaises(ValueError):
+            validate({"known": {}, "bulk": {}, "fix": ["a"]})
+
+    def test_fix_value_not_string(self):
+        with self.assertRaises(ValueError):
+            validate({"known": {}, "bulk": {}, "fix": {"a": 1}})
+
+
 class TestUpdateCacheVersions(unittest.TestCase):
     def test_update_known_versions(self):
         """Test updating versions for known tools."""
