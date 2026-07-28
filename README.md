@@ -6,6 +6,8 @@
 
 Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning), and [`tui_update_all_clis.py`](tui_update_all_clis.py) (the live dashboard executor — see "Live TUI dashboard" below).
 
+> **Prefer something thinner?** See [`migration/`](migration/) for a Topgrade + residual-script setup that covers the same managers and AI self-updaters without the discovery engine. The full stack above remains the default.
+
 ## Supported update mechanisms
 
 ### Bulk (package-manager-level)

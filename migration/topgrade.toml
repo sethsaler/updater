@@ -1,0 +1,91 @@
+# Topgrade config for the update-all-clis → hybrid migration.
+#
+# Install:
+#   cp migration/topgrade.toml "${XDG_CONFIG_HOME:-$HOME/.config}/topgrade.toml"
+#
+# Docs / full knobs:
+#   https://github.com/topgrade-rs/topgrade/blob/main/config.example.toml
+#
+# Philosophy: Topgrade owns every real package manager. The residual script
+# (update_ai_clis.sh) owns self-updaters and explicit go-install tools that no
+# manager bulk-updates correctly.
+
+[misc]
+# Don't assume yes on destructive prompts the first few runs; flip to true once trusted.
+assume_yes = false
+# Don't abort the whole run when a flaky step fails.
+ignore_failures = ["microsoft_office", "gem", "ruby_gems", "system"]
+# Useful on laptops; Topgrade skips some steps when on battery unless forced.
+# run_in_tmux = false
+# cleanup = true
+
+# microsoft_office is handled by a custom command that quits apps first
+# (see [commands] "Microsoft Office (quit apps + msupdate)"). The built-in
+# step is disabled so we don't run msupdate twice.
+disable = [
+  "microsoft_office",
+  # "system",      # macOS softwareupdate — slow / interactive
+  # "emacs",
+  # "vim",
+  # "containers",  # docker image pulls
+]
+
+# Only run a subset when debugging:
+# only = ["brew", "node", "cargo", "uv", "rustup"]
+
+[linux]
+# ignored on macOS
+
+[windows]
+# ignored on macOS
+
+# ---------------------------------------------------------------------------
+# Quit Office/Teams before msupdate (Topgrade has no built-in "quit apps").
+# Set QUIT_OFFICE_RELAUNCH=1 in the command if you want Teams/etc. reopened
+# after a successful update. QUIT_OFFICE_FORCE=1 force-kills stubborn apps.
+# ---------------------------------------------------------------------------
+[pre_commands]
+# Optional: quit early so later brew cask upgrades also see apps closed.
+# Comment out if you only want quit immediately before msupdate (the custom
+# command below always quits on its own).
+# "Quit Microsoft Office apps" = "/Users/sethsaler/Documents/GitHub/updater/migration/quit_office_apps.sh"
+
+# ---------------------------------------------------------------------------
+# Custom steps that Topgrade may not enable by default on your install, but
+# that map 1:1 to bulk origins in tool_config.json.
+# These run as named steps in the Topgrade UI.
+# ---------------------------------------------------------------------------
+[commands]
+# Replaces built-in microsoft_office: graceful quit → msupdate --install
+# Relaunch after: prefix with QUIT_OFFICE_RELAUNCH=1
+"Microsoft Office (quit apps + msupdate)" = "/Users/sethsaler/Documents/GitHub/updater/migration/quit_office_apps.sh --update"
+
+# pnpm / yarn globals (Topgrade's node step is npm-centric on many setups)
+"pnpm globals" = "command -v pnpm >/dev/null && pnpm update -g || true"
+"yarn globals" = "command -v yarn >/dev/null && yarn global upgrade || true"
+
+# Explicit uv self + all tools (redundant if Topgrade's uv step is on; harmless)
+"uv self + tools" = "command -v uv >/dev/null && uv self update && uv tool upgrade --all || true"
+
+# Optional managers from tool_config bulk — no-op when missing
+"pipx upgrade-all" = "command -v pipx >/dev/null && pipx upgrade-all || true"
+"krew" = "command -v kubectl >/dev/null && kubectl krew upgrade || true"
+"dotnet tools" = "command -v dotnet >/dev/null && dotnet tool update --global || true"
+"fnm" = "command -v fnm >/dev/null && fnm update || true"
+"proto" = "command -v proto >/dev/null && proto update || true"
+"volta" = "command -v volta >/dev/null && volta update || true"
+"rye" = "command -v rye >/dev/null && rye self update || true"
+"foundry" = "command -v foundryup >/dev/null && foundryup || true"
+"aqua" = "command -v aqua >/dev/null && aqua update || true"
+"asdf" = "command -v asdf >/dev/null && asdf update || true"
+
+# ---------------------------------------------------------------------------
+# After managers finish, run the thin residual (AI self-updaters + go tools).
+# Adjust the path to this checkout.
+# Comment out if you prefer to run update_ai_clis.sh separately / on a schedule.
+# ---------------------------------------------------------------------------
+[post_commands]
+"AI / self-updating CLIs" = "~/Documents/GitHub/updater/migration/update_ai_clis.sh"
+
+# Optional: email digest via existing Agent Mail helper after everything
+# "Email update summary" = "~/Documents/GitHub/updater/scripts/agentmail_send_update_summary.sh"
