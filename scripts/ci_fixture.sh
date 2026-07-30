@@ -49,4 +49,9 @@ sys.exit(1)
 
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py' -q
 
+# Executor parity gate: the Python executor (single executor for all real
+# runs) and the legacy bash executor must agree on records, tallies, and
+# (at parallel=1) stdout for an identical plan.
+bash "$ROOT/tests/executor_parity.sh"
+
 echo "ci_fixture: ok"

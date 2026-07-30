@@ -4,15 +4,21 @@ import json, os, sys, tempfile, unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 from lib_update_all_clis import (
-    EMIT_SEP, _parse_csv, ack_unknown, collect_emit_lines, create_backup,
-    emit_plan_json, list_backups, load_merge, lock_group_for, log_unknowns,
-    parse_npm_globals_json, report_unknown, restore_backup,
+    EMIT_SEP, _parse_csv, collect_emit_lines, create_backup,
+    list_backups, load_merge, lock_group_for, log_unknowns,
+    parse_npm_globals_json, restore_backup,
     convert_tools_array_to_json, update_cache_versions, validate,
     validate_cache,
     format_history, group_history_by_run, historical_mean_durations,
     history_append, load_history_by_name, load_history_records,
     quarantined_names,
     _stdout_signals_uptodate, precheck_candidate_origins, run_prechecks,
+    run_known_prechecks, known_precheck_candidates,
+    _known_pkg_from_cmd, _npm_outdated_names, _brew_outdated_names,
+    _norm_version, _pypi_latest_versions, normalize_hold_entries_major,
+    scan_dirs_config_rows, cache_tool_names, format_tool_list, lines_to_json,
+    unknown_log_summary, build_insights, format_insights,
+    doctor_prune_suggestions,
     incremental_scan_merge, parse_scan_rows, _scan_dir_entries,
     normalize_hold_entries, edit_local_hold, format_run_summary,
     is_major_upgrade, leading_major,
@@ -781,39 +787,6 @@ class TestCachedVersions(unittest.TestCase):
         shutil.rmtree(dirpath, ignore_errors=True)
 
 
-class TestHoldLock(unittest.TestCase):
-    def test_busy_then_acquire(self):
-        import subprocess, time
-        import shutil
-        dirpath = tempfile.mkdtemp()
-        self.addCleanup(lambda: shutil.rmtree(dirpath, ignore_errors=True))
-        lockfile = os.path.join(dirpath, "sub.lock")
-        lib = os.path.join(REPO_ROOT, "lib_update_all_clis.py")
-        py = sys.executable
-
-        holder = subprocess.Popen([py, lib, "hold-lock", lockfile],
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            self.assertEqual(holder.stdout.readline().decode().strip(), "LOCKED")
-            # Non-blocking attempt while held must report BUSY (exit 2).
-            r = subprocess.run([py, lib, "try-hold-lock", lockfile],
-                               capture_output=True, text=True)
-            self.assertEqual(r.stdout.strip(), "BUSY")
-            self.assertEqual(r.returncode, 2)
-        finally:
-            holder.terminate()
-            holder.wait()
-
-        # After release, a fresh non-blocking attempt acquires (LOCKED).
-        r = subprocess.Popen([py, lib, "try-hold-lock", lockfile],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            self.assertEqual(r.stdout.readline().decode().strip(), "LOCKED")
-        finally:
-            r.terminate()
-            r.wait()
-
-
 class TestHistoryAppend(unittest.TestCase):
     def setUp(self):
         self.dirpath = tempfile.mkdtemp()
@@ -1138,6 +1111,716 @@ class TestRunPrechecks(unittest.TestCase):
         cfg = {"known": {}, "bulk": {}, "check": {"npm": "true", "brew": "true"}}
         self.assertEqual(precheck_candidate_origins(cfg, only_origins="npm"), ["npm"])
         self.assertEqual(precheck_candidate_origins(cfg, skip_origins="npm"), ["brew"])
+
+
+class TestKnownPkgFromCmd(unittest.TestCase):
+    def test_npm_global(self):
+        self.assertEqual(
+            _known_pkg_from_cmd("npm update -g cline 2>/dev/null"),
+            ("npm", "cline"),
+        )
+
+    def test_npm_scoped_and_pinned(self):
+        self.assertEqual(
+            _known_pkg_from_cmd("npm update -g @browserbasehq/cli 2>/dev/null"),
+            ("npm", "@browserbasehq/cli"),
+        )
+        self.assertEqual(
+            _known_pkg_from_cmd("npm install -g cline@latest"),
+            ("npm", "cline"),
+        )
+
+    def test_npm_without_global_flag_rejected(self):
+        self.assertIsNone(_known_pkg_from_cmd("npm update cline"))
+
+    def test_brew(self):
+        self.assertEqual(
+            _known_pkg_from_cmd("brew upgrade bat 2>/dev/null"),
+            ("brew", "bat"),
+        )
+
+    def test_uv(self):
+        self.assertEqual(
+            _known_pkg_from_cmd("uv tool upgrade ruff 2>/dev/null"),
+            ("uv", "ruff"),
+        )
+
+    def test_cargo(self):
+        self.assertEqual(
+            _known_pkg_from_cmd("cargo install eza --locked 2>/dev/null"),
+            ("cargo", "eza"),
+        )
+
+    def test_rejected_shapes(self):
+        # self-updaters, multi-package, unknown flags, --all, other managers
+        self.assertIsNone(_known_pkg_from_cmd("claude update 2>/dev/null"))
+        self.assertIsNone(_known_pkg_from_cmd("npm update -g a b"))
+        self.assertIsNone(_known_pkg_from_cmd("npm update -g --registry https://x cline"))
+        self.assertIsNone(_known_pkg_from_cmd("uv self update && uv tool upgrade --all"))
+        self.assertIsNone(_known_pkg_from_cmd("uv tool upgrade --all"))
+        self.assertIsNone(_known_pkg_from_cmd("go install golang.org/x/tools/gopls@latest"))
+        self.assertIsNone(_known_pkg_from_cmd("gem update rake --user-install"))
+        self.assertIsNone(_known_pkg_from_cmd(""))
+
+
+class TestOutdatedListParsers(unittest.TestCase):
+    def test_npm_parseable(self):
+        out = (
+            "/usr/local/lib/node_modules/cline:cline@3.0.3:cline@3.0.2:\n"
+            "/usr/local/lib/node_modules/@browserbasehq/cli:@browserbasehq/cli@0.6.0:@browserbasehq/cli@0.5.7:\n"
+        )
+        self.assertEqual(
+            _npm_outdated_names(out), {"cline", "@browserbasehq/cli"})
+
+    def test_npm_garbage_lines_ignored(self):
+        self.assertEqual(_npm_outdated_names(""), set())
+        self.assertEqual(_npm_outdated_names("no-colon-here\n\n"), set())
+
+    def test_brew_quiet(self):
+        self.assertEqual(_brew_outdated_names("bat\nfzf\n"), {"bat", "fzf"})
+        self.assertEqual(_brew_outdated_names(""), set())
+
+
+class TestNormVersion(unittest.TestCase):
+    def test_equalities(self):
+        self.assertEqual(_norm_version("1.2.3"), _norm_version("1.2.3"))
+        self.assertEqual(_norm_version("v1.2.3"), _norm_version("1.2.3"))
+        self.assertEqual(_norm_version("1.2"), _norm_version("1.2.0"))
+        self.assertEqual(
+            _norm_version("uv 0.11.14 (3fdfdc7d4)"), _norm_version("0.11.14"))
+
+    def test_inequalities(self):
+        self.assertNotEqual(_norm_version("1.2.3"), _norm_version("1.2.4"))
+        self.assertNotEqual(
+            _norm_version("1.2.3-rc.1"), _norm_version("1.2.3"))
+
+    def test_unparseable_returns_none(self):
+        # Callers must treat None as "cannot compare" (fail open): the
+        # equality short-circuit lives in run_known_prechecks' `is not None`
+        # guards, so unparseable versions never cause a skip.
+        self.assertIsNone(_norm_version("?"))
+        self.assertIsNone(_norm_version(None))
+        self.assertIsNone(_norm_version(""))
+
+
+class TestRunKnownPrechecks(unittest.TestCase):
+    def setUp(self):
+        self.dirpath = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(self.dirpath, ignore_errors=True))
+        self.cache_path = os.path.join(self.dirpath, "cache.json")
+        tools = [
+            {"name": "cline", "origin": "npm"},
+            {"name": "bat", "origin": "brew"},
+            {"name": "ruff", "origin": "uv"},
+            {"name": "claude", "origin": "npm"},  # self-updater: never a candidate
+        ]
+        with open(self.cache_path, "w") as f:
+            json.dump(tools, f)
+        self.cfg = {
+            "known": {
+                "cline": "npm update -g cline 2>/dev/null",
+                "bat": "brew upgrade bat 2>/dev/null",
+                "ruff": "uv tool upgrade ruff 2>/dev/null",
+                "claude": "claude update 2>/dev/null",
+            },
+            "bulk": {},
+        }
+
+    def test_npm_membership_skip(self):
+        # cline NOT in the outdated list -> skipped; bat/uv untouched (no
+        # usable brew/uv signal here).
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={},
+            check_stdouts={"npm": "/x/cline:other@2.0:other@1.0:\n"},
+        )
+        self.assertEqual(res, {"cline": 0.0})
+
+    def test_npm_outdated_tool_not_skipped(self):
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={},
+            check_stdouts={"npm": "/x/cline:cline@3.0.3:cline@3.0.2:\n"},
+        )
+        self.assertEqual(res, {})
+
+    def test_npm_untrusted_when_check_failed(self):
+        # Empty stdout + npm not confirmed up to date = the npm check never
+        # produced a usable list (e.g. offline) -> fail open, nothing skipped.
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={}, check_stdouts={"npm": ""},
+        )
+        self.assertEqual(res, {})
+
+    def test_npm_all_current_when_origin_uptodate(self):
+        # Bulk npm check confirmed everything current (exit 0, empty list).
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={"npm": 1.2}, check_stdouts={"npm": ""},
+        )
+        self.assertEqual(res, {"cline": 0.0})
+
+    def test_brew_membership_skip(self):
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={}, check_stdouts={"brew": "fzf\n"},
+        )
+        self.assertEqual(res, {"bat": 0.0})
+
+    def test_uv_version_equality(self):
+        import lib_update_all_clis as m
+        orig_inst, orig_latest = m._uv_installed_versions, m._pypi_latest_versions
+        m._uv_installed_versions = lambda: {"ruff": "0.4.1"}
+        m._pypi_latest_versions = lambda pkgs, cache_path=None: {"ruff": "0.4.1"}
+        try:
+            res = run_known_prechecks(self.cache_path, self.cfg)
+        finally:
+            m._uv_installed_versions, m._pypi_latest_versions = orig_inst, orig_latest
+        self.assertIn("ruff", res)
+
+    def test_uv_newer_available_not_skipped(self):
+        import lib_update_all_clis as m
+        orig_inst, orig_latest = m._uv_installed_versions, m._pypi_latest_versions
+        m._uv_installed_versions = lambda: {"ruff": "0.4.0"}
+        m._pypi_latest_versions = lambda pkgs, cache_path=None: {"ruff": "0.4.1"}
+        try:
+            res = run_known_prechecks(self.cache_path, self.cfg)
+        finally:
+            m._uv_installed_versions, m._pypi_latest_versions = orig_inst, orig_latest
+        self.assertNotIn("ruff", res)
+
+    def test_uv_lookup_failure_fails_open(self):
+        import lib_update_all_clis as m
+        orig_inst, orig_latest = m._uv_installed_versions, m._pypi_latest_versions
+        m._uv_installed_versions = lambda: {}
+        m._pypi_latest_versions = lambda pkgs, cache_path=None: {}
+        try:
+            res = run_known_prechecks(self.cache_path, self.cfg)
+        finally:
+            m._uv_installed_versions, m._pypi_latest_versions = orig_inst, orig_latest
+        self.assertEqual(res, {})
+
+    def test_cargo_version_equality_and_fail_open(self):
+        import lib_update_all_clis as m
+        tools = [{"name": "eza", "origin": "cargo"}]
+        with open(self.cache_path, "w") as f:
+            json.dump(tools, f)
+        cfg = {"known": {"eza": "cargo install eza --locked 2>/dev/null"}, "bulk": {}}
+        orig_inst, orig_latest = m._cargo_installed_versions, m._crates_latest_versions
+        try:
+            m._cargo_installed_versions = lambda: {"eza": "0.23.5"}
+            m._crates_latest_versions = lambda pkgs, cache_path=None: {"eza": "0.23.5"}
+            self.assertIn("eza", run_known_prechecks(self.cache_path, cfg))
+            m._crates_latest_versions = lambda pkgs, cache_path=None: {"eza": "0.24.0"}
+            self.assertEqual(run_known_prechecks(self.cache_path, cfg), {})
+            # Unparseable/missing installs fail open (no cargo on this machine).
+            m._cargo_installed_versions = lambda: {}
+            m._crates_latest_versions = lambda pkgs, cache_path=None: {"eza": "0.23.5"}
+            self.assertEqual(run_known_prechecks(self.cache_path, cfg), {})
+        finally:
+            m._cargo_installed_versions, m._crates_latest_versions = orig_inst, orig_latest
+
+    def test_skip_names_and_origin_filters(self):
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={"npm": 1.0}, check_stdouts={},
+            skip_names={"cline"},
+        )
+        self.assertEqual(res, {})
+        res = run_known_prechecks(
+            self.cache_path, self.cfg,
+            uptodate_bulk={}, check_stdouts={"npm": ""},
+            only_origins="brew",
+        )
+        self.assertEqual(res, {})
+
+    def test_candidates_listing(self):
+        names = known_precheck_candidates(self.cache_path, self.cfg)
+        self.assertEqual(names, ["bat", "cline", "ruff"])  # claude excluded
+
+
+class TestPypiLatestCache(unittest.TestCase):
+    def test_ttl_cache_roundtrip(self):
+        import lib_update_all_clis as m
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_file = os.path.join(dirpath, "latest.json")
+        os.environ["UAC_KNOWN_LATEST_CACHE"] = cache_file
+        self.addCleanup(lambda: os.environ.pop("UAC_KNOWN_LATEST_CACHE", None))
+        calls = []
+        orig = m._pypi_latest_version
+        m._pypi_latest_version = lambda pkg, timeout=10: calls.append(pkg) or "1.0.0"
+        try:
+            out1 = _pypi_latest_versions({"ruff"}, None)
+            out2 = _pypi_latest_versions({"ruff"}, None)  # served from cache
+        finally:
+            m._pypi_latest_version = orig
+        self.assertEqual(out1, {"ruff": "1.0.0"})
+        self.assertEqual(out2, {"ruff": "1.0.0"})
+        self.assertEqual(calls, ["ruff"])  # fetched once
+
+    def test_failures_cached_as_null_but_never_returned(self):
+        import lib_update_all_clis as m
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_file = os.path.join(dirpath, "latest.json")
+        os.environ["UAC_KNOWN_LATEST_CACHE"] = cache_file
+        self.addCleanup(lambda: os.environ.pop("UAC_KNOWN_LATEST_CACHE", None))
+        calls = []
+        orig = m._pypi_latest_version
+        m._pypi_latest_version = lambda pkg, timeout=10: calls.append(pkg) or None
+        try:
+            out1 = _pypi_latest_versions({"git-only-pkg"}, None)
+            out2 = _pypi_latest_versions({"git-only-pkg"}, None)
+        finally:
+            m._pypi_latest_version = orig
+        self.assertEqual(out1, {})
+        self.assertEqual(out2, {})
+        self.assertEqual(calls, ["git-only-pkg"])  # null cached: one fetch total
+
+
+class TestCollectEmitLinesKnownPrecheck(unittest.TestCase):
+    def _cache(self, tools):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump(tools, f)
+        return cache_path
+
+    def test_known_uptodate_becomes_uptodate_line(self):
+        cache_path = self._cache([{"name": "cline", "origin": "npm"}])
+        cfg = {"known": {"cline": "npm update -g cline"}, "bulk": {}}
+        lines = collect_emit_lines(
+            cache_path, cfg, None, None,
+            precheck_uptodate_known={"cline": 0.0},
+        )
+        self.assertEqual(len(lines), 1)
+        parts = lines[0].split(EMIT_SEP)
+        self.assertEqual(parts[0], "uptodate")
+        self.assertEqual(parts[1], "cline")
+        self.assertEqual(parts[2], "0.0")
+
+    def test_held_wins_over_known_precheck(self):
+        cache_path = self._cache([{"name": "cline", "origin": "npm"}])
+        cfg = {"known": {"cline": "npm update -g cline"}, "bulk": {},
+               "hold": ["cline"]}
+        lines = collect_emit_lines(
+            cache_path, cfg, None, None,
+            held_config={"cline"},
+            precheck_uptodate_known={"cline": 0.0},
+        )
+        self.assertEqual(lines[0].split(EMIT_SEP)[0], "held")
+
+    def test_quarantine_wins_over_known_precheck(self):
+        cache_path = self._cache([{"name": "cline", "origin": "npm"}])
+        history_path = os.path.join(self.dirpath if hasattr(self, "dirpath") else tempfile.mkdtemp(), "history.jsonl")
+        with open(history_path, "w") as f:
+            for _ in range(3):
+                f.write(json.dumps({"name": "cline", "status": "fail"}) + "\n")
+        cfg = {"known": {"cline": "npm update -g cline"}, "bulk": {}}
+        lines = collect_emit_lines(
+            cache_path, cfg, None, None,
+            history_path=history_path,
+            precheck_uptodate_known={"cline": 0.0},
+        )
+        self.assertEqual(lines[0].split(EMIT_SEP)[0], "quarantined")
+
+    def test_bulk_and_known_maps_are_independent(self):
+        # A known-tool entry named like an origin must not uptodate the bulk
+        # line, and vice versa.
+        cache_path = self._cache([
+            {"name": "cline", "origin": "npm"},
+            {"name": "other", "origin": "npm"},
+        ])
+        cfg = {"known": {"cline": "npm update -g cline"},
+               "bulk": {"npm": "npm update -g"}}
+        lines = collect_emit_lines(
+            cache_path, cfg, None, None,
+            precheck_uptodate_known={"npm": 0.0},   # bogus known entry "npm"
+            precheck_uptodate={"cline": 0.0},       # bogus bulk entry "cline"
+        )
+        kinds = {ln.split(EMIT_SEP)[1]: ln.split(EMIT_SEP)[0] for ln in lines}
+        self.assertEqual(kinds.get("cline"), "known")
+        self.assertEqual(kinds.get("npm"), "bulk")
+
+
+class TestMajorHolds(unittest.TestCase):
+    def setUp(self):
+        self.dirpath = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(self.dirpath, ignore_errors=True))
+        self.cache_path = os.path.join(self.dirpath, "cache.json")
+        with open(self.cache_path, "w") as f:
+            json.dump([{"name": "cline", "origin": "npm"},
+                       {"name": "bat", "origin": "brew"},
+                       {"name": "ruff", "origin": "uv"},
+                       {"name": "claude", "origin": "npm"}], f)
+
+    def _cfg(self, hold):
+        return {
+            "known": {
+                "cline": "npm update -g cline 2>/dev/null",
+                "bat": "brew upgrade bat 2>/dev/null",
+                "ruff": "uv tool upgrade ruff 2>/dev/null",
+                "claude": "claude update 2>/dev/null",
+            },
+            "bulk": {},
+            "hold": hold,
+        }
+
+    def test_normalize_major(self):
+        self.assertEqual(normalize_hold_entries_major(["cline:major", "bat"]), {"cline"})
+        self.assertEqual(normalize_hold_entries_major(None), set())
+        self.assertEqual(normalize_hold_entries_major(["cline"]), set())
+
+    def test_npm_block_on_major_jump(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["cline:major"])
+        res = m.resolve_major_holds(
+            self.cache_path, cfg, None, {},
+            {"npm": "/x/cline:cline@3.0.0:cline@2.9.0:\n"},
+            probe_installed=lambda name: "2.9.0",
+        )
+        self.assertEqual(res["block"], {"cline": {"source": "config", "target": "3.0.0"}})
+        self.assertEqual(res["allow"], [])
+
+    def test_npm_allow_on_minor_jump(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["cline:major"])
+        res = m.resolve_major_holds(
+            self.cache_path, cfg, None, {},
+            {"npm": "/x/cline:cline@2.9.1:cline@2.9.0:\n"},
+            probe_installed=lambda name: "2.9.0",
+        )
+        self.assertEqual(res["block"], {})
+        self.assertEqual(res["allow"], ["cline"])
+
+    def test_npm_allow_when_not_outdated(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["cline:major"])
+        res = m.resolve_major_holds(
+            self.cache_path, cfg, None, {"npm": 1.0}, {"npm": ""},
+            probe_installed=lambda name: "2.9.0",
+        )
+        self.assertEqual(res["allow"], ["cline"])
+
+    def test_npm_fallback_to_npm_view(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["cline:major"])
+        orig = m._npm_latest_versions
+        m._npm_latest_versions = lambda pkgs: {"cline": "3.0.0"}
+        try:
+            # No sidecar signal (e.g. --no-precheck): npm view fallback.
+            res = m.resolve_major_holds(
+                self.cache_path, cfg, None, {}, {},
+                probe_installed=lambda name: "2.9.0",
+            )
+        finally:
+            m._npm_latest_versions = orig
+        self.assertEqual(res["block"]["cline"]["target"], "3.0.0")
+
+    def test_unknown_when_unverifiable(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["claude:major"])  # self-updater: no registry
+        res = m.resolve_major_holds(
+            self.cache_path, cfg, None, {}, {},
+            probe_installed=lambda name: "1.0.0",
+        )
+        self.assertEqual(res["unknown"], ["claude"])
+
+    def test_uv_block(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["ruff:major"])
+        orig = m._pypi_latest_versions
+        m._pypi_latest_versions = lambda pkgs, cache_path=None: {"ruff": "1.0.0"}
+        try:
+            res = m.resolve_major_holds(
+                self.cache_path, cfg, None, {}, {},
+                probe_installed=lambda name: "0.9.0",
+            )
+        finally:
+            m._pypi_latest_versions = orig
+        self.assertEqual(res["block"]["ruff"]["target"], "1.0.0")
+
+    def test_adhoc_env_source(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg([])
+        res = m.resolve_major_holds(
+            self.cache_path, cfg, "cline:major", {},
+            {"npm": "/x/cline:cline@3.0.0:cline@2.9.0:\n"},
+            probe_installed=lambda name: "2.9.0",
+        )
+        self.assertEqual(res["block"]["cline"]["source"], "env")
+
+    def test_plain_hold_takes_precedence(self):
+        import lib_update_all_clis as m
+        cfg = self._cfg(["cline", "cline:major"])
+        res = m.resolve_major_holds(
+            self.cache_path, cfg, None, {},
+            {"npm": "/x/cline:cline@3.0.0:cline@2.9.0:\n"},
+            probe_installed=lambda name: "2.9.0",
+        )
+        # Plainly held -> not resolved here at all (emit's plain hold wins).
+        self.assertEqual(res["block"], {})
+        self.assertEqual(res["allow"], [])
+        self.assertEqual(res["unknown"], [])
+
+    def test_emit_block_allow_unknown(self):
+        cfg = {"known": {"cline": "npm update -g cline"}, "bulk": {},
+               "hold": ["cline:major"]}
+        # blocked -> held line carrying major:<source>:<target>
+        lines = collect_emit_lines(
+            self.cache_path, cfg, None, None,
+            held_config_major={"cline"},
+            major_hold_blocks={"cline": {"source": "config", "target": "3.0.0"}},
+        )
+        parts = lines[0].split(EMIT_SEP)
+        self.assertEqual(parts[0], "held")
+        self.assertEqual(parts[2], "major:config:3.0.0")
+        # allowed (resolved, no block) -> normal known line
+        lines = collect_emit_lines(
+            self.cache_path, cfg, None, None,
+            held_config_major={"cline"}, major_hold_blocks={},
+        )
+        self.assertEqual(lines[0].split(EMIT_SEP)[0], "known")
+        # no resolve stage (dry-run) -> fail-safe held with unknown target
+        lines = collect_emit_lines(
+            self.cache_path, cfg, None, None,
+            held_config_major={"cline"}, major_hold_blocks=None,
+        )
+        self.assertEqual(lines[0].split(EMIT_SEP)[2], "major:config:unknown")
+
+
+class TestScanDirsConfig(unittest.TestCase):
+    def _write(self, path, obj):
+        with open(path, "w") as f:
+            json.dump(obj, f)
+
+    def test_validate_good(self):
+        validate({"known": {}, "bulk": {}, "scan_dirs": [
+            {"dir": "$HOME/.local/bin", "origin": "uv/pip"},
+            {"dir": "/opt/x", "origin": "manual", "mode": "tree"},
+        ]})
+
+    def test_validate_bad_shapes(self):
+        for bad in (
+            "notalist",
+            ["notadict"],
+            [{"origin": "npm"}],                          # missing dir
+            [{"dir": "", "origin": "npm"}],               # empty dir
+            [{"dir": "/x"}],                              # missing origin
+            [{"dir": "/x", "origin": "npm", "mode": "zip"}],  # bad mode
+        ):
+            with self.assertRaises(ValueError, msg=f"expected ValueError for {bad!r}"):
+                validate({"known": {}, "bulk": {}, "scan_dirs": bad})
+
+    def test_merge_local_appends_and_wins_same_dir(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        base = os.path.join(dirpath, "base.json")
+        local = os.path.join(dirpath, "local.json")
+        self._write(base, {"known": {}, "bulk": {}, "scan_dirs": [
+            {"dir": "/a", "origin": "manual"},
+            {"dir": "/b", "origin": "npm"},
+        ]})
+        self._write(local, {"scan_dirs": [
+            {"dir": "/b", "origin": "brew"},   # same dir: local wins
+            {"dir": "/c", "origin": "uv"},     # new dir: appended
+        ]})
+        cfg = load_merge(base, local)
+        rows = scan_dirs_config_rows(cfg)
+        self.assertEqual(rows, [("/b", "brew", "dir"), ("/c", "uv", "dir"), ("/a", "manual", "dir")])
+
+    def test_rows_mode_default_and_dedupe(self):
+        cfg = {"known": {}, "bulk": {}, "scan_dirs": [
+            {"dir": "/x", "origin": "npm"},
+            {"dir": "/x", "origin": "npm"},
+            {"dir": "/y", "origin": "mise", "mode": "tree"},
+        ]}
+        self.assertEqual(
+            scan_dirs_config_rows(cfg),
+            [("/x", "npm", "dir"), ("/y", "mise", "tree")],
+        )
+
+    def test_base_config_scan_dirs_load(self):
+        # The repo's own tool_config.json must validate and produce rows.
+        cfg = load_merge(os.path.join(REPO_ROOT, "tool_config.json"), None)
+        validate(cfg)
+        rows = scan_dirs_config_rows(cfg)
+        self.assertGreater(len(rows), 20)
+        self.assertIn(("$HOME/.local/bin", "uv/pip", "dir"), rows)
+
+
+class TestShellHelperFunctions(unittest.TestCase):
+    def setUp(self):
+        self.dirpath = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(self.dirpath, ignore_errors=True))
+
+    def test_cache_tool_names(self):
+        p = os.path.join(self.dirpath, "cache.json")
+        with open(p, "w") as f:
+            json.dump([{"name": "b"}, {"name": "a"}, {"scanned_at": "x"}], f)
+        self.assertEqual(cache_tool_names(p), ["b", "a"])
+        self.assertEqual(cache_tool_names(os.path.join(self.dirpath, "missing.json")), [])
+
+    def test_format_tool_list(self):
+        p = os.path.join(self.dirpath, "cache.json")
+        with open(p, "w") as f:
+            json.dump([
+                {"name": "b", "origin": "npm"},
+                {"name": "a", "origin": "brew"},
+                {"scanned_at": "2026-01-01T00:00:00Z", "count": 2},
+            ], f)
+        out = format_tool_list(p)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "  a  [brew]")
+        self.assertEqual(lines[1], "  b  [npm]")
+        self.assertIn("Total: 2 tools", lines[-1])
+        self.assertIn("2026-01-01", lines[-1])
+        self.assertEqual(format_tool_list(os.path.join(self.dirpath, "missing.json")), "")
+
+    def test_lines_to_json(self):
+        self.assertEqual(lines_to_json("  a  \n\n b \n"), '["a", "b"]')
+        self.assertEqual(lines_to_json(""), "[]")
+
+    def test_unknown_log_summary(self):
+        p = os.path.join(self.dirpath, "unknown.json")
+        with open(p, "w") as f:
+            json.dump({"tools": {
+                "a": {"name": "a", "acknowledged": False},
+                "b": {"name": "b", "acknowledged": True},
+                "c": {"name": "c"},
+            }}, f)
+        count, sample = unknown_log_summary(p)
+        self.assertEqual(count, 2)
+        self.assertEqual(sample, "a, c")
+        self.assertEqual(unknown_log_summary(os.path.join(self.dirpath, "missing.json")), (0, ""))
+
+
+class TestRunSummaryModes(unittest.TestCase):
+    def _snaps(self):
+        before = {"known": {"a": "1.0", "b": "1.0", "c": "1.0"},
+                  "bulk": {"npm": "10.0"}}
+        after = {"known": {"a": "2.0", "b": "1.0", "c": "1.0"},
+                 "bulk": {"npm": "10.0"}}
+        return before, after
+
+    def test_full_mode_unchanged(self):
+        before, after = self._snaps()
+        out = format_run_summary(before, after, 3, 1)
+        self.assertIn("Upgraded (1):", out)
+        self.assertIn("a: 1.0 → 2.0  [MAJOR UPGRADE]", out)
+        self.assertIn("Already up to date (3):", out)
+        self.assertIn("b, c, npm", out)
+        self.assertNotIn("Failed (", out)
+
+    def test_full_mode_with_failed_names(self):
+        before, after = self._snaps()
+        out = format_run_summary(before, after, 3, 1, failed=["b"])
+        # Full mode keeps the up-to-date list; the Failed section only
+        # appears in failures mode.
+        self.assertIn("Already up to date (3):", out)
+        self.assertNotIn("Failed (", out)
+
+    def test_failures_mode(self):
+        before, after = self._snaps()
+        out = format_run_summary(before, after, 3, 1,
+                                 new_tools=["z"], quarantined=["q"], held=["h"],
+                                 failed=["b"], mode="failures")
+        self.assertIn("Failed (1):", out)
+        self.assertIn("  b", out)
+        # Upgrades (with MAJOR flag) survive; the up-to-date list collapses.
+        self.assertIn("Upgraded (1):", out)
+        self.assertIn("a: 1.0 → 2.0  [MAJOR UPGRADE]", out)
+        self.assertIn("Already up to date: 3 (list omitted in failures mode)", out)
+        self.assertNotIn("b, c, npm", out)
+        self.assertIn("Quarantined, skipped this run (1):", out)
+        self.assertIn("Held (pinned in config), skipped this run (1):", out)
+        self.assertIn("New installs added for future runs (1):", out)
+
+    def test_failures_mode_no_failures(self):
+        before, after = self._snaps()
+        out = format_run_summary(before, after, 4, 0, failed=[], mode="failures")
+        self.assertIn("Failed (0):", out)
+        self.assertIn("  (none)", out)
+
+
+class TestInsights(unittest.TestCase):
+    def setUp(self):
+        self.dirpath = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(self.dirpath, ignore_errors=True))
+        self.history = os.path.join(self.dirpath, "history.jsonl")
+
+    def _write_history(self, recs):
+        with open(self.history, "w") as f:
+            for r in recs:
+                f.write(json.dumps(r) + "\n")
+
+    def test_empty_history(self):
+        report = build_insights(os.path.join(self.dirpath, "missing.jsonl"))
+        self.assertEqual(report["records"], 0)
+        self.assertEqual(report["slowest"], [])
+        out = format_insights(report)
+        self.assertIn("no duration data", out)
+
+    def test_analytics(self):
+        recs = []
+        for i in range(8):
+            recs.append({"name": "brew", "kind": "bulk", "status": "ok",
+                         "duration_s": 300, "version_before": "4.0", "version_after": "4.0"})
+        for i in range(5):
+            recs.append({"name": "badtool", "kind": "known", "status": "fail",
+                         "duration_s": 5, "version_before": "1.0", "version_after": "1.0"})
+        for i in range(6):
+            recs.append({"name": "churner", "kind": "known", "status": "ok",
+                         "duration_s": 10,
+                         "version_before": f"1.{i}", "version_after": f"1.{i+1}"})
+        self._write_history(recs)
+        report = build_insights(self.history)
+        self.assertEqual(report["slowest"][0]["name"], "brew")
+        self.assertEqual(report["slowest"][0]["mean_s"], 300.0)
+        self.assertEqual(report["chronic_failures"][0]["name"], "badtool")
+        self.assertEqual(report["chronic_failures"][0]["rate"], 1.0)
+        self.assertEqual(report["frequently_updated"][0]["name"], "churner")
+        self.assertEqual(report["frequently_updated"][0]["changed_runs"], 6)
+        sugg = " ".join(report["suggestions"])
+        self.assertIn("badtool fails 5/5", sugg)
+        self.assertIn("brew is the long pole", sugg)
+        self.assertIn("churner changes nearly every run", sugg)
+        out = format_insights(report)
+        self.assertIn("Slowest jobs", out)
+        self.assertIn("5m00s", out)
+
+    def test_small_sample_not_chronic(self):
+        # Fewer than 3 appearances: not enough evidence for chronic-failure.
+        self._write_history([
+            {"name": "flake", "kind": "known", "status": "fail", "duration_s": 1},
+            {"name": "flake", "kind": "known", "status": "fail", "duration_s": 1},
+        ])
+        report = build_insights(self.history)
+        self.assertEqual(report["chronic_failures"], [])
+
+
+class TestDoctorPruneSuggestions(unittest.TestCase):
+    def test_prune_suggestions(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": "seen-tool", "origin": "npm"}], f)
+        cfg = {"known": {
+            "seen-tool": "npm update -g seen-tool",
+            "definitely-not-on-path-or-cache-xyz": "npm update -g x",
+        }, "bulk": {}}
+        self.assertEqual(
+            doctor_prune_suggestions(cache_path, cfg),
+            ["definitely-not-on-path-or-cache-xyz"],
+        )
 
 
 class TestCollectEmitLinesPrecheck(unittest.TestCase):

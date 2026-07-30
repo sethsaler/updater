@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""tui_update_all_clis.py — live TUI executor for update-all-clis.
+"""tui_update_all_clis.py — the update executor for update-all-clis.
 
-Replaces the bash parallel executor in update_all_clis.sh when stdout is an
-interactive terminal: it reads the plan ("emit lines") produced by
-lib_update_all_clis.py, runs every job with the exact same semantics as the
-bash executor (parallel cap, per-origin lock-group serialization, per-job
-watchdog timeout, process-tree kills, exit-code conventions), renders a live
-dashboard while jobs run, and writes result records in the byte-exact format
-update_all_clis.sh's own executors produce — so every post-run step in the
-shell script (version snapshots, run summary, history, notify, changelog)
-works unchanged.
+This is the single executor for every real (non-dry-run) update run: it
+reads the plan ("emit lines") produced by lib_update_all_clis.py, runs every
+job with the exact same semantics as the legacy bash executor (parallel cap,
+per-origin lock-group serialization, per-job watchdog timeout, process-tree
+kills, retry + one-shot-fix policy, exit-code conventions), and writes
+result records in the byte-exact format update_all_clis.sh's own executors
+produce — so every post-run step in the shell script (version snapshots,
+run summary, history, notify, changelog) works unchanged. On an interactive
+terminal it renders the live dashboard; anywhere else (LaunchAgent, CI,
+pipes, --quiet, --no-tui) its plain renderer prints the same lines the bash
+executor would. tests/executor_parity.sh gates that equivalence in CI.
+
+The legacy in-shell executor (run_updates_parallel / run_updates_sequential
+in update_all_clis.sh) remains only for --dry-run, --trace, and the
+UAC_EXECUTOR=bash escape hatch.
 
 Stdlib only — no third-party dependencies, matching the rest of the project.
 
 Usage:
     python3 tui_update_all_clis.py \
         --emit-file PATH --results-file PATH \
-        [--parallel N] [--timeout SECONDS] [--skip a,b,c] \
+        [--parallel N] [--timeout SECONDS] [--skip a,b,c] [--quiet] \
         [--mode auto|live|plain] [--version-string X]
 
 Emit-line format (one per line, fields separated by \\x1e):
@@ -177,7 +183,14 @@ def job_detail(job: Job) -> str:
     if job.status == ST_SKIPPED:
         return job.note or "skipped"
     if job.status == ST_HELD:
-        return "held (HOLD= env)" if job.cmd == "env" else 'held (config "hold")'
+        if job.cmd == "env":
+            return "held (HOLD= env)"
+        if job.cmd.startswith("major:"):
+            src, _, tgt = job.cmd[len("major:"):].partition(":")
+            if tgt == "unknown":
+                return "held (:major pin, target unverified)"
+            return f"held (major upgrade to {tgt} blocked)"
+        return 'held (config "hold")'
     if job.status == ST_QUARANTINED:
         return f"quarantined after {job.cmd} consecutive failures"
     return ""
@@ -382,6 +395,22 @@ class BaseRenderer:
     def line_event(self, job: Job) -> None:
         pass
 
+    def retry_event(self, job: Job, attempt: int, rc: int,
+                    retry_delay: float, max_retries: int) -> None:
+        """A job failed and is about to be retried (plain renderer prints
+        the same warning line the bash executor does)."""
+        pass
+
+    def retries_exhausted_event(self, job: Job, rc: int) -> None:
+        """A job's retries are exhausted and its fix is next (plain renderer
+        prints the failure line + output tail the bash executor prints
+        before attempting the fix)."""
+        pass
+
+    def fix_event(self, job: Job) -> None:
+        """A job exhausted its retries and its one-shot fix is starting."""
+        pass
+
     async def finish(self, aborted: bool = False) -> None:
         pass
 
@@ -399,18 +428,43 @@ def _supports_live(out: IO[str]) -> bool:
 
 class PlainRenderer(BaseRenderer):
     """Line-oriented output matching the bash executor's messages. Used for
-    --mode plain and as the automatic fallback on non-terminals."""
+    --mode plain and as the automatic fallback on non-terminals. With
+    quiet=True every line is suppressed (mirrors the shell's QUIET, which
+    silences all of log/info/ok/warn)."""
 
-    def __init__(self, jobs: list[Job], version: str = "", out: IO[str] = sys.stdout):
+    def __init__(self, jobs: list[Job], version: str = "", out: IO[str] = sys.stdout,
+                 quiet: bool = False):
         super().__init__(jobs, version)
         self.out = out
+        self.quiet = quiet
         is_tty = getattr(out, "isatty", lambda: False)()
         self.style = Style(is_tty and not os.environ.get("NO_COLOR")
                            and os.environ.get("TERM", "") != "dumb")
 
     def _print(self, text: str) -> None:
+        if self.quiet:
+            return
         self.out.write(text + "\n")
         self.out.flush()
+
+    def retry_event(self, job: Job, attempt: int, rc: int,
+                    retry_delay: float, max_retries: int) -> None:
+        # Same wording as the shell's run_update retry warning ({:g} so
+        # 0.1 prints "0.1" and 10.0 prints "10", like the shell's raw value).
+        self._print(self.style.yellow("!!") + f" {job.name} failed (exit {rc}) — "
+                    f"retrying in {retry_delay:g}s "
+                    f"(retry {attempt}/{max_retries})")
+
+    def retries_exhausted_event(self, job: Job, rc: int) -> None:
+        # Same failure line + 3-line output tail the shell prints once a
+        # job's retries are exhausted, before it attempts the fix.
+        self._print(self.style.yellow("!!") + f" {job.name} failed (exit {rc})")
+        for line in list(job.tail)[-3:]:
+            self._print(f"   {line}")
+
+    def fix_event(self, job: Job) -> None:
+        # Same wording as the shell's run_update fix announcement.
+        self._print(self.style.bold("==>") + f" Attempting fix for {job.name}: {job.fix}")
 
     def job_event(self, job: Job) -> None:
         s = self.style
@@ -432,6 +486,10 @@ class PlainRenderer(BaseRenderer):
                             "it was probably waiting on something (e.g. an open app "
                             "blocking a cask upgrade, or a prompt). Other updates were "
                             "not blocked.")
+            elif job.note.startswith("fix"):
+                # "fix failed" / "fix timed out" — the shell reports both as
+                # "fix failed" with the fix attempt's output tail.
+                self._print(s.yellow("!!") + f" {job.name} fix failed")
             else:
                 shown = job.raw_ec if job.raw_ec is not None else job.ec
                 self._print(s.yellow("!!") + f" {job.name} failed (exit {shown})")
@@ -443,6 +501,20 @@ class PlainRenderer(BaseRenderer):
             if job.cmd == "env":
                 self._print(s.yellow("!!") + f" held (env HOLD=): {job.name} — "
                             "remove from HOLD= to resume this run only")
+            elif job.cmd.startswith("major:"):
+                # cmd is major:<source>:<target|"unknown"> — a :major pin.
+                src, _, tgt = job.cmd[len("major:"):].partition(":")
+                if tgt == "unknown":
+                    self._print(s.yellow("!!") + f" held (:major pin, latest version "
+                                f"unverified): {job.name} — staying held (fail-safe); "
+                                "--unhold to force")
+                elif src == "env":
+                    self._print(s.yellow("!!") + f" held (env HOLD=, major upgrade to "
+                                f"{tgt} blocked): {job.name} — remove from HOLD= to allow")
+                else:
+                    self._print(s.yellow("!!") + f" held (major upgrade to {tgt} "
+                                f"blocked): {job.name} — remove the \":major\" hold "
+                                "to allow, or upgrade manually")
             else:
                 self._print(s.yellow("!!") + f" held (config): {job.name} — "
                             'remove from "hold" to resume updates')
@@ -655,35 +727,40 @@ class Executor:
             raise
 
     async def _run_one_inner(self, job: Job) -> None:
-        # Instant kinds — no subprocess, same outcomes as the shell's
-        # _run_one_emit_line_core.
-        if job.kind == KIND_SKIP:
-            self._complete(job, ST_SKIPPED, EC_SKIP)
-            return
-        if job.kind == KIND_HELD:
-            self._complete(job, ST_HELD, EC_SKIP,
-                           note="env" if job.cmd == "env" else "config")
-            return
-        if job.kind == KIND_QUARANTINED:
-            self._complete(job, ST_QUARANTINED, EC_SKIP)
-            return
-        if job.kind == KIND_UPTODATE:
-            # The cmd field carries the pre-check's duration; history wants
-            # start = end - int(duration), mirroring the shell executors.
-            dur_int = int(_float_or_zero(job.cmd))
-            job.end = time.time()
-            job.start = job.end - dur_int
-            self._complete(job, ST_UPTODATE, 0)
-            return
-        if job.kind == KIND_KNOWN and job.name in self.skip:
-            self._complete(job, ST_SKIPPED, EC_SKIP, note="--skip")
-            return
-
+        # Everything — including the instant kinds — goes through the
+        # semaphore. The shell executor forks every plan line in order and
+        # reaps them in order, so at parallel=1 its output and result
+        # records are in exact plan order; routing instant kinds through the
+        # same queue preserves that here. (skip lines still skip the group
+        # lock, mirroring the shell's `cmd_type != "skip"` lock condition.)
         async with self.sem:
+            if job.kind == KIND_SKIP:
+                self._complete(job, ST_SKIPPED, EC_SKIP)
+                return
             # Jobs sharing a lock group (same package manager) serialize —
             # the in-process equivalent of the shell's per-origin lockdirs.
             lock = self.group_locks.setdefault(job.lock, asyncio.Lock())
             async with lock:
+                # Instant kinds — no subprocess, same outcomes as the
+                # shell's _run_one_emit_line_core.
+                if job.kind == KIND_HELD:
+                    self._complete(job, ST_HELD, EC_SKIP,
+                                   note="env" if job.cmd == "env" else "config")
+                    return
+                if job.kind == KIND_QUARANTINED:
+                    self._complete(job, ST_QUARANTINED, EC_SKIP)
+                    return
+                if job.kind == KIND_UPTODATE:
+                    # The cmd field carries the pre-check's duration; history
+                    # wants start = end - int(duration), mirroring the shell.
+                    dur_int = int(_float_or_zero(job.cmd))
+                    job.end = time.time()
+                    job.start = job.end - dur_int
+                    self._complete(job, ST_UPTODATE, 0)
+                    return
+                if job.kind == KIND_KNOWN and job.name in self.skip:
+                    self._complete(job, ST_SKIPPED, EC_SKIP, note="--skip")
+                    return
                 await self._run_cmd(job)
 
     async def _run_cmd(self, job: Job) -> None:
@@ -711,9 +788,11 @@ class Executor:
             if attempt < self.retries:
                 attempt += 1
                 job.last_line = (f"exit {rc} — retrying in "
-                                 f"{self.retry_delay:.0f}s "
+                                 f"{self.retry_delay:g}s "
                                  f"(retry {attempt}/{self.retries})")
                 self.renderer.line_event(job)
+                self.renderer.retry_event(job, attempt, rc,
+                                          self.retry_delay, self.retries)
                 await asyncio.sleep(self.retry_delay)
                 continue
             break
@@ -723,11 +802,16 @@ class Executor:
         # counts as ok — a reinstall at latest achieves what the update was
         # trying to do.
         if job.fix and self.do_fix:
+            # The shell prints the job's failure line + tail before the fix
+            # announcement; mirror it so plain output matches line-for-line.
+            self.renderer.retries_exhausted_event(job, rc)
             job.last_line = f"fix: {job.fix}"
             self.renderer.line_event(job)
+            self.renderer.fix_event(job)
             fix_rc, fix_timed_out = await self._exec_once(job, job.fix)
             if not fix_timed_out and fix_rc == 0:
-                self._complete(job, ST_DONE, 0, note="fixed via reinstall")
+                # Same note wording the shell executor prints.
+                self._complete(job, ST_DONE, 0, note=f"fixed via: {job.fix}")
                 return
             # Report the fix's own exit code, not the earlier update's.
             job.raw_ec = fix_rc
@@ -833,6 +917,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="comma-separated known-tool names to skip")
     p.add_argument("--mode", choices=("auto", "live", "plain"), default="auto",
                    help="rendering mode (default: auto = live on terminals)")
+    p.add_argument("--quiet", action="store_true",
+                   help="suppress all plain-renderer output (mirrors the "
+                        "shell's --quiet; no effect on the live dashboard)")
     p.add_argument("--version-string", default="",
                    help="update-all-clis version shown in the dashboard header")
     return p.parse_args(argv)
@@ -858,10 +945,10 @@ async def amain(argv: list[str]) -> int:
 
     live = args.mode == "live" or (args.mode == "auto" and _supports_live(sys.stdout))
     renderer: BaseRenderer
-    if live and sys.stdout.isatty():
+    if live and sys.stdout.isatty() and not args.quiet:
         renderer = LiveRenderer(jobs, args.version_string)
     else:
-        renderer = PlainRenderer(jobs, args.version_string)
+        renderer = PlainRenderer(jobs, args.version_string, quiet=args.quiet)
 
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
 

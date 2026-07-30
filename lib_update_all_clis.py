@@ -2,7 +2,7 @@
 """Merge tool config, validate, emit update lines for update_all_clis.sh."""
 from __future__ import annotations
 
-import fcntl
+import argparse
 import glob
 import json
 import logging
@@ -104,6 +104,25 @@ def load_merge(base_path: str, local_path: Optional[str]) -> dict[str, Any]:
                         merged.append(entry)
                 base[key] = merged
                 logger.debug(f"Merged {key} list, now {len(merged)} entries")
+        # "scan_dirs" is a list of {dir, origin, mode} objects: local entries
+        # come FIRST so a local row for the same dir wins over the base one
+        # (consistent with local-wins key conflicts above); dedupe by dir.
+        if isinstance(loc.get("scan_dirs"), list):
+            base_dirs = base.get("scan_dirs")
+            if not isinstance(base_dirs, list):
+                base_dirs = []
+            merged_dirs: list[Any] = []
+            seen_dirs: set[str] = set()
+            for entry in list(loc["scan_dirs"]) + list(base_dirs):
+                if not isinstance(entry, dict):
+                    continue
+                d = entry.get("dir")
+                if not d or d in seen_dirs:
+                    continue
+                seen_dirs.add(d)
+                merged_dirs.append(entry)
+            base["scan_dirs"] = merged_dirs
+            logger.debug(f"Merged scan_dirs, now {len(merged_dirs)} entries")
     return base
 
 
@@ -182,6 +201,43 @@ def validate(cfg: dict[str, Any]) -> None:
             if not isinstance(v, str) or "/" not in v:
                 raise ValueError(f"repos.{k!r} must be a string 'owner/repo'")
 
+    # Validate optional "scan_dirs" list (static discovery-scan directories;
+    # the shell adds its own dynamic manager-derived rows on top).
+    if "scan_dirs" in cfg:
+        if not isinstance(cfg["scan_dirs"], list):
+            raise ValueError("'scan_dirs' must be an array of {dir, origin, mode} objects")
+        for entry in cfg["scan_dirs"]:
+            if not isinstance(entry, dict):
+                raise ValueError(f"scan_dirs entries must be objects, got {entry!r}")
+            if not isinstance(entry.get("dir"), str) or not entry["dir"].strip():
+                raise ValueError(f"scan_dirs entry needs a non-empty 'dir', got {entry!r}")
+            if not isinstance(entry.get("origin"), str) or not entry["origin"].strip():
+                raise ValueError(f"scan_dirs entry needs a non-empty 'origin', got {entry!r}")
+            if "mode" in entry and entry["mode"] not in ("dir", "tree"):
+                raise ValueError(
+                    f"scan_dirs mode must be 'dir' or 'tree', got {entry['mode']!r}")
+
+
+def scan_dirs_config_rows(cfg: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """(dir, origin, mode) rows from the merged config's "scan_dirs" section.
+
+    mode defaults to "dir". Dirs are emitted verbatim — the shell expands a
+    leading $HOME itself (no eval). Duplicate dirs keep the first row
+    (load_merge already ordered local-over-base)."""
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for entry in cfg.get("scan_dirs", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        d = str(entry.get("dir") or "").strip()
+        origin = str(entry.get("origin") or "").strip()
+        mode = str(entry.get("mode") or "dir").strip() or "dir"
+        if not d or not origin or d in seen:
+            continue
+        seen.add(d)
+        rows.append((d, origin, mode))
+    return rows
+
 
 def _parse_csv(s: Optional[str]) -> set[str]:
     if not s or not str(s).strip():
@@ -206,6 +262,25 @@ def normalize_hold_entries(entries: Optional[list[str]]) -> set[str]:
     if not entries:
         return set()
     return {_hold_base_name(e) for e in entries if isinstance(e, str) and e.strip()}
+
+
+def normalize_hold_entries_major(entries: Optional[list[str]]) -> set[str]:
+    """Config `hold` list -> set of names carrying the ":major" suffix.
+
+    v2 semantics: a "name:major" hold blocks only MAJOR upgrades — the
+    resolve-major-holds stage compares the tool's installed version against
+    the manager's latest and emits a held line only when the leading
+    integer would jump. Anything it can't verify stays held (fail-safe).
+    """
+    if not entries:
+        return set()
+    out: set[str] = set()
+    for e in entries:
+        if isinstance(e, str) and e.strip().endswith(":major"):
+            base = _hold_base_name(e.strip())
+            if base:
+                out.add(base)
+    return out
 
 
 def edit_local_hold(
@@ -493,11 +568,13 @@ def _stdout_signals_uptodate(stdout: str) -> bool:
     return False
 
 
-def run_check_command(cmd: str, timeout: int = 60) -> tuple[bool, float]:
-    """Run one `check` command; return (is_up_to_date, duration_s).
+def run_check_command(cmd: str, timeout: int = 60) -> tuple[bool, float, str]:
+    """Run one `check` command; return (is_up_to_date, duration_s, stdout).
 
     Fails open: a missing binary, non-zero exit, or timeout is treated as
-    "not up to date" (i.e. the real bulk update still runs).
+    "not up to date" (i.e. the real bulk update still runs). The raw stdout
+    rides along so known-tool prechecks can reuse the manager's outdated
+    list (npm/brew) instead of issuing per-tool lookups.
     """
     start = time.time()
     try:
@@ -509,11 +586,13 @@ def run_check_command(cmd: str, timeout: int = 60) -> tuple[bool, float]:
             env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False, time.time() - start
+        return False, time.time() - start, ""
     duration = time.time() - start
     if r.returncode != 0:
-        return False, duration
-    return _stdout_signals_uptodate(r.stdout), duration
+        # npm outdated exits non-zero exactly when it has outdated packages
+        # to report — the stdout is still the real, usable list.
+        return False, duration, r.stdout or ""
+    return _stdout_signals_uptodate(r.stdout), duration, r.stdout or ""
 
 
 def _precheck_candidates(
@@ -546,21 +625,23 @@ def precheck_candidate_origins(
     return sorted(o for o, _ in _precheck_candidates(cfg, only_origins, skip_origins))
 
 
-def run_prechecks(
+def run_prechecks_full(
     cfg: dict[str, Any],
     only_origins: Optional[str] = None,
     skip_origins: Optional[str] = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, str]]:
     """Run all configured `check` commands concurrently.
 
-    Returns {origin: duration_s} for origins confirmed up to date (and thus
-    safe to skip this run). Origins with no check, or whose check fails/errors/
-    produces real output, are simply absent from the result (fail open).
+    Returns ({origin: duration_s} for origins confirmed up to date,
+    {origin: raw stdout} for every check that ran). Origins with no check,
+    or whose check errors, are simply absent from the first map (fail open);
+    their stdout is absent from the second.
     """
     candidates = _precheck_candidates(cfg, only_origins, skip_origins)
     if not candidates:
-        return {}
-    results: dict[str, float] = {}
+        return {}, {}
+    uptodate: dict[str, float] = {}
+    stdouts: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
         future_to_origin = {
             executor.submit(run_check_command, cmd): origin for origin, cmd in candidates
@@ -568,11 +649,623 @@ def run_prechecks(
         for future in as_completed(future_to_origin):
             origin = future_to_origin[future]
             try:
-                uptodate, duration = future.result()
+                is_uptodate, duration, stdout = future.result()
             except Exception:
                 continue
-            if uptodate:
-                results[origin] = round(duration, 3)
+            stdouts[origin] = stdout
+            if is_uptodate:
+                uptodate[origin] = round(duration, 3)
+    return uptodate, stdouts
+
+
+def run_prechecks(
+    cfg: dict[str, Any],
+    only_origins: Optional[str] = None,
+    skip_origins: Optional[str] = None,
+) -> dict[str, float]:
+    """{origin: duration_s} for origins confirmed up to date (see run_prechecks_full)."""
+    uptodate, _ = run_prechecks_full(cfg, only_origins, skip_origins)
+    return uptodate
+
+
+# ---------------------------------------------------------------------------
+# Known-tool outdated prechecks (v2): skip an individually-tracked tool's
+# update command when it is already at the latest version — the known-tool
+# counterpart of the bulk `check` prechecks the README's v1 deferred.
+#
+# How each supported manager decides "already current":
+#   npm  — membership in `npm outdated -g --parseable` output, captured by
+#          the bulk npm check this same run (no per-tool network calls).
+#   brew — membership in `brew outdated --quiet` output, likewise.
+#   uv   — installed version from one `uv tool list` call vs latest from the
+#          PyPI JSON API (concurrent, 6h TTL cache, failures never cached).
+#   cargo — installed version from one `cargo install --list` call vs latest
+#          from the crates.io API (same cache/semantics as PyPI).
+#
+# A manager's captured list is only trusted when its bulk check actually
+# produced usable output this run: either the origin was confirmed up to
+# date (exit 0, empty list) or the list is non-empty (npm's exit-1-with-
+# output case). A failed check (e.g. `brew update` offline) leaves an empty,
+# untrusted list — fail open, every tool updates exactly as before. Any
+# unrecognized command shape (self-updaters, multi-package, unknown flags)
+# is left alone for the same reason.
+# ---------------------------------------------------------------------------
+_KNOWN_PRECHECK_MANAGERS = frozenset({"npm", "brew", "uv", "cargo"})
+
+
+def _known_pkg_from_cmd(cmd: str) -> Optional[tuple[str, str]]:
+    """(manager, package) for a known tool's update command, or None.
+
+    Same tokenization discipline as fix derivation: recognized manager verb
+    prefix, only known valueless flags, exactly one package token.
+    """
+    head = _cmd_head(cmd)
+    toks = _fix_tokens(head)
+    if not toks:
+        return None
+    for mgr, prefixes, valueless in _FIX_MATCHERS:
+        if mgr not in _KNOWN_PRECHECK_MANAGERS:
+            continue
+        prefix = next(
+            (p for p in prefixes if tuple(toks[: len(p)]) == p), None)
+        if prefix is None:
+            continue
+        rest = toks[len(prefix):]
+        pkgs = []
+        for tok in rest:
+            if tok.startswith("-"):
+                if "=" in tok or tok in valueless:
+                    continue
+                return None
+            pkgs.append(tok)
+        if len(pkgs) != 1 or not _FIX_PKG_RE.fullmatch(pkgs[0]):
+            return None
+        pkg = pkgs[0]
+        if mgr == "npm":
+            if not any(t in ("-g", "--global") for t in rest):
+                return None
+            # Strip a pinned tag/version (`pkg@latest`) for list matching.
+            if "@" in pkg[1:]:
+                pkg = pkg[: pkg.rindex("@")]
+        return mgr, pkg
+    return None
+
+
+def _npm_outdated_map(stdout: str) -> dict[str, str]:
+    """{name: wanted_version} from `npm outdated -g --parseable` output.
+
+    Lines look like `<dir>:<name>@<wanted>:<name>@<current>:...`; the name
+    column is `@scope/pkg@1.2.3` for scoped packages. Unparseable lines just
+    never match (fail open downstream).
+    """
+    out: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        fields = line.split(":")
+        if len(fields) < 2 or not fields[1]:
+            continue
+        cand = fields[1]
+        if "@" in cand[1:]:
+            name, _, wanted = cand.rpartition("@")
+            if name and wanted:
+                out[name] = wanted
+        elif cand:
+            out[cand] = ""
+    return out
+
+
+def _npm_outdated_names(stdout: str) -> set[str]:
+    """Package names from `npm outdated -g --parseable` output."""
+    return set(_npm_outdated_map(stdout))
+
+
+def _brew_outdated_names(stdout: str) -> set[str]:
+    """Formula/cask names from `brew outdated --quiet` (one per line)."""
+    return {ln.strip() for ln in (stdout or "").splitlines() if ln.strip()}
+
+
+def _uv_installed_versions() -> dict[str, str]:
+    """{package: installed_version} from one `uv tool list` call ({} on error)."""
+    try:
+        r = subprocess.run(
+            ["uv", "tool", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(\S+)\s+v(\S+)\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+_NORM_VERSION_RE = re.compile(r"v?(\d+(?:\.\d+){0,3})([-+.][0-9A-Za-z.-]+)?")
+
+
+def _norm_version(v: Optional[str]) -> Optional[tuple[tuple[int, ...], str]]:
+    """Normalized (numeric tuple, suffix) for equality comparison.
+
+    `1.2` equals `1.2.0`; a leading `v` is ignored; pre-release/build
+    suffixes compare as lowercase strings. None (unparseable) never equals.
+    """
+    if not v:
+        return None
+    m = _NORM_VERSION_RE.search(str(v))
+    if not m:
+        return None
+    nums = tuple(int(p) for p in m.group(1).split("."))
+    nums = nums + (0,) * (3 - len(nums))
+    return nums, (m.group(2) or "").lower()
+
+
+def _pypi_latest_version(pkg: str, timeout: int = 10) -> Optional[str]:
+    """Latest release of `pkg` per the PyPI JSON API (None on any error —
+    network, 404 for git-installed tools, rate limit: all fail open)."""
+    url = f"https://pypi.org/pypi/{pkg}/json"
+    req = urllib.request.Request(url, headers={"User-Agent": "update-all-clis"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+    except Exception:
+        return None
+    info = data.get("info") if isinstance(data, dict) else None
+    version = info.get("version") if isinstance(info, dict) else None
+    return str(version) if version else None
+
+
+def _crates_latest_version(pkg: str, timeout: int = 10) -> Optional[str]:
+    """Latest stable release of `pkg` per the crates.io API (None on any
+    error — fail open, same as PyPI)."""
+    url = f"https://crates.io/api/v1/crates/{pkg}"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "update-all-clis (github.com/sethsaler/updater)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+    except Exception:
+        return None
+    crate = data.get("crate") if isinstance(data, dict) else None
+    if not isinstance(crate, dict):
+        return None
+    version = crate.get("max_stable_version") or crate.get("max_version")
+    return str(version) if version else None
+
+
+def _known_latest_cache_path(cache_path: Optional[str]) -> str:
+    override = os.environ.get("UAC_KNOWN_LATEST_CACHE")
+    if override:
+        return override
+    if cache_path:
+        base = os.path.dirname(os.path.abspath(cache_path))
+    else:
+        base = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+            "update-all-clis",
+        )
+    return os.path.join(base, "known_latest_cache.json")
+
+
+def _latest_versions_cached(
+    pkgs: set[str],
+    fetch_one: Any,
+    cache_path: Optional[str],
+    key_prefix: str,
+) -> dict[str, str]:
+    """{pkg: latest_version} from `fetch_one(pkg)`, TTL-cached on disk
+    (default 6h, UAC_KNOWN_LATEST_TTL seconds). Cache keys are namespaced
+    with `key_prefix` so PyPI and crates.io entries share one file without
+    collisions. Lookup failures are cached as nulls so an unlisted package
+    (e.g. a git-installed tool) doesn't cost a request on every run; nulls
+    simply never satisfy the equality check (the update still runs — fail
+    open)."""
+    try:
+        ttl = float(os.environ.get("UAC_KNOWN_LATEST_TTL", "21600") or "21600")
+    except ValueError:
+        ttl = 21600.0
+    now = time.time()
+    path = _known_latest_cache_path(cache_path)
+    cached: dict[str, Any] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            cached = raw
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+
+    out: dict[str, str] = {}
+    missing: list[str] = []
+    for p in sorted(pkgs):
+        ent = cached.get(f"{key_prefix}{p}")
+        if (
+            isinstance(ent, dict)
+            and "version" in ent
+            and now - float(ent.get("fetched_at", 0) or 0) < ttl
+        ):
+            if ent["version"]:
+                out[p] = str(ent["version"])
+        else:
+            missing.append(p)
+
+    if missing:
+        fetched: dict[str, Optional[str]] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(missing))) as executor:
+            future_to_pkg = {
+                executor.submit(fetch_one, p): p for p in missing
+            }
+            for future in as_completed(future_to_pkg):
+                p = future_to_pkg[future]
+                try:
+                    fetched[p] = future.result()
+                except Exception:
+                    fetched[p] = None
+        for p, v in fetched.items():
+            cached[f"{key_prefix}{p}"] = {"version": v, "fetched_at": now}
+            if v:
+                out[p] = v
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cached, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return out
+
+
+def _pypi_latest_versions(pkgs: set[str], cache_path: Optional[str]) -> dict[str, str]:
+    return _latest_versions_cached(pkgs, _pypi_latest_version, cache_path, "pypi:")
+
+
+def _crates_latest_versions(pkgs: set[str], cache_path: Optional[str]) -> dict[str, str]:
+    return _latest_versions_cached(pkgs, _crates_latest_version, cache_path, "crates:")
+
+
+def _cargo_installed_versions() -> dict[str, str]:
+    """{package: installed_version} from one `cargo install --list` call
+    ({} on error or unparseable output — fail open)."""
+    try:
+        r = subprocess.run(
+            ["cargo", "install", "--list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        # Entries look like "eza v0.23.0:" followed by indented binary names.
+        m = re.match(r"^(\S+)\s+v(\S+):\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def _brew_info_version(pkg: str, timeout: int = 30) -> Optional[str]:
+    """Latest available version of a brew formula/cask via `brew info`
+    (None on any error — fail safe for :major holds)."""
+    try:
+        r = subprocess.run(
+            ["brew", "info", "--json=v2", pkg],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    formulae = data.get("formulae") or []
+    if formulae and isinstance(formulae[0], dict):
+        stable = (formulae[0].get("versions") or {}).get("stable")
+        if stable:
+            return str(stable)
+    casks = data.get("casks") or []
+    if casks and isinstance(casks[0], dict) and casks[0].get("version"):
+        return str(casks[0]["version"])
+    return None
+
+
+def _npm_view_version(pkg: str, timeout: int = 20) -> Optional[str]:
+    """Latest registry version of an npm package via `npm view` (None on any
+    error — fail safe). Only used for :major-hold decisions when the bulk
+    npm check's outdated list isn't available this run."""
+    try:
+        r = subprocess.run(
+            ["npm", "view", pkg, "version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    line = r.stdout.strip().split("\n")[0].strip()
+    return line or None
+
+
+def _npm_latest_versions(pkgs: set[str]) -> dict[str, str]:
+    """{pkg: latest_version} via per-package `npm view` (concurrent, no
+    cache — :major holds are a handful of tools at most)."""
+    if not pkgs:
+        return {}
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(pkgs))) as executor:
+        future_to_pkg = {executor.submit(_npm_view_version, p): p for p in sorted(pkgs)}
+        for future in as_completed(future_to_pkg):
+            p = future_to_pkg[future]
+            try:
+                v = future.result()
+            except Exception:
+                v = None
+            if v:
+                out[p] = v
+    return out
+
+
+def _brew_latest_versions(pkgs: set[str]) -> dict[str, str]:
+    """{pkg: latest_version} via per-package `brew info` (concurrent).
+
+    Only used for :major-hold decisions (a handful of tools at most), so no
+    cache — the bulk brew check's metadata refresh already ran this run.
+    """
+    if not pkgs:
+        return {}
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(pkgs))) as executor:
+        future_to_pkg = {executor.submit(_brew_info_version, p): p for p in sorted(pkgs)}
+        for future in as_completed(future_to_pkg):
+            p = future_to_pkg[future]
+            try:
+                v = future.result()
+            except Exception:
+                v = None
+            if v:
+                out[p] = v
+    return out
+
+
+def resolve_major_holds(
+    cache_path: str,
+    cfg: dict[str, Any],
+    adhoc_hold_csv: Optional[str] = None,
+    uptodate_bulk: Optional[dict[str, float]] = None,
+    check_stdouts: Optional[dict[str, str]] = None,
+    probe_installed: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Decide what each "name:major" hold should do this run.
+
+    Returns {"block": {name: target_version}, "allow": [name], "unknown":
+    [name]} — block = a major upgrade is pending (stay held, say what's
+    coming); allow = no major jump (minor/patch or nothing at all — the
+    update runs normally); unknown = the target couldn't be verified (a
+    self-updater with no registry, a failed lookup, an unparseable version)
+    and the hold stays, fail-safe.
+
+    A name plainly held (same name without the suffix, either source) is
+    excluded here — the plain hold already wins in emit.
+    """
+    uptodate_bulk = uptodate_bulk or {}
+    check_stdouts = check_stdouts or {}
+    probe = probe_installed or probe_version
+
+    hold_list = cfg.get("hold", []) or []
+    adhoc_list = [s for s in (adhoc_hold_csv or "").split(",") if s.strip()]
+    config_major = normalize_hold_entries_major(hold_list)
+    adhoc_major = normalize_hold_entries_major(adhoc_list)
+
+    def _plain(entries: list[str]) -> set[str]:
+        return {e.strip() for e in entries
+                if isinstance(e, str) and e.strip() and not e.strip().endswith(":major")}
+
+    plainly_held = _plain(hold_list) | _plain(adhoc_list)
+
+    known = cfg.get("known", {}) or {}
+    out: dict[str, Any] = {"block": {}, "allow": [], "unknown": []}
+
+    # Batch per-manager targets first (concurrent where it matters).
+    jobs: dict[str, tuple[str, str, str]] = {}  # name -> (source, mgr, pkg)
+    for name in sorted(config_major | adhoc_major):
+        if name in plainly_held:
+            continue
+        source = "config" if name in config_major else "env"
+        ext = _known_pkg_from_cmd(known.get(name, "") or "")
+        if ext is None:
+            out["unknown"].append(name)
+            continue
+        jobs[name] = (source, ext[0], ext[1])
+
+    npm_map: Optional[dict[str, str]] = None
+    npm_view_latest: dict[str, str] = {}
+    npm_pkgs = {pkg for _, mgr, pkg in jobs.values() if mgr == "npm"}
+    if npm_pkgs:
+        if "npm" in uptodate_bulk or check_stdouts.get("npm", "").strip():
+            npm_map = _npm_outdated_map(check_stdouts.get("npm", ""))
+        else:
+            # No usable bulk-check signal (e.g. --no-precheck, or the npm
+            # check failed): fall back to per-package registry lookups.
+            npm_view_latest = _npm_latest_versions(npm_pkgs)
+    brew_pkgs = {pkg for _, mgr, pkg in jobs.values() if mgr == "brew"}
+    brew_latest = _brew_latest_versions(brew_pkgs) if brew_pkgs else {}
+    uv_pkgs = {pkg for _, mgr, pkg in jobs.values() if mgr == "uv"}
+    uv_latest = _pypi_latest_versions(uv_pkgs, cache_path) if uv_pkgs else {}
+    cargo_pkgs = {pkg for _, mgr, pkg in jobs.values() if mgr == "cargo"}
+    cargo_latest = _crates_latest_versions(cargo_pkgs, cache_path) if cargo_pkgs else {}
+
+    for name, (source, mgr, pkg) in sorted(jobs.items()):
+        latest: Optional[str] = None
+        allow_without_compare = False
+        if mgr == "npm":
+            if npm_map is not None:
+                if pkg not in npm_map:
+                    allow_without_compare = True  # not outdated at all
+                else:
+                    latest = npm_map[pkg] or None
+            else:
+                latest = npm_view_latest.get(pkg)
+        elif mgr == "brew":
+            latest = brew_latest.get(pkg)
+        elif mgr == "uv":
+            latest = uv_latest.get(pkg)
+        else:  # cargo
+            latest = cargo_latest.get(pkg)
+
+        if allow_without_compare:
+            out["allow"].append(name)
+            continue
+        installed = probe(name)
+        li, ll = leading_major(installed), leading_major(latest)
+        if li is None or ll is None:
+            out["unknown"].append(name)
+        elif ll > li:
+            out["block"][name] = {"source": source, "target": str(latest)}
+        else:
+            out["allow"].append(name)
+
+    return out
+
+
+def _known_precheck_jobs(
+    cache_path: str,
+    cfg: dict[str, Any],
+    only_origins: Optional[str],
+    skip_origins: Optional[str],
+    skip_names: Optional[set[str]],
+) -> list[tuple[str, str, str]]:
+    """(name, manager, package) triples eligible for a known-tool up-to-date
+    check: discovered known tools with a recognizable update command, after
+    the same origin only/skip filtering the emit loop applies (SKIP= names
+    excluded so a `--skip`ed tool can never surface as an up-to-date ok).
+    """
+    only = _parse_csv(only_origins)
+    skip = _parse_csv(skip_origins)
+    skip_names = skip_names or set()
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    tools = [t for t in data if isinstance(t, dict) and "name" in t]
+    known = cfg.get("known", {}) or {}
+
+    jobs: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for t in tools:
+        name = t["name"]
+        if name in seen or name in skip_names or name not in known:
+            continue
+        seen.add(name)
+        origin = str(t.get("origin", "?"))
+        if origin in skip:
+            continue
+        if only and origin not in only and name not in only:
+            continue
+        cmd = known.get(name) or ""
+        if not cmd.strip():
+            continue
+        ext = _known_pkg_from_cmd(cmd)
+        if ext:
+            jobs.append((name, ext[0], ext[1]))
+    return jobs
+
+
+def known_precheck_candidates(
+    cache_path: str,
+    cfg: dict[str, Any],
+    only_origins: Optional[str] = None,
+    skip_origins: Optional[str] = None,
+    skip_names: Optional[set[str]] = None,
+) -> list[str]:
+    """Known tool names that WOULD be up-to-date-checked (no lookups run)."""
+    return sorted(name for name, _, _ in _known_precheck_jobs(
+        cache_path, cfg, only_origins, skip_origins, skip_names))
+
+
+def run_known_prechecks(
+    cache_path: str,
+    cfg: dict[str, Any],
+    uptodate_bulk: Optional[dict[str, float]] = None,
+    check_stdouts: Optional[dict[str, str]] = None,
+    only_origins: Optional[str] = None,
+    skip_origins: Optional[str] = None,
+    skip_names: Optional[set[str]] = None,
+) -> dict[str, float]:
+    """{known_tool_name: duration_s} for tools confirmed already at latest.
+
+    Everything is fail-open: any manager whose freshness signal is missing
+    or unusable leaves its tools alone.
+    """
+    uptodate_bulk = uptodate_bulk or {}
+    check_stdouts = check_stdouts or {}
+    jobs = _known_precheck_jobs(cache_path, cfg, only_origins, skip_origins, skip_names)
+    if not jobs:
+        return {}
+
+    results: dict[str, float] = {}
+
+    # npm / brew: membership in the bulk check's outdated list. Trust the
+    # list only when the bulk check produced a usable signal this run (the
+    # origin went fully up to date, or the list has real content).
+    npm_trusted = "npm" in uptodate_bulk or bool(check_stdouts.get("npm", "").strip())
+    brew_trusted = "brew" in uptodate_bulk or bool(check_stdouts.get("brew", "").strip())
+    npm_outdated = _npm_outdated_names(check_stdouts.get("npm", "")) if npm_trusted else None
+    brew_outdated = _brew_outdated_names(check_stdouts.get("brew", "")) if brew_trusted else None
+
+    # Registry-compared managers: (installed-map fn, latest-map fn). Each
+    # batch costs one local list call + concurrent registry lookups, and any
+    # failure leaves installed/latest empty (fail open — tools update).
+    uv_jobs: list[tuple[str, str]] = []
+    cargo_jobs: list[tuple[str, str]] = []
+    for name, mgr, pkg in jobs:
+        if mgr == "npm":
+            if npm_outdated is not None and pkg not in npm_outdated:
+                results[name] = 0.0
+        elif mgr == "brew":
+            if brew_outdated is not None and pkg not in brew_outdated:
+                results[name] = 0.0
+        elif mgr == "cargo":
+            cargo_jobs.append((name, pkg))
+        else:  # uv
+            uv_jobs.append((name, pkg))
+
+    for batch, installed_fn, latest_fn in (
+        (uv_jobs, _uv_installed_versions, _pypi_latest_versions),
+        (cargo_jobs, _cargo_installed_versions, _crates_latest_versions),
+    ):
+        if not batch:
+            continue
+        phase_start = time.time()
+        installed = installed_fn()
+        latest = latest_fn({pkg for _, pkg in batch}, cache_path)
+        phase = time.time() - phase_start
+        per_tool = round(phase / len(batch), 3)
+        for name, pkg in batch:
+            iv = _norm_version(installed.get(pkg))
+            lv = _norm_version(latest.get(pkg))
+            if iv is not None and lv is not None and iv == lv:
+                results[name] = per_tool
+
     return results
 
 
@@ -693,6 +1386,10 @@ def collect_emit_lines(
     precheck_uptodate: Optional[dict[str, float]] = None,
     held_config: Optional[set[str]] = None,
     held_adhoc: Optional[set[str]] = None,
+    precheck_uptodate_known: Optional[dict[str, float]] = None,
+    held_config_major: Optional[set[str]] = None,
+    held_adhoc_major: Optional[set[str]] = None,
+    major_hold_blocks: Optional[dict[str, dict[str, str]]] = None,
 ) -> list[str]:
     only = _parse_csv(only_origins)
     skip = _parse_csv(skip_origins)
@@ -797,19 +1494,41 @@ def collect_emit_lines(
     # synthetic "held" line instead of running. Applied before quarantine/
     # precheck so a hold always wins regardless of history/outdated state.
     # The cmd field carries the hold's source ("config" or "env") so the
-    # shell can phrase its message accordingly.
+    # executors can phrase their message accordingly. A "name:major" hold
+    # only becomes a held line when the resolve stage found a major upgrade
+    # pending (cmd "major:<source>:<target>") or couldn't verify one
+    # ("major:<source>:unknown", fail-safe); a verified no-major-jump run
+    # lets the update through untouched.
     held_config = held_config or set()
     held_adhoc = held_adhoc or set()
-    if held_config or held_adhoc:
+    held_config_major = held_config_major or set()
+    held_adhoc_major = held_adhoc_major or set()
+    if held_config or held_adhoc or held_config_major or held_adhoc_major:
         transformed_held: list[str] = []
         for line in lines:
             parts = line.split(EMIT_SEP, 3)
             kind = parts[0]
             name = parts[1] if len(parts) > 1 else ""
-            if kind in ("known", "bulk") and name in held_config:
+            if kind not in ("known", "bulk"):
+                transformed_held.append(line)
+                continue
+            if name in held_config:
                 transformed_held.append(f"held{EMIT_SEP}{name}{EMIT_SEP}config{EMIT_SEP}")
-            elif kind in ("known", "bulk") and name in held_adhoc:
+            elif name in held_adhoc:
                 transformed_held.append(f"held{EMIT_SEP}{name}{EMIT_SEP}env{EMIT_SEP}")
+            elif name in held_config_major or name in held_adhoc_major:
+                source = "config" if name in held_config_major else "env"
+                if major_hold_blocks is None:
+                    # No resolve stage ran (dry-run): stay held, fail-safe.
+                    target = "unknown"
+                elif name in major_hold_blocks:
+                    target = major_hold_blocks[name].get("target") or "unknown"
+                else:
+                    # Verified: no major jump pending — let the update run.
+                    transformed_held.append(line)
+                    continue
+                transformed_held.append(
+                    f"held{EMIT_SEP}{name}{EMIT_SEP}major:{source}:{target}{EMIT_SEP}")
             else:
                 transformed_held.append(line)
         lines = transformed_held
@@ -832,18 +1551,25 @@ def collect_emit_lines(
         lines = transformed
 
     # Outdated pre-checks: a bulk origin whose `check` command reported
-    # nothing to do is replaced with a synthetic "uptodate" line (shell
-    # prints it as an instant ok, no update command runs). Applied after
-    # quarantine so a quarantined origin still shows as quarantined, not
-    # up to date, if both would otherwise apply.
-    if precheck_uptodate:
+    # nothing to do — or a known tool already at the latest version — is
+    # replaced with a synthetic "uptodate" line (the executor prints it as
+    # an instant ok, no update command runs). Applied after quarantine so a
+    # quarantined job still shows as quarantined, not up to date, if both
+    # would otherwise apply.
+    if precheck_uptodate or precheck_uptodate_known:
+        bulk_up = precheck_uptodate or {}
+        known_up = precheck_uptodate_known or {}
         transformed2: list[str] = []
         for line in lines:
             parts = line.split(EMIT_SEP, 3)
             kind = parts[0]
             name = parts[1] if len(parts) > 1 else ""
-            if kind == "bulk" and name in precheck_uptodate:
-                duration = precheck_uptodate[name]
+            duration: Optional[float] = None
+            if kind == "bulk" and name in bulk_up:
+                duration = bulk_up[name]
+            elif kind == "known" and name in known_up:
+                duration = known_up[name]
+            if duration is not None:
                 transformed2.append(f"uptodate{EMIT_SEP}{name}{EMIT_SEP}{duration}{EMIT_SEP}")
             else:
                 transformed2.append(line)
@@ -868,11 +1594,16 @@ def emit_lines(
     precheck_uptodate: Optional[dict[str, float]] = None,
     held_config: Optional[set[str]] = None,
     held_adhoc: Optional[set[str]] = None,
+    precheck_uptodate_known: Optional[dict[str, float]] = None,
+    held_config_major: Optional[set[str]] = None,
+    held_adhoc_major: Optional[set[str]] = None,
+    major_hold_blocks: Optional[dict[str, dict[str, str]]] = None,
 ) -> None:
     for line in collect_emit_lines(
         cache_path, cfg, only_origins, skip_origins,
         history_path, quarantine_after, include_quarantined, precheck_uptodate,
-        held_config, held_adhoc,
+        held_config, held_adhoc, precheck_uptodate_known,
+        held_config_major, held_adhoc_major, major_hold_blocks,
     ):
         sys.stdout.write(line + "\n")
 
@@ -888,12 +1619,17 @@ def emit_plan_json(
     precheck_uptodate: Optional[dict[str, float]] = None,
     held_config: Optional[set[str]] = None,
     held_adhoc: Optional[set[str]] = None,
+    precheck_uptodate_known: Optional[dict[str, float]] = None,
+    held_config_major: Optional[set[str]] = None,
+    held_adhoc_major: Optional[set[str]] = None,
+    major_hold_blocks: Optional[dict[str, dict[str, str]]] = None,
 ) -> None:
     plan: list[dict[str, str]] = []
     for line in collect_emit_lines(
         cache_path, cfg, only_origins, skip_origins,
         history_path, quarantine_after, include_quarantined, precheck_uptodate,
-        held_config, held_adhoc,
+        held_config, held_adhoc, precheck_uptodate_known,
+        held_config_major, held_adhoc_major, major_hold_blocks,
     ):
         parts = line.split(EMIT_SEP)
         if len(parts) < 3:
@@ -1666,7 +2402,12 @@ def format_run_summary(
     new_tools: Optional[list[str]] = None,
     quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
+    failed: Optional[list[str]] = None,
+    mode: str = "full",
 ) -> str:
+    """Run summary text. mode="full" lists everything; mode="failures"
+    leads with the failed jobs and collapses the (long) up-to-date name
+    list to a count — for scheduled runs where only problems are news."""
     upgraded: list[str] = []
     unchanged: list[str] = []
     for section in ("known", "bulk"):
@@ -1680,12 +2421,19 @@ def format_run_summary(
                 marker = "  [MAJOR UPGRADE]" if is_major_upgrade(b, a) else ""
                 upgraded.append(f"  {name}: {b} → {a}{marker}")
 
+    failed = failed or []
     lines_out: list[str] = [
         "update-all-clis",
         f"Steps: {ok} ok, {fail} failed",
-        "",
-        f"Upgraded ({len(upgraded)}):",
     ]
+
+    if mode == "failures":
+        lines_out.append("")
+        lines_out.append(f"Failed ({len(failed)}):")
+        lines_out.append("  " + ", ".join(sorted(failed)) if failed else "  (none)")
+
+    lines_out.append("")
+    lines_out.append(f"Upgraded ({len(upgraded)}):")
     lines_out.extend(upgraded if upgraded else ["  (none)"])
 
     lines_out.append("")
@@ -1697,11 +2445,11 @@ def format_run_summary(
         lines_out.append("  (none)")
 
     lines_out.append("")
-    lines_out.append(f"Already up to date ({len(unchanged)}):")
-    if unchanged:
-        lines_out.append("  " + ", ".join(sorted(unchanged)))
+    if mode == "failures":
+        lines_out.append(f"Already up to date: {len(unchanged)} (list omitted in failures mode)")
     else:
-        lines_out.append("  (none)")
+        lines_out.append(f"Already up to date ({len(unchanged)}):")
+        lines_out.append("  " + ", ".join(sorted(unchanged)) if unchanged else "  (none)")
 
     lines_out.append("")
     quarantined = quarantined or []
@@ -1722,6 +2470,11 @@ def format_run_summary(
     return "\n".join(lines_out) + "\n"
 
 
+def _summary_mode_env() -> str:
+    mode = os.environ.get("UPDATE_ALL_CLIS_SUMMARY_MODE", "full")
+    return mode if mode in ("full", "failures") else "full"
+
+
 def notify_macos_dialog(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -1730,10 +2483,14 @@ def notify_macos_dialog(
     new_tools: Optional[list[str]] = None,
     quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
+    failed: Optional[list[str]] = None,
 ) -> None:
     if sys.platform != "darwin":
         return
-    body = format_run_summary(before, after, ok, fail, new_tools, quarantined, held).rstrip("\n")
+    body = format_run_summary(
+        before, after, ok, fail, new_tools, quarantined, held, failed,
+        mode=_summary_mode_env(),
+    ).rstrip("\n")
     if len(body) > 950:
         body = body[:947] + "\n…"
     fd, path = tempfile.mkstemp(suffix=".txt", text=True)
@@ -1774,9 +2531,13 @@ def notify_linux(
     new_tools: Optional[list[str]] = None,
     quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
+    failed: Optional[list[str]] = None,
 ) -> None:
     if sys.platform == "linux" and shutil.which("notify-send"):
-        body = format_run_summary(before, after, ok, fail, new_tools, quarantined, held).rstrip("\n")
+        body = format_run_summary(
+            before, after, ok, fail, new_tools, quarantined, held, failed,
+            mode=_summary_mode_env(),
+        ).rstrip("\n")
         if len(body) > 500:
             body = body[:497] + "…"
         subprocess.run(
@@ -1798,9 +2559,10 @@ def notify_diff(
     new_tools: Optional[list[str]] = None,
     quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
+    failed: Optional[list[str]] = None,
 ) -> None:
-    notify_macos_dialog(before, after, ok, fail, new_tools, quarantined, held)
-    notify_linux(before, after, ok, fail, new_tools, quarantined, held)
+    notify_macos_dialog(before, after, ok, fail, new_tools, quarantined, held, failed)
+    notify_linux(before, after, ok, fail, new_tools, quarantined, held, failed)
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -2542,6 +3304,23 @@ def _doctor_dir_excluded(d: str) -> bool:
     return d in _DOCTOR_SYSTEM_DIRS or d.startswith(_DOCTOR_SYSTEM_PREFIXES)
 
 
+def doctor_prune_suggestions(cache_path: str, cfg: dict[str, Any]) -> list[str]:
+    """Known-config entries whose tool is nowhere: not on PATH AND absent
+    from the latest discovery scan. Purely informational (a pruning aid —
+    the config deliberately catalogs tools you might install later), so
+    these never count as doctor findings."""
+    known = cfg.get("known", {}) or {}
+    cached_names = set(cache_tool_names(cache_path))
+    out = []
+    for name in sorted(known):
+        if name in cached_names:
+            continue
+        if shutil.which(name):
+            continue
+        out.append(name)
+    return out
+
+
 def doctor_report(
     cache_path: str,
     cfg: dict[str, Any],
@@ -2556,6 +3335,7 @@ def doctor_report(
         "chronic_failures": [],
         "config_issues": [],
         "not_installed": [],
+        "prune_suggestions": [],
         "errors": [],
     }
 
@@ -2601,13 +3381,19 @@ def doctor_report(
     except Exception as e:
         report["errors"].append(f"not-installed check failed: {e}")
 
+    try:
+        report["prune_suggestions"] = doctor_prune_suggestions(cache_path, cfg)
+    except Exception as e:
+        report["errors"].append(f"prune-suggestion check failed: {e}")
+
     return report
 
 
 def doctor_has_findings(report: dict[str, Any]) -> bool:
     # Informational sections don't count as findings: `not_installed`
-    # (config catalogs tools you might install) and cache warnings
-    # (duplicate names across origins are normal — see shadowed check).
+    # (config catalogs tools you might install), `prune_suggestions`
+    # (an aid, not a problem), and cache warnings (duplicate names across
+    # origins are normal — see shadowed check).
     cv = report.get("cache_validation", {}) or {}
     return bool(
         (not cv.get("valid", True))
@@ -2674,6 +3460,14 @@ def format_doctor_report(report: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"Known but not installed ({len(ni)}, informational — these are skipped):")
         lines.append("  " + ", ".join(ni))
+
+    ps = report.get("prune_suggestions", []) or []
+    if ps:
+        lines.append("")
+        lines.append(
+            f"Not seen anywhere ({len(ps)}, informational — not on PATH and "
+            "absent from the last scan; review for pruning):")
+        lines.append("  " + ", ".join(ps))
 
     ig = report.get("ignored_shadows", []) or []
     if ig:
@@ -2854,49 +3648,14 @@ def build_changelog_digest(
     return format_changelog_section(entries, capped=capped, cap=max_tools)
 
 
-def hold_lock(path: str, blocking: bool = True) -> int:
-    """Acquire an exclusive lock on `path` via fcntl.flock and hold it until killed.
-
-    Prints 'LOCKED' to stdout once acquired, or 'BUSY' (exit 2) when non-blocking
-    and already held. The lock is released automatically when the process dies
-    (the OS closes the fd). Works on macOS and Linux without the `flock` binary.
-    """
-    lock_dir = os.path.dirname(path)
-    if lock_dir:
-        os.makedirs(lock_dir, exist_ok=True)
-    flags = fcntl.LOCK_EX
-    if not blocking:
-        flags |= fcntl.LOCK_NB
-    try:
-        f = open(path, "a", encoding="utf-8")
-    except OSError as e:
-        print(f"LOCK_ERROR {e}", file=sys.stderr)
-        return 3
-    try:
-        fcntl.flock(f.fileno(), flags)
-    except OSError:
-        f.close()
-        if not blocking:
-            sys.stdout.write("BUSY\n")
-            sys.stdout.flush()
-            return 2
-        print("LOCK_ERROR could not acquire lock", file=sys.stderr)
-        return 3
-    sys.stdout.write("LOCKED\n")
-    sys.stdout.flush()
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        pass
-    return 0
-
-
-def _load_precheck_uptodate_env() -> Optional[dict[str, float]]:
-    """Read the {origin: duration_s} map written by the shell's pre-check stage.
+def _load_precheck_file() -> Optional[dict[str, Any]]:
+    """Read the JSON file written by the shell's pre-check stage.
 
     Path is passed via UAC_PRECHECK_UPTODATE_FILE (a small JSON file) rather
-    than raw JSON in an env var, to sidestep shell quoting entirely.
+    than raw JSON in an env var, to sidestep shell quoting entirely. Two
+    formats are accepted: the current {"bulk": {...}, "known": {...},
+    "stdout": {...}} shape, and the original flat {origin: duration_s} map
+    (treated as bulk-only).
     """
     path = os.environ.get("UAC_PRECHECK_UPTODATE_FILE")
     if not path or not os.path.isfile(path):
@@ -2906,331 +3665,728 @@ def _load_precheck_uptodate_env() -> Optional[dict[str, float]]:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_precheck_uptodate_env() -> Optional[dict[str, float]]:
+    """The bulk {origin: duration_s} up-to-date map from the pre-check file."""
+    data = _load_precheck_file()
+    if not data:
+        return None
+    if "bulk" in data or "known" in data:
+        bulk = data.get("bulk")
+        return bulk if isinstance(bulk, dict) and bulk else None
+    # Legacy flat {origin: duration} format.
+    return data or None
+
+
+def _load_precheck_known_env() -> Optional[dict[str, float]]:
+    """The known-tool {name: duration_s} up-to-date map from the pre-check file."""
+    data = _load_precheck_file()
+    if not data:
+        return None
+    known = data.get("known")
+    return known if isinstance(known, dict) and known else None
+
+
+def _load_major_holds_env() -> Optional[dict[str, dict[str, str]]]:
+    """The {name: {"source","target"}} major-upgrade blocks written by the
+    shell's resolve-major-holds stage (UAC_MAJOR_HOLDS_FILE). None when the
+    stage never ran (e.g. --dry-run) — emit treats that as fail-safe held.
+    """
+    path = os.environ.get("UAC_MAJOR_HOLDS_FILE")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
     if not isinstance(data, dict):
         return None
-    return data
+    block = data.get("block")
+    return block if isinstance(block, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers (dispatched by main()'s argparse subparsers). The CLI
+# surface — subcommand names, positional args, env vars, exit codes — is
+# unchanged from the original if/elif dispatch; update_all_clis.sh's
+# callsites depend on it.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Small output helpers — these back lib subcommands that replaced inline
+# `python3 -c` snippets in update_all_clis.sh (same logic, now testable).
+# ---------------------------------------------------------------------------
+def cache_tool_names(cache_path: str) -> list[str]:
+    """Every discovered tool's name, one per line's worth, in cache order."""
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [str(t["name"]) for t in data if isinstance(t, dict) and "name" in t]
+
+
+def format_tool_list(cache_path: str) -> str:
+    """The human-readable --list output: sorted tools + scanned_at footer."""
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    tools = sorted(
+        (t for t in data if isinstance(t, dict) and "name" in t),
+        key=lambda x: x["name"],
+    )
+    meta = next((t for t in data if isinstance(t, dict) and "scanned_at" in t), None)
+    lines = [f"  {t['name']}  [{t.get('origin', '?')}]" for t in tools]
+    scanned = meta.get("scanned_at") if meta else "?"
+    lines.append(f"\nTotal: {len(tools)} tools  |  Scanned: {scanned}")
+    return "\n".join(lines)
+
+
+def lines_to_json(stdin_text: str) -> str:
+    """JSON array of stdin's non-empty stripped lines (snapshot plumbing)."""
+    return json.dumps([ln.strip() for ln in stdin_text.splitlines() if ln.strip()])
+
+
+def unknown_log_summary(unknown_log_path: str, sample_size: int = 5) -> tuple[int, str]:
+    """(unacknowledged count, comma sample) from the unknown-tools log."""
+    try:
+        with open(unknown_log_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return 0, ""
+    tools = data.get("tools") if isinstance(data, dict) else None
+    if not isinstance(tools, dict):
+        return 0, ""
+    names = sorted(
+        str(t.get("name") or key)
+        for key, t in tools.items()
+        if isinstance(t, dict) and not t.get("acknowledged")
+    )
+    return len(names), ", ".join(names[:sample_size])
+
+
+# ---------------------------------------------------------------------------
+# --insights: history analytics (slowest jobs, chronic failers, most-
+# frequently-updated tools, and actionable suggestions).
+# ---------------------------------------------------------------------------
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def build_insights(history_path: Optional[str], top_n: int = 10) -> dict[str, Any]:
+    """Analyze history.jsonl. All numbers come straight from recorded job
+    records (kind/name/duration_s/status/version_before/version_after)."""
+    records = load_history_records(history_path)
+    by_name = load_history_by_name(history_path)
+    means = historical_mean_durations(by_name)
+
+    slowest = [
+        {"name": name, "mean_s": round(mean, 1),
+         "runs": len([r for r in by_name[name] if isinstance(r.get("duration_s"), (int, float))])}
+        for name, mean in sorted(means.items(), key=lambda kv: -kv[1])[:top_n]
+    ]
+
+    failers = []
+    for name, recs in sorted(by_name.items()):
+        counted = [r for r in recs if r.get("status") in ("ok", "fail")]
+        fails = sum(1 for r in counted if r.get("status") == "fail")
+        if len(counted) >= 3 and fails:
+            failers.append({
+                "name": name, "failed": fails, "total": len(counted),
+                "rate": round(fails / len(counted), 3),
+            })
+    failers.sort(key=lambda f: (-f["rate"], -f["failed"], f["name"]))
+    failers = failers[:top_n]
+
+    frequent = []
+    for name, recs in sorted(by_name.items()):
+        changed = sum(
+            1 for r in recs
+            if r.get("version_before") and r.get("version_after")
+            and r["version_before"] != r["version_after"]
+        )
+        if changed:
+            frequent.append({"name": name, "changed_runs": changed})
+    frequent.sort(key=lambda f: (-f["changed_runs"], f["name"]))
+    frequent = frequent[:top_n]
+
+    suggestions: list[str] = []
+    for f in failers:
+        if f["rate"] >= 0.5:
+            suggestions.append(
+                f"{f['name']} fails {f['failed']}/{f['total']} runs "
+                f"({int(f['rate'] * 100)}%) — investigate, or --hold it to stop the noise")
+    if slowest and slowest[0]["mean_s"] >= 60:
+        suggestions.append(
+            f"{slowest[0]['name']} is the long pole "
+            f"(~{_fmt_duration(slowest[0]['mean_s'])} mean) — slowest-first "
+            "scheduling already starts it first")
+    if frequent and frequent[0]["changed_runs"] >= 5:
+        suggestions.append(
+            f"{frequent[0]['name']} changes nearly every run "
+            f"({frequent[0]['changed_runs']} version bumps on record) — "
+            "expect regular [MAJOR UPGRADE]-style churn")
+
+    return {
+        "records": len(records),
+        "jobs_tracked": len(by_name),
+        "slowest": slowest,
+        "chronic_failures": failers,
+        "frequently_updated": frequent,
+        "suggestions": suggestions,
+    }
+
+
+def format_insights(report: dict[str, Any]) -> str:
+    lines = [
+        f"update-all-clis insights — {report.get('records', 0)} history records "
+        f"({report.get('jobs_tracked', 0)} jobs tracked)",
+        "",
+    ]
+    slowest = report.get("slowest", [])
+    lines.append(f"Slowest jobs (mean of last ~10 runs each, top {len(slowest)}):")
+    if slowest:
+        for s in slowest:
+            lines.append(f"  {s['name']:<28} {_fmt_duration(s['mean_s']):>7} mean ({s['runs']} runs)")
+    else:
+        lines.append("  (none — no duration data yet)")
+    lines.append("")
+
+    failers = report.get("chronic_failures", [])
+    lines.append(f"Chronic failure rates ({len(failers)}):")
+    if failers:
+        for f in failers:
+            lines.append(f"  {f['name']:<28} {f['failed']}/{f['total']} failed ({int(f['rate'] * 100)}%)")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    frequent = report.get("frequently_updated", [])
+    lines.append(f"Most frequently updated ({len(frequent)}):")
+    if frequent:
+        for f in frequent:
+            lines.append(f"  {f['name']:<28} version changed in {f['changed_runs']} runs")
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    suggestions = report.get("suggestions", [])
+    lines.append(f"Suggestions ({len(suggestions)}):")
+    if suggestions:
+        lines.extend(f"  - {s}" for s in suggestions)
+    else:
+        lines.append("  (none)")
+    return "\n".join(lines) + "\n"
+
+
+def _cfg_from_env(do_validate: bool = True) -> dict[str, Any]:
+    """Merged config from CONFIG_FILE/CONFIG_LOCAL_FILE env (default base:
+    the tool_config.json next to this file)."""
+    base = os.environ.get("CONFIG_FILE", "") or os.path.join(
+        os.path.dirname(__file__), "tool_config.json")
+    local = os.environ.get("CONFIG_LOCAL_FILE", "")
+    cfg = load_merge(base, local or None)
+    if do_validate:
+        validate(cfg)
+    return cfg
+
+
+def _cfg_with_legacy_base(args_base: str, do_validate: bool = True) -> dict[str, Any]:
+    """Like _cfg_from_env but allows the legacy positional base-config path
+    (used by the suggest/log-unknowns subcommands)."""
+    base = (os.environ.get("CONFIG_FILE") or args_base
+            or os.path.join(os.path.dirname(__file__), "tool_config.json"))
+    local = os.environ.get("CONFIG_LOCAL_FILE", "")
+    cfg = load_merge(base, local or None)
+    if do_validate:
+        validate(cfg)
+    return cfg
+
+
+def _emit_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Shared emit/emit-json argument bundle: origin filters, history,
+    quarantine, holds (plain + :major), and both pre-check maps."""
+    hold_env_list = [s for s in os.environ.get("HOLD", "").split(",")]
+    return {
+        "only_origins": os.environ.get("ONLY_ORIGINS"),
+        "skip_origins": os.environ.get("SKIP_ORIGINS"),
+        "history_path": os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path(),
+        "quarantine_after": int(os.environ.get("UAC_QUARANTINE_AFTER") or DEFAULT_QUARANTINE_AFTER),
+        "include_quarantined": os.environ.get("UAC_INCLUDE_QUARANTINED", "0") == "1",
+        "precheck_uptodate": _load_precheck_uptodate_env(),
+        "held_config": normalize_hold_entries(cfg.get("hold")) - normalize_hold_entries_major(cfg.get("hold")),
+        "held_adhoc": _parse_csv(os.environ.get("HOLD")) - normalize_hold_entries_major(hold_env_list),
+        "precheck_uptodate_known": _load_precheck_known_env(),
+        "held_config_major": normalize_hold_entries_major(cfg.get("hold")),
+        "held_adhoc_major": normalize_hold_entries_major(hold_env_list),
+        "major_hold_blocks": _load_major_holds_env(),
+    }
+
+
+def _precheck_stage_data() -> tuple[dict[str, Any], dict[str, Any]]:
+    """(bulk map, stdout map) from the pre-check stage's file."""
+    data = _load_precheck_file() or {}
+    bulk_up = data.get("bulk") if isinstance(data.get("bulk"), dict) else {}
+    stdouts = data.get("stdout") if isinstance(data.get("stdout"), dict) else {}
+    return bulk_up, stdouts
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    base = os.environ.get("CONFIG_FILE", "") or os.path.join(
+        os.path.dirname(__file__), "tool_config.json")
+    local = os.environ.get("CONFIG_LOCAL_FILE", "")
+    cfg = load_merge(base, local or None)
+    results = benchmark_operation(args.cache_path or "", cfg, base, local or None)
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+def _cmd_health_check(args: argparse.Namespace) -> int:
+    result = health_check()
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] == "healthy" else 1
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    backup_path = create_backup(args.cache_path)
+    if backup_path:
+        print(f"Backup created: {backup_path}")
+    else:
+        print("No backup created (cache file not found)")
+    return 0
+
+
+def _cmd_list_backups(args: argparse.Namespace) -> int:
+    backups = list_backups(args.cache_path)
+    if backups:
+        print(f"Found {len(backups)} backup(s):")
+        for b in backups:
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(b)))
+            print(f"  {b} (modified: {mtime})")
+    else:
+        print("No backups found")
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    return 0 if restore_backup(args.cache_path, args.backup_path) else 1
+
+
+def _cmd_parse_npm_globals(args: argparse.Namespace) -> int:
+    print(parse_npm_globals_json(sys.stdin.read()))
+    return 0
+
+
+def _cmd_convert_tools_array(args: argparse.Namespace) -> int:
+    result = convert_tools_array_to_json(
+        sys.stdin.read(), args.scanned_at, args.existing_cache or None)
+    print(result)
+    return 0
+
+
+def _cmd_incremental_scan(args: argparse.Namespace) -> int:
+    with open(args.rows_file, encoding="utf-8") as f:
+        rows = parse_scan_rows(f.read())
+    extra_tools: list[tuple[str, str]] = []
+    if args.extra_tools_file and os.path.isfile(args.extra_tools_file):
+        with open(args.extra_tools_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if "|" not in line:
+                    continue
+                n, o = line.split("|", 1)
+                if n:
+                    extra_tools.append((n, o))
+    print(incremental_scan_merge(rows, args.cache_path, args.scanned_at,
+                                 args.force == "1", extra_tools))
+    return 0
+
+
+def _cmd_update_cache_versions(args: argparse.Namespace) -> int:
+    versions_input = sys.stdin.read()
+    versions = json.loads(versions_input) if versions_input.strip() else {}
+    update_cache_versions(args.cache_path, versions)
+    return 0
+
+
+def _cmd_validate_cache(args: argparse.Namespace) -> int:
+    result = validate_cache(args.cache_path)
+    print(json.dumps(result, indent=2))
+    return 0 if result["valid"] else 1
+
+
+def _cmd_debug_cache(args: argparse.Namespace) -> int:
+    debug_cache(args.cache_path)
+    return 0
+
+
+def _cmd_emit(args: argparse.Namespace) -> int:
+    cfg = _cfg_from_env()
+    emit_lines(args.cache_path, cfg, **_emit_kwargs(cfg))
+    return 0
+
+
+def _cmd_emit_json(args: argparse.Namespace) -> int:
+    cfg = _cfg_from_env()
+    emit_plan_json(args.cache_path, cfg, **_emit_kwargs(cfg))
+    return 0
+
+
+def _cmd_precheck(args: argparse.Namespace) -> int:
+    cfg = _cfg_from_env()
+    bulk_up, stdouts = run_prechecks_full(
+        cfg, os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"))
+    # The per-origin stdout rides along so the precheck-known stage can
+    # reuse the manager's outdated list (npm/brew) instead of issuing
+    # per-tool lookups.
+    print(json.dumps({"bulk": bulk_up, "known": {}, "stdout": stdouts}))
+    return 0
+
+
+def _cmd_precheck_known(args: argparse.Namespace) -> int:
+    # Second pre-check stage: known tools already at the latest version.
+    # Reads the file precheck wrote (path in UAC_PRECHECK_UPTODATE_FILE),
+    # fills its "known" map, and prints the full updated JSON.
+    cfg = _cfg_from_env()
+    bulk_up, stdouts = _precheck_stage_data()
+    known_up = run_known_prechecks(
+        args.cache_path, cfg, bulk_up, stdouts,
+        os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"),
+        _parse_csv(os.environ.get("UAC_PRECHECK_SKIP")),
+    )
+    print(json.dumps({"bulk": bulk_up, "known": known_up, "stdout": stdouts}))
+    return 0
+
+
+def _cmd_precheck_known_candidates(args: argparse.Namespace) -> int:
+    # Dry-run support: known tool names that WOULD be considered for an
+    # up-to-date check this run (no lookups performed).
+    cfg = _cfg_from_env()
+    names = known_precheck_candidates(
+        args.cache_path, cfg,
+        os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"),
+        _parse_csv(os.environ.get("UAC_PRECHECK_SKIP")),
+    )
+    print(", ".join(names))
+    return 0
+
+
+def _cmd_precheck_candidates(args: argparse.Namespace) -> int:
+    cfg = _cfg_from_env()
+    origins = precheck_candidate_origins(
+        cfg, os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"))
+    print(", ".join(origins))
+    return 0
+
+
+def _cmd_scan_dirs(args: argparse.Namespace) -> int:
+    # Static discovery-scan directories from the merged config, as TSV rows
+    # ("dir\torigin\tmode") for the shell's full_scan. Dirs are printed
+    # verbatim; the shell expands a leading $HOME (no eval).
+    cfg = _cfg_from_env()
+    for d, origin, mode in scan_dirs_config_rows(cfg):
+        sys.stdout.write(f"{d}\t{origin}\t{mode}\n")
+    return 0
+
+
+def _cmd_resolve_major_holds(args: argparse.Namespace) -> int:
+    # Decide what each "name:major" hold does this run: block (a major
+    # upgrade is pending), allow (no major jump — update runs), or unknown
+    # (can't verify — stays held, fail-safe). Reuses the pre-check file's
+    # captured manager output where available.
+    cfg = _cfg_from_env()
+    bulk_up, stdouts = _precheck_stage_data()
+    result = resolve_major_holds(args.cache_path, cfg, os.environ.get("HOLD"), bulk_up, stdouts)
+    print(json.dumps(result))
+    return 0
+
+
+def _cmd_list_json(args: argparse.Namespace) -> int:
+    list_json(args.cache_path)
+    return 0
+
+
+def _cmd_snapshot_versions(args: argparse.Namespace) -> int:
+    snap = snapshot_versions(
+        _read_lines(args.emit_path),
+        args.cache_path or None,
+        args.prior_snapshot_path or None,
+    )
+    print(json.dumps(snap))
+    return 0
+
+
+def _cmd_notify_diff(args: argparse.Namespace) -> int:
+    notify_diff(
+        _load_json(args.before), _load_json(args.after),
+        int(args.ok), int(args.fail),
+        _load_new_tools_arg(args.new_tools),
+        _load_new_tools_arg(args.quarantined),
+        _load_new_tools_arg(args.held),
+        _load_new_tools_arg(args.failed),
+    )
+    return 0
+
+
+def _cmd_run_summary(args: argparse.Namespace) -> int:
+    sys.stdout.write(format_run_summary(
+        _load_json(args.before), _load_json(args.after),
+        int(args.ok), int(args.fail),
+        _load_new_tools_arg(args.new_tools),
+        _load_new_tools_arg(args.quarantined),
+        _load_new_tools_arg(args.held),
+        _load_new_tools_arg(args.failed),
+        mode=_summary_mode_env(),
+    ))
+    return 0
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    history_path = args.history_path or default_history_path()
+    sys.stdout.write(format_history(history_path, args.n))
+    return 0
+
+
+def _cmd_history_append(args: argparse.Namespace) -> int:
+    before = _load_json(args.before_json) if args.before_json else {}
+    after = _load_json(args.after_json) if args.after_json else {}
+    appended = history_append(
+        args.history_path, args.run_id, _read_lines(args.results_path), before, after)
+    logger.debug(f"Appended {appended} history record(s) to {args.history_path}")
+    return 0
+
+
+def _cmd_new_tools(args: argparse.Namespace) -> int:
+    print(json.dumps(diff_new_tools(args.prev_names_path or "", args.cache_path or "")))
+    return 0
+
+
+def _cmd_suggest(args: argparse.Namespace) -> int:
+    suggest_config(args.cache_path, _cfg_with_legacy_base(args.base_config or ""))
+    return 0
+
+
+def _cmd_suggest_known(args: argparse.Namespace) -> int:
+    suggest_known(args.cache_path, _cfg_with_legacy_base(args.base_config or ""))
+    return 0
+
+
+def _cmd_suggest_known_count(args: argparse.Namespace) -> int:
+    cfg = _cfg_with_legacy_base(args.base_config or "", do_validate=False)
+    print(json.dumps(suggest_known_count(args.cache_path, cfg)))
+    return 0
+
+
+def _cmd_log_unknowns(args: argparse.Namespace) -> int:
+    cfg = _cfg_with_legacy_base(args.base_config or "")
+    log_unknowns(args.cache_path, cfg, os.environ.get("UNKNOWN_LOG_FILE", UNKNOWN_LOG_DEFAULT))
+    return 0
+
+
+def _cmd_report_unknown(args: argparse.Namespace) -> int:
+    report_unknown(args.unknown_log or UNKNOWN_LOG_DEFAULT, args.min_times)
+    return 0
+
+
+def _cmd_ack_unknown(args: argparse.Namespace) -> int:
+    ack_unknown(args.unknown_log, args.tool_name)
+    return 0
+
+
+def _cmd_hold_edit(args: argparse.Namespace, add: bool) -> int:
+    names = _parse_csv(args.names)
+    if not names:
+        print("No names given.", file=sys.stderr)
+        return 2
+    hold = edit_local_hold(args.config_local_file, add=names if add else None,
+                           remove=None if add else names)
+    verb = "Held" if add else "Unheld"
+    print(f"{verb}: {', '.join(sorted(names))}")
+    print(f"hold list now ({len(hold)}): {', '.join(hold) if hold else '(empty)'}")
+    return 0
+
+
+def _cmd_hold_add(args: argparse.Namespace) -> int:
+    return _cmd_hold_edit(args, add=True)
+
+
+def _cmd_hold_remove(args: argparse.Namespace) -> int:
+    return _cmd_hold_edit(args, add=False)
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    cfg = _cfg_from_env()
+    history_path = os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path()
+    report = doctor_report(args.cache_path, cfg, history_path)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_doctor_report(report), end="")
+    return 1 if doctor_has_findings(report) else 0
+
+
+def _cmd_changelog(args: argparse.Namespace) -> int:
+    cfg = _cfg_from_env(do_validate=False)
+    sys.stdout.write(build_changelog_digest(_load_json(args.before), _load_json(args.after), cfg))
+    return 0
+
+
+def _cmd_cache_names(args: argparse.Namespace) -> int:
+    for name in cache_tool_names(args.cache_path):
+        print(name)
+    return 0
+
+
+def _cmd_list_human(args: argparse.Namespace) -> int:
+    out = format_tool_list(args.cache_path)
+    if out:
+        print(out)
+    return 0
+
+
+def _cmd_lines_to_json(args: argparse.Namespace) -> int:
+    print(lines_to_json(sys.stdin.read()))
+    return 0
+
+
+def _cmd_suggest_known_summary(args: argparse.Namespace) -> int:
+    # One-line "count<TAB>sample" for the shell's post-run auto-tip.
+    cfg = _cfg_with_legacy_base(args.base_config or "", do_validate=False)
+    candidates = suggest_known_count(args.cache_path, cfg)
+    sample = ", ".join(str(c[0]) for c in candidates[:3] if c)
+    print(f"{len(candidates)}\t{sample}")
+    return 0
+
+
+def _cmd_unknown_summary(args: argparse.Namespace) -> int:
+    count, sample = unknown_log_summary(args.unknown_log)
+    print(count)
+    print(sample)
+    return 0
+
+
+def _cmd_json_summary(args: argparse.Namespace) -> int:
+    print(json.dumps({"ok": int(args.ok), "failed": int(args.fail)}))
+    return 0
+
+
+def _cmd_insights(args: argparse.Namespace) -> int:
+    history_path = args.history_path or (
+        os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path())
+    report = build_insights(history_path, top_n=args.top)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        sys.stdout.write(format_insights(report))
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lib_update_all_clis.py",
+        description="update-all-clis library subcommands (invoked by update_all_clis.sh).",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def _p(name: str, func: Any, **kwargs: Any) -> argparse.ArgumentParser:
+        sp = sub.add_parser(name, **kwargs)
+        sp.set_defaults(func=func)
+        return sp
+
+    p = _p("benchmark", _cmd_benchmark); p.add_argument("cache_path", nargs="?", default="")
+    _p("health-check", _cmd_health_check)
+    p = _p("backup", _cmd_backup); p.add_argument("cache_path")
+    p = _p("list-backups", _cmd_list_backups); p.add_argument("cache_path")
+    p = _p("restore", _cmd_restore)
+    p.add_argument("cache_path"); p.add_argument("backup_path")
+    _p("parse-npm-globals", _cmd_parse_npm_globals)
+    p = _p("convert-tools-array", _cmd_convert_tools_array)
+    p.add_argument("scanned_at", nargs="?", default="")
+    p.add_argument("existing_cache", nargs="?", default="")
+    p = _p("incremental-scan", _cmd_incremental_scan)
+    p.add_argument("cache_path"); p.add_argument("scanned_at")
+    p.add_argument("force"); p.add_argument("rows_file")
+    p.add_argument("extra_tools_file", nargs="?", default="")
+    p = _p("update-cache-versions", _cmd_update_cache_versions); p.add_argument("cache_path")
+    p = _p("validate-cache", _cmd_validate_cache); p.add_argument("cache_path")
+    p = _p("debug-cache", _cmd_debug_cache); p.add_argument("cache_path")
+    p = _p("emit", _cmd_emit); p.add_argument("cache_path")
+    p = _p("emit-json", _cmd_emit_json); p.add_argument("cache_path")
+    _p("precheck", _cmd_precheck)
+    p = _p("precheck-known", _cmd_precheck_known); p.add_argument("cache_path")
+    p = _p("precheck-known-candidates", _cmd_precheck_known_candidates)
+    p.add_argument("cache_path")
+    _p("precheck-candidates", _cmd_precheck_candidates)
+    _p("scan-dirs", _cmd_scan_dirs)
+    p = _p("resolve-major-holds", _cmd_resolve_major_holds); p.add_argument("cache_path")
+    p = _p("list-json", _cmd_list_json); p.add_argument("cache_path")
+    p = _p("snapshot-versions", _cmd_snapshot_versions)
+    p.add_argument("emit_path"); p.add_argument("cache_path", nargs="?", default="")
+    p.add_argument("prior_snapshot_path", nargs="?", default="")
+    for name, func in (("notify-diff", _cmd_notify_diff), ("run-summary", _cmd_run_summary)):
+        p = _p(name, func)
+        p.add_argument("before"); p.add_argument("after")
+        p.add_argument("ok"); p.add_argument("fail")
+        p.add_argument("new_tools", nargs="?", default="")
+        p.add_argument("quarantined", nargs="?", default="")
+        p.add_argument("held", nargs="?", default="")
+        p.add_argument("failed", nargs="?", default="")
+    p = _p("history", _cmd_history)
+    p.add_argument("history_path", nargs="?", default="")
+    p.add_argument("n", nargs="?", type=int, default=3)
+    p = _p("history-append", _cmd_history_append)
+    p.add_argument("history_path"); p.add_argument("run_id"); p.add_argument("results_path")
+    p.add_argument("before_json", nargs="?", default="")
+    p.add_argument("after_json", nargs="?", default="")
+    p = _p("new-tools", _cmd_new_tools)
+    p.add_argument("prev_names_path", nargs="?", default="")
+    p.add_argument("cache_path", nargs="?", default="")
+    for name, func in (("suggest", _cmd_suggest), ("suggest-known", _cmd_suggest_known),
+                       ("suggest-known-count", _cmd_suggest_known_count),
+                       ("log-unknowns", _cmd_log_unknowns)):
+        p = _p(name, func)
+        p.add_argument("cache_path")
+        p.add_argument("base_config", nargs="?", default="")
+    p = _p("report-unknown", _cmd_report_unknown)
+    p.add_argument("unknown_log", nargs="?", default="")
+    p.add_argument("min_times", nargs="?", type=int, default=1)
+    p = _p("ack-unknown", _cmd_ack_unknown)
+    p.add_argument("unknown_log"); p.add_argument("tool_name")
+    p = _p("hold-add", _cmd_hold_add)
+    p.add_argument("config_local_file"); p.add_argument("names")
+    p = _p("hold-remove", _cmd_hold_remove)
+    p.add_argument("config_local_file"); p.add_argument("names")
+    p = _p("doctor", _cmd_doctor)
+    p.add_argument("cache_path", nargs="?", default="")
+    p.add_argument("--json", action="store_true")
+    p = _p("changelog", _cmd_changelog)
+    p.add_argument("before"); p.add_argument("after")
+    p = _p("cache-names", _cmd_cache_names); p.add_argument("cache_path")
+    p = _p("list-human", _cmd_list_human); p.add_argument("cache_path")
+    _p("lines-to-json", _cmd_lines_to_json)
+    p = _p("suggest-known-summary", _cmd_suggest_known_summary)
+    p.add_argument("cache_path")
+    p.add_argument("base_config", nargs="?", default="")
+    p = _p("unknown-summary", _cmd_unknown_summary); p.add_argument("unknown_log")
+    p = _p("json-summary", _cmd_json_summary)
+    p.add_argument("ok"); p.add_argument("fail")
+    p = _p("insights", _cmd_insights)
+    p.add_argument("history_path", nargs="?", default="")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--top", type=int, default=10)
+    return parser
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(
-            "usage: lib_update_all_clis.py emit|emit-json|list-json|snapshot-versions|"
-            "notify-diff|run-summary|new-tools|suggest|suggest-known|suggest-known-count|"
-            "log-unknowns|report-unknown|ack-unknown|"
-            "parse-npm-globals|convert-tools-array|update-cache-versions|validate-cache|debug-cache|"
-            "health-check|backup|restore|list-backups|hold-lock|try-hold-lock|benchmark|"
-            "hold-add|hold-remove|doctor|changelog|"
-            "history|history-append …",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    cmd = sys.argv[1]
-    if cmd == "benchmark":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        results = benchmark_operation(cache_path, cfg, base, local or None)
-        print(json.dumps(results, indent=2))
-        sys.exit(0)
-    elif cmd == "health-check":
-        result = health_check()
-        print(json.dumps(result, indent=2))
-        sys.exit(0 if result["status"] == "healthy" else 1)
-    elif cmd == "backup":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not cache_path:
-            print("Usage: lib_update_all_clis.py backup <cache_path>", file=sys.stderr)
-            sys.exit(2)
-        backup_path = create_backup(cache_path)
-        if backup_path:
-            print(f"Backup created: {backup_path}")
-        else:
-            print("No backup created (cache file not found)")
-        sys.exit(0)
-    elif cmd == "list-backups":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not cache_path:
-            print("Usage: lib_update_all_clis.py list-backups <cache_path>", file=sys.stderr)
-            sys.exit(2)
-        backups = list_backups(cache_path)
-        if backups:
-            print(f"Found {len(backups)} backup(s):")
-            for b in backups:
-                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(b)))
-                print(f"  {b} (modified: {mtime})")
-        else:
-            print("No backups found")
-        sys.exit(0)
-    elif cmd == "restore":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        backup_path = sys.argv[3] if len(sys.argv) > 3 else ""
-        if not cache_path or not backup_path:
-            print("Usage: lib_update_all_clis.py restore <cache_path> <backup_path>", file=sys.stderr)
-            sys.exit(2)
-        success = restore_backup(cache_path, backup_path)
-        sys.exit(0 if success else 1)
-    elif cmd in ("hold-lock", "try-hold-lock"):
-        path = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not path:
-            print(f"usage: lib_update_all_clis.py {cmd} <path>", file=sys.stderr)
-            sys.exit(2)
-        sys.exit(hold_lock(path, blocking=(cmd == "hold-lock")))
-    elif cmd == "parse-npm-globals":
-        json_input = sys.stdin.read()
-        result = parse_npm_globals_json(json_input)
-        print(result)
-    elif cmd == "convert-tools-array":
-        scanned_at = sys.argv[2] if len(sys.argv) > 2 else ""
-        existing_cache = sys.argv[3] if len(sys.argv) > 3 else None
-        tools_input = sys.stdin.read()
-        result = convert_tools_array_to_json(tools_input, scanned_at, existing_cache)
-        print(result)
-    elif cmd == "incremental-scan":
-        if len(sys.argv) < 6:
-            print(
-                "usage: lib_update_all_clis.py incremental-scan <cache_path> <scanned_at> "
-                "<force:0|1> <rows_file> [extra_tools_file]",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        cache_path = sys.argv[2]
-        scanned_at = sys.argv[3]
-        force = sys.argv[4] == "1"
-        rows_file = sys.argv[5]
-        extra_file = sys.argv[6] if len(sys.argv) > 6 else ""
-        with open(rows_file, encoding="utf-8") as f:
-            rows = parse_scan_rows(f.read())
-        extra_tools: list[tuple[str, str]] = []
-        if extra_file and os.path.isfile(extra_file):
-            with open(extra_file, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if "|" not in line:
-                        continue
-                    n, o = line.split("|", 1)
-                    if n:
-                        extra_tools.append((n, o))
-        result = incremental_scan_merge(rows, cache_path, scanned_at, force, extra_tools)
-        print(result)
-    elif cmd == "update-cache-versions":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        versions_input = sys.stdin.read()
-        versions = json.loads(versions_input) if versions_input.strip() else {}
-        update_cache_versions(cache_path, versions)
-        sys.exit(0)
-    elif cmd == "validate-cache":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        result = validate_cache(cache_path)
-        print(json.dumps(result, indent=2))
-        sys.exit(0 if result["valid"] else 1)
-    elif cmd == "debug-cache":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        debug_cache(cache_path)
-        sys.exit(0)
-    elif cmd == "emit":
-        cache_path = sys.argv[2]
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        emit_lines(
-            cache_path,
-            cfg,
-            os.environ.get("ONLY_ORIGINS"),
-            os.environ.get("SKIP_ORIGINS"),
-            os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path(),
-            int(os.environ.get("UAC_QUARANTINE_AFTER") or DEFAULT_QUARANTINE_AFTER),
-            os.environ.get("UAC_INCLUDE_QUARANTINED", "0") == "1",
-            _load_precheck_uptodate_env(),
-            normalize_hold_entries(cfg.get("hold")),
-            _parse_csv(os.environ.get("HOLD")),
-        )
-    elif cmd == "emit-json":
-        cache_path = sys.argv[2]
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        emit_plan_json(
-            cache_path,
-            cfg,
-            os.environ.get("ONLY_ORIGINS"),
-            os.environ.get("SKIP_ORIGINS"),
-            os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path(),
-            int(os.environ.get("UAC_QUARANTINE_AFTER") or DEFAULT_QUARANTINE_AFTER),
-            os.environ.get("UAC_INCLUDE_QUARANTINED", "0") == "1",
-            _load_precheck_uptodate_env(),
-            normalize_hold_entries(cfg.get("hold")),
-            _parse_csv(os.environ.get("HOLD")),
-        )
-    elif cmd == "precheck":
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        result = run_prechecks(cfg, os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"))
-        print(json.dumps(result))
-    elif cmd == "precheck-candidates":
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        origins = precheck_candidate_origins(cfg, os.environ.get("ONLY_ORIGINS"), os.environ.get("SKIP_ORIGINS"))
-        print(", ".join(origins))
-    elif cmd == "list-json":
-        cache_path = sys.argv[2]
-        list_json(cache_path)
-    elif cmd == "snapshot-versions":
-        emit_path = sys.argv[2]
-        cache_path = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
-        prior_snapshot_path = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
-        snap = snapshot_versions(_read_lines(emit_path), cache_path, prior_snapshot_path)
-        print(json.dumps(snap))
-    elif cmd == "notify-diff":
-        before = _load_json(sys.argv[2])
-        after = _load_json(sys.argv[3])
-        new_tools = _load_new_tools_arg(sys.argv[6] if len(sys.argv) > 6 else "")
-        quarantined = _load_new_tools_arg(sys.argv[7] if len(sys.argv) > 7 else "")
-        held = _load_new_tools_arg(sys.argv[8] if len(sys.argv) > 8 else "")
-        notify_diff(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools, quarantined, held)
-    elif cmd == "run-summary":
-        before = _load_json(sys.argv[2])
-        after = _load_json(sys.argv[3])
-        new_tools = _load_new_tools_arg(sys.argv[6] if len(sys.argv) > 6 else "")
-        quarantined = _load_new_tools_arg(sys.argv[7] if len(sys.argv) > 7 else "")
-        held = _load_new_tools_arg(sys.argv[8] if len(sys.argv) > 8 else "")
-        sys.stdout.write(format_run_summary(before, after, int(sys.argv[4]), int(sys.argv[5]), new_tools, quarantined, held))
-    elif cmd == "history":
-        history_path = sys.argv[2] if len(sys.argv) > 2 else default_history_path()
-        n = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-        sys.stdout.write(format_history(history_path, n))
-    elif cmd == "history-append":
-        if len(sys.argv) < 5:
-            print(
-                "usage: lib_update_all_clis.py history-append <history_path> <run_id> "
-                "<results_path> [before_json] [after_json]",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        history_path = sys.argv[2]
-        run_id = sys.argv[3]
-        results_path = sys.argv[4]
-        before = _load_json(sys.argv[5]) if len(sys.argv) > 5 else {}
-        after = _load_json(sys.argv[6]) if len(sys.argv) > 6 else {}
-        result_lines = _read_lines(results_path)
-        appended = history_append(history_path, run_id, result_lines, before, after)
-        logger.debug(f"Appended {appended} history record(s) to {history_path}")
-        sys.exit(0)
-    elif cmd == "new-tools":
-        prev_names_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        cache_path = sys.argv[3] if len(sys.argv) > 3 else ""
-        print(json.dumps(diff_new_tools(prev_names_path, cache_path)))
-    elif cmd == "suggest":
-        cache_path = sys.argv[2]
-        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        suggest_config(cache_path, cfg)
-    elif cmd == "suggest-known":
-        cache_path = sys.argv[2]
-        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        suggest_known(cache_path, cfg)
-    elif cmd == "suggest-known-count":
-        cache_path = sys.argv[2]
-        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        result = suggest_known_count(cache_path, cfg)
-        print(json.dumps(result))
-    elif cmd == "log-unknowns":
-        cache_path = sys.argv[2]
-        unknown_log = os.environ.get("UNKNOWN_LOG_FILE", UNKNOWN_LOG_DEFAULT)
-        base = os.environ.get("CONFIG_FILE", sys.argv[3] if len(sys.argv) > 3 else "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        log_unknowns(cache_path, cfg, unknown_log)
-    elif cmd == "report-unknown":
-        unknown_log = sys.argv[2] if len(sys.argv) > 2 else UNKNOWN_LOG_DEFAULT
-        min_times = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-        report_unknown(unknown_log, min_times)
-    elif cmd == "ack-unknown":
-        if len(sys.argv) < 4:
-            print("usage: lib_update_all_clis.py ack-unknown UNKNOWN_LOG TOOL_NAME", file=sys.stderr)
-            sys.exit(2)
-        ack_unknown(sys.argv[2], sys.argv[3])
-    elif cmd == "hold-add":
-        if len(sys.argv) < 4:
-            print("usage: lib_update_all_clis.py hold-add CONFIG_LOCAL_FILE name1,name2,...", file=sys.stderr)
-            sys.exit(2)
-        names = _parse_csv(sys.argv[3])
-        if not names:
-            print("No names given.", file=sys.stderr)
-            sys.exit(2)
-        hold = edit_local_hold(sys.argv[2], add=names)
-        print(f"Held: {', '.join(sorted(names))}")
-        print(f"hold list now ({len(hold)}): {', '.join(hold) if hold else '(empty)'}")
-    elif cmd == "hold-remove":
-        if len(sys.argv) < 4:
-            print("usage: lib_update_all_clis.py hold-remove CONFIG_LOCAL_FILE name1,name2,...", file=sys.stderr)
-            sys.exit(2)
-        names = _parse_csv(sys.argv[3])
-        if not names:
-            print("No names given.", file=sys.stderr)
-            sys.exit(2)
-        hold = edit_local_hold(sys.argv[2], remove=names)
-        print(f"Unheld: {', '.join(sorted(names))}")
-        print(f"hold list now ({len(hold)}): {', '.join(hold) if hold else '(empty)'}")
-    elif cmd == "doctor":
-        cache_path = sys.argv[2] if len(sys.argv) > 2 else ""
-        want_json = "--json" in sys.argv[3:]
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        validate(cfg)
-        history_path = os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path()
-        report = doctor_report(cache_path, cfg, history_path)
-        if want_json:
-            print(json.dumps(report, indent=2))
-        else:
-            print(format_doctor_report(report), end="")
-        sys.exit(1 if doctor_has_findings(report) else 0)
-    elif cmd == "changelog":
-        if len(sys.argv) < 4:
-            print("usage: lib_update_all_clis.py changelog BEFORE_JSON AFTER_JSON", file=sys.stderr)
-            sys.exit(2)
-        before = _load_json(sys.argv[2])
-        after = _load_json(sys.argv[3])
-        base = os.environ.get("CONFIG_FILE", "")
-        local = os.environ.get("CONFIG_LOCAL_FILE", "")
-        if not base:
-            base = os.path.join(os.path.dirname(__file__), "tool_config.json")
-        cfg = load_merge(base, local or None)
-        sys.stdout.write(build_changelog_digest(before, after, cfg))
-    else:
-        print("unknown command", file=sys.stderr)
-        sys.exit(2)
+    args = _build_parser().parse_args()
+    sys.exit(args.func(args))
 
 
 if __name__ == "__main__":

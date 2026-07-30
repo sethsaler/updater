@@ -4,7 +4,7 @@
 
 `update-all-clis` scans `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, npm global bins (including `~/.npm-global/bin`, `pnpm`, `yarn`, and nvm-installed packages), Homebrew Cellar, gem bins, Go tool bins, dotnet tools, krew plugins, mise shims, pipx venvs, `~/bin`, Wasmtime/Wasmer runtimes, macOS Python user installs (`~/Library/Python/3.x/bin`), Volta, asdf, proto, Rye, Foundry, aqua, Mason (Neovim LSP), and **all user-writable directories on `$PATH`** — plus single-CLI managers detected by presence alone (rustup, gcloud, mas, tlmgr) — then runs the right update command for each. Nothing is hardcoded about *what* you have installed.
 
-Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning), and [`tui_update_all_clis.py`](tui_update_all_clis.py) (the live dashboard executor — see "Live TUI dashboard" below).
+Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool_config.json), [`lib_update_all_clis.py`](lib_update_all_clis.py) (merge, validation, and command planning), and [`tui_update_all_clis.py`](tui_update_all_clis.py) (the update executor and its live dashboard — see below).
 
 > **Prefer something thinner?** See [`migration/`](migration/) for a Topgrade + residual-script setup that covers the same managers and AI self-updaters without the discovery engine. The full stack above remains the default.
 
@@ -44,7 +44,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Rye (Python) | `rye self update` |
 | Foundry (Ethereum) | `foundryup` |
 | aqua (CLI installer) | `aqua update` |
-| Mason (Neovim LSP) | _(discovery only; no bulk update)_ |
+| Mason (Neovim LSP) | headless `nvim` registry refresh + `MasonInstall` of installed packages (guarded; see caveats) |
 
 ### Known tools (individual commands)
 
@@ -116,7 +116,7 @@ A tool being in `known` never suppresses its origin's bulk update: e.g. `cline` 
 - **tlmgr** — TeX Live package manager; `tlmgr update --self --all`, detected via `command -v tlmgr`. **Caveat, not machine-verified**: on a typical system-wide TeX Live install, `tlmgr` needs `sudo` to write to the system tree. This script **never invokes `sudo`** (and never will), so on such installs this bulk command will fail with a permissions error rather than silently doing nothing — the failure is visible in the run summary/history like any other failed job. If your TeX Live install needs elevated permissions, run `sudo tlmgr update --self --all` yourself, or reinstall TeX Live to a user-writable prefix.
 - **`path`** — **Enabled by default**. Binaries found under `$PATH` directories (excluding system dirs like `/usr/bin`, `/bin`, `/sbin`) get origin `path`. There is no default bulk update for `path`; add a `"path"` entry under `bulk` in [`config.local.json`](#configuration-merge-and-overrides) if you want a single command for all of them, or list tools under `known`. Use `--no-scan-path` to disable PATH scanning.
 
-None of pipx, rustup, gcloud, mas, or tlmgr were installed on the machine this was built on; every entry above is guarded to be a silent no-op in both discovery and the update command when the corresponding tool isn't present, but only `pipx` (pre-existing) had its wiring exercised end-to-end there. `check` pre-check commands and `repos` changelog slugs were deliberately **not** added for gcloud/tlmgr (no reliable/verifiable check command; no meaningful public-release-notes repo for gcloud, and TeX Live isn't a single-repo GitHub project). `rustup` (`rust-lang/rustup`) and `mas` (`mas-cli/mas`) do have verified `repos` slugs for the changelog digest.
+None of pipx, rustup, gcloud, mas, tlmgr, or nvim/Mason were installed on the machine this was built on; every entry above is guarded to be a silent no-op in both discovery and the update command when the corresponding tool isn't present, but only `pipx` (pre-existing) had its wiring exercised end-to-end there. The **mason** bulk command (headless `nvim` registry refresh + `MasonInstall` of installed packages, blocking in headless mode by Mason's own docs) is likewise **not machine-verified**, and Mason's package-level failures don't reach its exit code — a broken Mason update reads as success, so check `nvim +Mason` itself if you suspect trouble. `check` pre-check commands and `repos` changelog slugs were deliberately **not** added for gcloud/tlmgr (no reliable/verifiable check command; no meaningful public-release-notes repo for gcloud, and TeX Live isn't a single-repo GitHub project). `rustup` (`rust-lang/rustup`) and `mas` (`mas-cli/mas`) do have verified `repos` slugs for the changelog digest.
 
 ## Installation
 
@@ -164,6 +164,9 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --suggest-known   # show tools updated via bulk but not in known list
 ./update_all_clis.sh --history         # show the last 3 runs (ok/fail, version changes, failures)
 ./update_all_clis.sh --history=10      # show the last 10 runs
+./update_all_clis.sh --insights        # history analytics: slowest jobs, chronic failers, churn leaders
+./update_all_clis.sh --summary=failures  # collapse the up-to-date list; lead with failures
+./update_all_clis.sh --notify=on-failure # desktop dialog only when at least one update failed
 ./update_all_clis.sh --include-quarantined  # force-run tools/origins currently quarantined
 ./update_all_clis.sh --no-precheck    # always run every bulk update (skip outdated pre-checks)
 ./update_all_clis.sh --hold=claude,brew     # pin tools/origins (persists in config.local.json) and exit
@@ -178,6 +181,7 @@ SKIP=hermes,uv ./update_all_clis.sh
 QUIET=1 ./update_all_clis.sh
 ./update_all_clis.sh --no-tui      # plain log output even on an interactive terminal
 ./update_all_clis.sh --tui         # force the live dashboard on
+UAC_EXECUTOR=bash ./update_all_clis.sh   # legacy in-shell executor (escape hatch, one release)
 ```
 
 ### Retries and auto-fix (repair after failure)
@@ -214,13 +218,14 @@ Where fix commands come from:
 
 `--dry-run` shows the repair that would run: `[dry-run]   (on failure, after 1 retries: ...)`.
 
-### Live TUI dashboard
+### The update executor (and its live TUI dashboard)
 
-On an interactive terminal, the update run renders a live dashboard instead of interleaved log lines: one row per job with a spinner, per-job elapsed time, and its latest output line, plus a progress bar with ok/failed tallies. `Ctrl+C` aborts cleanly — running updates (whole process trees) are killed and the terminal is restored.
+Since 0.11.0 there is **one** update executor: the stdlib-only Python runner `tui_update_all_clis.py`. On an interactive terminal it renders a live dashboard — one row per job with a spinner, per-job elapsed time, and its latest output line, plus a progress bar with ok/fail tallies — and `Ctrl+C` aborts cleanly (running updates' whole process trees are killed and the terminal is restored). Everywhere else it prints the same plain log lines the legacy bash executor produced. Retry policy, the per-job watchdog, process-tree kills, per-origin lock serialization, and exit-code conventions now live in exactly one implementation instead of being mirrored across two languages; `tests/executor_parity.sh` gates the remaining equivalence in CI.
 
-- **On by default** when stdout is a TTY. Force with `--tui`, disable with `--no-tui` or `UAC_TUI=0`.
-- **Automatically off** (plain log output, exactly as before) for non-terminals (LaunchAgent, systemd, CI, pipes), `--dry-run`, `--quiet`, `--trace`, `--list`/JSON modes, `NO_COLOR`, `TERM=dumb`, very small terminals, and when `tui_update_all_clis.py` isn't installed next to the script.
-- The dashboard is a stdlib-only Python executor (`tui_update_all_clis.py`) that runs the same plan with the same semantics — parallel cap, per-origin lock serialization, per-job watchdog timeout, process-tree kills — and reports results back in the format the shell's own executors produce, so run history, summaries, notify dialogs, and changelog digests are unaffected. No third-party dependencies.
+- **Dashboard on by default** when stdout is a TTY. Force with `--tui`, disable with `--no-tui` or `UAC_TUI=0`.
+- **Automatically plain output** (identical lines to the old bash executor) for non-terminals (LaunchAgent, systemd, CI, pipes), `NO_COLOR`, `TERM=dumb`, and very small terminals. `--quiet` is full executor silence everywhere.
+- The legacy bash executor remains only for `--dry-run` (prints "would run" lines), `--trace` (`bash -x` is shell-only), and the `UAC_EXECUTOR=bash` escape hatch — it is slated for removal next release. If `tui_update_all_clis.py` is missing next to the script, the bash executor is used automatically.
+- Run history, summaries, notify dialogs, and changelog digests are unaffected: the executor reports results in the exact format the shell's post-run steps consume.
 
 ### Performance
 
@@ -231,7 +236,7 @@ The updater includes several performance optimizations:
 - **Rate limiting** — minimal delay between subprocess calls (0.01s default, configurable via `UAC_RATE_LIMIT_DELAY`)
 - **Parallel version probing** — uses 16 workers for concurrent version checks
 - **Fast failure detection** — 5-second timeout for unresponsive tools during version probing
-- **Outdated pre-checks** — a bulk origin with a configured `check` command (see below) skips its update entirely when the check says nothing's outdated
+- **Outdated pre-checks** — a bulk origin with a configured `check` command (see below) skips its update entirely when the check says nothing's outdated, and a known tool already at the latest version (npm/brew/uv/cargo signals) is skipped the same way
 - **mtime-gated post-run probing** — the post-update version snapshot only re-probes a tool/manager whose binary's mtime actually changed since the pre-run snapshot; everything else reuses the pre-run version string instead of spawning another `--version` call
 - **Incremental discovery scan** — directories are only re-listed when their mtime changed since the last scan (see below); `--rescan` forces a full walk
 - **Fewer `python3` spawns per run** — the per-job and single-instance locks used to each spawn a Python `fcntl.flock` coprocess; both are now a bash-native `mkdir` spin-lock (atomic on POSIX filesystems, no helper process, same stale-lock-steal and Ctrl+C-safe cleanup semantics). `--dry-run` also skips locking entirely now — it never mutates anything, so serializing "would-run" jobs against each other bought nothing but a lock round-trip per job.
@@ -261,9 +266,28 @@ Use `--validate-cache` and `--debug-cache` to diagnose cache health and performa
 
 Semantics: the check command runs; if it **exits 0** and its stdout (after trimming whitespace) is **empty**, `[]`, or `{}`, the origin is treated as up to date and its bulk update is skipped this run. Any other outcome — non-zero exit, real output, a missing command, or an error — fails open and the update runs exactly as before. Skipped origins print `✓ <origin>: already up to date (pre-check)`, count as `ok` in the run summary, and are recorded in `history.jsonl` with `status: "ok"` and the check's own duration.
 
-Checks run **concurrently**, before the plan executes, and only for **bulk origins** (known-tool commands are left alone in v1 — a known tool routed through the same manager as a pre-checked origin still runs its own command). `--dry-run` never executes checks (some, like brew's, refresh manager metadata as a side effect) — it only reports which origins would have been checked. Disable pre-checks entirely with `--no-precheck` or `UAC_NO_PRECHECK=1`.
+Checks run **concurrently**, before the plan executes, and only for **bulk origins**. `--dry-run` never executes checks (some, like brew's, refresh manager metadata as a side effect) — it only reports which origins would have been checked. Disable pre-checks entirely with `--no-precheck` or `UAC_NO_PRECHECK=1`.
 
 Only `npm` and `brew` ship with a `check` command — both were verified by hand on a real machine. `gem outdated` was tried and rejected: it always prints noisy `Ignoring ...` lines and a long list of un-upgradable system gems, so its stdout is never actually empty even when every user-installed gem is current. `cargo` (needs the `cargo-install-update` subcommand, not installed here), `dotnet`, and `krew` were not verified (missing/not installed) and were left out rather than guessed at — a good next step for whoever picks this up on a machine that has them.
+
+#### Known-tool up-to-date checks (v2)
+
+Known tools are pre-checked too (the v1 limitation above is gone): a known tool already at the latest version is skipped as a synthetic `uptodate` job — on a real machine this eliminates ~45% of known-tool jobs per run. Every signal is **fail-open**: if it can't be computed or trusted, the update runs exactly as before.
+
+| Manager | How "already current" is decided |
+|---|---|
+| npm | package absent from the bulk npm check's `npm outdated -g --parseable` output (no extra network calls) |
+| brew | formula/cask absent from the bulk brew check's `brew outdated --quiet` output |
+| uv | `uv tool list` installed version == PyPI JSON API latest |
+| cargo | `cargo install --list` installed version == crates.io API latest |
+
+Rules and notes:
+
+- The npm/brew lists are **only trusted when the bulk check produced a usable signal this run** (origin confirmed up to date, or a non-empty outdated list). A failed check (offline, `brew update` error) means an untrusted list — not a wrongly empty one.
+- Registry lookups (PyPI/crates.io) are concurrent and TTL-cached for 6h (`UAC_KNOWN_LATEST_TTL`, cache at `~/.config/update-all-clis/known_latest_cache.json`). Failures are cached as nulls so a git-installed tool doesn't cost a request every run; nulls never satisfy the equality check.
+- `--skip`ed tools are never candidates (a skipped tool can't surface as an up-to-date ok). Held/quarantined tools keep their status — those transforms win over the pre-check replacement.
+- Only update commands of the exact shapes `npm update/install -g <pkg>`, `brew upgrade <pkg>`, `uv tool upgrade <pkg>`, `cargo install <pkg>` are checked (same tokenization discipline as fix derivation). Self-updaters and everything else run unconditionally.
+- gem/dotnet/krew and the remaining managers have no known-tool check either — same verify-don't-guess rule as above.
 
 #### Incremental discovery scan
 
@@ -273,7 +297,7 @@ Two scan modes: a plain directory listing (most bin dirs), and a "tree" mode for
 
 ### Configuration merge and overrides
 
-- **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known`, `bulk`, `check`, `repos`, and `fix` objects are **merged on top of** `tool_config.json` (local wins on key conflicts) and its `hold` array is **added to** (not replaced by) the base list, so you can add or override commands without editing the repo file.
+- **`~/.config/update-all-clis/config.local.json`** (override path with `CONFIG_LOCAL_FILE`) — optional. If present, its `known`, `bulk`, `check`, `repos`, and `fix` objects are **merged on top of** `tool_config.json` (local wins on key conflicts), its `hold` array is **added to** (not replaced by) the base list, and its `scan_dirs` entries **extend discovery** (local row wins on the same `dir`) — so you can add or override commands, and add your own scan directories, without editing the repo file.
 - **`CACHE_TTL_HOURS`** — cache freshness in hours (default **0**, i.e. every run does a fresh discovery scan so new installs are always picked up). Set to e.g. `24` to reuse a cache newer than 24h (unless `--rescan`).
 - **`ONLY_ORIGINS`** — comma-separated origins (and known tool names) to **restrict** what runs. When set, bulk updates run only for listed origins; known tools run only if their `origin` or `name` is listed.
 - **`SKIP_ORIGINS`** — comma-separated origins to skip for bulk updates; known tools whose `origin` is listed are skipped.
@@ -295,7 +319,10 @@ The dialog is **opt-in and never blocks the terminal** — it is spawned fully d
 
 - **Default:** no dialog.
 - **`--notify`** or **`UPDATE_ALL_CLIS_NOTIFY=1`** — show the dialog (non-blocking).
+- **`--notify=on-failure`** or **`UPDATE_ALL_CLIS_NOTIFY=on-failure`** — show it only when at least one update step failed (good for scheduled runs).
 - **`UPDATE_ALL_CLIS_NOTIFY=0`** or **`UPDATE_ALL_CLIS_NO_NOTIFY=1`** — never show it (set automatically for **LaunchAgent**/**systemd** schedules).
+
+The same summary text goes to the terminal and to `UPDATE_ALL_CLIS_SUMMARY_FILE` (for the email integration below). **`--summary=failures`** / **`UPDATE_ALL_CLIS_SUMMARY_MODE=failures`** makes it failure-focused everywhere: a leading **Failed** section (job names), the Upgraded list with `[MAJOR UPGRADE]` flags kept, and the long up-to-date name list collapsed to a count. `full` (the default) is unchanged.
 
 ### Run history
 
@@ -305,6 +332,12 @@ Every real (non-`--dry-run`) run appends one JSON line per executed job to **`~/
 ./update_all_clis.sh --history        # last 3 runs: ok/fail counts, version changes, failures
 ./update_all_clis.sh --history=10     # last 10 runs
 python3 lib_update_all_clis.py history ~/.config/update-all-clis/history.jsonl 5
+```
+
+**`--insights`** turns the same file into analytics — slowest jobs by mean duration, chronic failure rates (3+ appearances), most-frequently-updated tools, and actionable suggestions — and exits (`lib` also has `insights --json`):
+
+```bash
+./update_all_clis.sh --insights
 ```
 
 **Slowest-first scheduling** — when building the parallel-run plan, jobs are ordered by their historical mean duration (last ~10 runs per job), descending, so the long pole (usually `brew`) kicks off first instead of last. Jobs with no history yet run after the known-slow ones, in their otherwise-stable original order.
@@ -325,7 +358,13 @@ Force a quarantined job to run anyway with **`--include-quarantined`** (or `UAC_
 "hold": ["claude", "brew"]
 ```
 
-An entry may also be written `"name:major"` (e.g. `"claude:major"`). In v1 this is accepted and treated identically to a plain hold — for most package managers there's no reliable way to know the *target* version before the update runs, so a true "block major upgrades only" hold isn't safe to implement at the planning stage. What v1 gives you instead is **major-jump flagging in the run summary**: any tool whose version actually changed with a bump in the leading integer component (e.g. `1.9.0 → 2.0.0`) is marked `[MAJOR UPGRADE]` in the desktop dialog / `UPDATE_ALL_CLIS_SUMMARY_FILE` output, so you notice it after the fact even without a pre-run block.
+An entry may also be written `"name:major"` (e.g. `"claude:major"`) — a **semver-aware hold** that blocks only major upgrades. Before planning, a resolve stage compares the tool's installed version against the manager's latest (npm's captured outdated list or `npm view`, `brew info`, PyPI, crates.io — concurrent, and only for the handful of pinned tools). Three outcomes:
+
+- **Major jump pending** → the tool stays held, saying what's coming: `held (major upgrade to 3.0.0 blocked): cline — remove the ":major" hold to allow, or upgrade manually`.
+- **Minor/patch/no jump** → the update runs normally (you get safe upgrades without unholding).
+- **Unverifiable** (self-updaters like `claude update` with no registry, failed lookups, unparseable versions) → stays held, fail-safe: `held (:major pin, latest version unverified) — staying held; --unhold to force`.
+
+Works for `HOLD=name:major` ad hoc holds too, and a plain `"name"` hold on the same tool always wins. Independently, **major-jump flagging in the run summary** marks any tool whose leading version component actually bumped (e.g. `1.9.0 → 2.0.0`) with `[MAJOR UPGRADE]` in the summary output, so you notice big jumps after the fact as well.
 
 Two ways to manage the persistent hold list:
 
@@ -358,6 +397,7 @@ Checks (each is independent — one crashing doesn't prevent the rest from repor
 3. **Chronic failures** — jobs with 3+ failures in their last 10 `history.jsonl` records, surfaced even if they haven't (yet) hit the consecutive-failure quarantine threshold.
 4. **Config issues** — `hold` entries matching nothing; `check` entries for an origin with no corresponding `bulk` command. (`known` entries for tools that aren't installed are **informational only** — the config deliberately catalogs tools you might install, and absent ones are skipped.)
 5. **Cache health** — reuses `validate_cache()` (same as `--validate-cache`) rather than duplicating that logic. Cache *warnings* are informational; only cache errors count as findings.
+6. **Prune suggestions (informational)** — `known` entries whose binary is neither on `$PATH` nor in the latest discovery scan, i.e. tracked-but-nowhere tools worth reviewing for pruning. Like `not_installed`, these never affect the exit status.
 
 Exit code is **0** with no findings, **1** if any check surfaced something actionable.
 
@@ -452,23 +492,28 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 
 ## How it works
 
-1. **Discovery scan** — walks 25+ known tool directories (`~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, npm globals, Homebrew, Go bins, dotnet tools, krew, mise, pipx — both legacy `~/.local/pipx/venvs` and modern `~/.local/share/pipx/venvs` — pnpm (`~/Library/pnpm` on macOS, `~/.local/share/pnpm` on Linux), Yarn (`~/.yarn/bin`), etc.) **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`), then writes `~/.config/update-all-clis/cache.json`. A scan that fails or produces nothing **preserves the previous cache** instead of clobbering it.
+1. **Discovery scan** — walks the directories in the merged config's **`scan_dirs`** section (30+ static manager dirs: `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, `~/.npm-global/bin`, mise, krew, aqua, …) plus the manager-derived directories the script computes itself (npm prefix and per-package `.bin` dirs, `brew --prefix`, `GOPATH`/`GOBIN`, nvm/pipx globs, `gem env home`, sdkman candidates, pnpm's defaults or `$PNPM_HOME`, macOS `~/Library/Python/3.x/bin`), **and** scans user-writable directories on `$PATH` (skipping system dirs like `/usr/bin`, `/bin`, and anything already registered as a scan row — the exclusion list is derived from the rows, not a second hardcoded copy). Results go to `~/.config/update-all-clis/cache.json`; a scan that fails or produces nothing **preserves the previous cache** instead of clobbering it. Extend discovery with your own directories via `scan_dirs` in `config.local.json` (see [Configuration merge](#configuration-merge-and-overrides)):
+
+   ```json
+   "scan_dirs": [{"dir": "$HOME/my-tools/bin", "origin": "manual", "mode": "dir"}]
+   ```
 2. **Version caching** — after each update run, tool versions are cached to speed up future runs. The cache preserves version information across rescans to avoid redundant version probing.
 3. **Symlink inference** — if a binary in a generic directory (e.g., `~/.local/bin`) is a symlink into a package manager tree (e.g., `node_modules`), it's routed to that manager's bulk update. This includes binaries scanned under uv-ish origins (`uv`, `uv/pip`, `uv/venv`): when the npm global prefix is `~/.local`, npm CLIs land in `~/.local/bin` alongside uv tools, and a `node_modules` symlink target reroutes them to the npm bulk update so they're never misattributed to uv. Target-path inference recognizes the install trees of uv, pipx, Homebrew, bun, deno, Volta, mise, pnpm/Yarn/npm (`node_modules`), Cargo, and dotnet.
 4. **Cache** — by default every run performs a fresh discovery scan (**`CACHE_TTL_HOURS=0`**) so newly installed tools are always found. Set `CACHE_TTL_HOURS=N` to reuse a cache newer than N hours. A normal run performs **at most one** full scan.
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
-7. **Execution** — parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency (tracing is disabled for parallel runs). Every update command runs with **stdin redirected to `/dev/null`** (a command that tries to prompt reads EOF instead of waiting forever) and under a **per-job watchdog** (`--job-timeout=N` / `UAC_JOB_TIMEOUT`, default 900s, 0 disables): a job still running past the timeout has its whole process tree killed and is counted as failed — e.g. a `brew upgrade` cask waiting on an open app can't stall the rest of the run. Jobs waiting on a same-manager lock are bounded too (watchdog + 60s slack), so a wedged sibling never blocks the queue indefinitely. A real command failure is retried and can trigger a one-shot repair (see [Retries and auto-fix](#retries-and-auto-fix-repair-after-failure)); a timeout is neither retried nor fixed.
-8. **Concurrency safety** — a **single-instance lock** (`mkdir`-based, with stale-lock detection) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. Parallel updates of the same package manager are serialized the same way — no `flock` binary or helper process needed on macOS, and no busy-waiting (a lock older than the stale cap is assumed abandoned and reclaimed rather than waited on forever). `--dry-run` skips locking entirely since it never mutates anything. **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`, and its `EXIT`/`INT`/`TERM` trap removes the whole lock directory so a crash never leaves a stale lock behind for long.
+7. **Execution** — the Python executor (see [The update executor](#the-update-executor-and-its-live-tui-dashboard)) runs the plan in parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency. Every update command runs with **stdin redirected to `/dev/null`** (a command that tries to prompt reads EOF instead of waiting forever) and under a **per-job watchdog** (`--job-timeout=N` / `UAC_JOB_TIMEOUT`, default 900s, 0 disables): a job still running past the timeout has its whole process tree killed and is counted as failed — e.g. a `brew upgrade` cask waiting on an open app can't stall the rest of the run. Jobs sharing a manager lock group serialize in-process, so a wedged sibling is bounded by the same watchdog. A real command failure is retried and can trigger a one-shot repair (see [Retries and auto-fix](#retries-and-auto-fix-repair-after-failure)); a timeout is neither retried nor fixed.
+8. **Concurrency safety** — a **single-instance lock** (`mkdir`-based, with stale-lock detection) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`, and the shell's `EXIT`/`INT`/`TERM` trap plus the executor's own signal handling remove the lock directory and kill job process trees, so a crash never leaves a stale lock (or a wedged `brew`) behind for long.
 
-## Adding a new tool
+## Adding a new tool (or a new scan directory)
 
 Edit [`tool_config.json`](tool_config.json) or your **`config.local.json`**:
 
 - **`known`** — tool name → command to run for that binary.
 - **`bulk`** — origin label → one command per run for that origin.
+- **`scan_dirs`** — `{"dir": ..., "origin": ..., "mode": "dir"|"tree"}` entries for discovery. `$HOME` is expanded (a leading token only, never eval'd); `mode` defaults to `dir` (plain listing; `tree` walks one level of `*/bin` subdirs). `config.local.json` rows merge on top (local wins on the same `dir`), and registered dirs are automatically excluded from the generic `$PATH` scan — no second list to keep in sync.
 
-[`lib_update_all_clis.py`](lib_update_all_clis.py) validates that both sections exist and that every command is a string.
+`lib_update_all_clis.py` validates every section (`known`/`bulk` command strings, `scan_dirs` row shapes) and the JSON schema covers them too.
 
 After a discovery scan, run the **suggest** command to see which discovered tools aren't yet covered:
 
@@ -545,7 +590,7 @@ Last modified is the file timestamp of the binary on disk (when it was last inst
 ## Requirements
 
 - Bash 3.2+ (macOS default bash works)
-- Python 3.6+ (for `lib_update_all_clis.py` and cache handling)
+- Python 3.11+ (the update executor uses `asyncio.timeout`; the library itself needs only 3.9+)
 - Git
 
 ## Testing
@@ -553,15 +598,14 @@ Last modified is the file timestamp of the binary on disk (when it was last inst
 The project includes a comprehensive test suite:
 
 ```bash
-python3 -m unittest tests/test_lib_update_all_clis.py -v
+python3 -m unittest discover -s tests -p 'test_*.py'   # 300+ unit tests
+bash tests/executor_parity.sh                          # bash↔python executor equivalence gate
+bash scripts/ci_fixture.sh                             # both of the above + CLI smoke tests
 ```
 
-Tests cover:
-- Configuration loading and merging
-- Validation logic
-- Version caching functionality
-- Discovery path handling
-- Cache update operations
+Tests cover: configuration loading and merging, validation, version caching, discovery path handling, cache operations, emit/plan generation (holds, quarantine, prechecks, :major pins), the known-tool up-to-date machinery, doctor, history, the changelog digest, and the executor (watchdog kills, retry/fix, lock-group serialization, renderers). The parity gate runs identical fake-job plans through the Python executor and the legacy bash executor and requires identical result records, tallies, lock-serialization witnesses, and — at `--parallel 1` — byte-identical stdout.
+
+CI runs all of this on ubuntu and macOS, plus shellcheck on every shell script (including `migration/`) and ruff (E9,F) on the Python files.
 
 All tests should pass before making changes to the core logic.
 

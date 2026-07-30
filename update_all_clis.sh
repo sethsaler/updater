@@ -31,14 +31,21 @@
 #   --trace           Trace shell commands (bash -x)
 #   --dry-run         Show commands without running
 #   --json-plan       Print planned updates as JSON and exit
-#   --notify          Show the desktop summary dialog (non-blocking, opt-in)
-#                     (also: UPDATE_ALL_CLIS_NOTIFY=1; default is silent)
-#   --history[=N]     Show the last N runs from history.jsonl (default 3) and exit
+  #   --notify          Show the desktop summary dialog (non-blocking, opt-in)
+  #                     (also: UPDATE_ALL_CLIS_NOTIFY=1; default is silent)
+  #   --notify=on-failure  Show the dialog only when at least one update failed
+  #                     (also: UPDATE_ALL_CLIS_NOTIFY=on-failure)
+  #   --summary=MODE    Run-summary verbosity: full (default) or failures (leads
+  #                     with failed jobs, collapses the up-to-date name list)
+  #                     (also: UPDATE_ALL_CLIS_SUMMARY_MODE)
+  #   --history[=N]     Show the last N runs from history.jsonl (default 3) and exit
+  #   --insights        History analytics: slowest jobs, chronic failers, most-
+  #                     frequently-updated tools, and suggestions; then exit
 #   --include-quarantined  Force quarantined tools/origins to run this run
 #                     (also: UAC_INCLUDE_QUARANTINED=1)
 #                     (quarantine threshold: UAC_QUARANTINE_AFTER, default 3, 0 disables)
-#   --no-precheck     Skip outdated pre-checks; always run every bulk update
-#                     (also: UAC_NO_PRECHECK=1)
+  #   --no-precheck     Skip outdated pre-checks; always run every bulk update and
+  #                     every known tool (also: UAC_NO_PRECHECK=1)
 #   --hold=a,b        Add tools/origins to the persistent hold list (config.local.json) and exit
 #   --unhold=a,b      Remove tools/origins from the persistent hold list and exit
 #                     (one-run ad hoc hold: HOLD=a,b ./update_all_clis.sh)
@@ -50,16 +57,18 @@
 #                     and re-exec once if it updated (also: UPDATE_ALL_CLIS_SELF_UPDATE=1)
 #                     Off by default; any failure (dirty tree, no network, diverged,
 #                     not a git checkout) warns and continues — never fails the run.
-#   --tui             Force the live TUI dashboard on for the update run
-#   --no-tui          Force the live TUI dashboard off (plain log output)
-#                     (default: on when stdout is an interactive terminal and
-#                     tui_update_all_clis.py is present; also: UAC_TUI=1|0.
-#                     Always off for --dry-run/--quiet/--trace/--list/JSON modes
-#                     and non-terminals: LaunchAgent/CI runs are unaffected.)
-#   --version         Print version and exit
+  #   --tui             Force the live TUI dashboard on for the update run
+  #   --no-tui          Force the live TUI dashboard off (plain log output)
+  #                     (default: on when stdout is an interactive terminal and
+  #                     tui_update_all_clis.py is present; also: UAC_TUI=1|0.
+  #                     All real runs execute via tui_update_all_clis.py — the
+  #                     dashboard on terminals, identical plain output elsewhere.
+  #                     UAC_EXECUTOR=bash forces the legacy bash executor, which
+  #                     also still handles --dry-run and --trace.)
+  #   --version         Print version and exit
 # =============================================================================
 
-UAC_VERSION="0.10.0"
+UAC_VERSION="0.11.0"
 
 set -uo pipefail
 
@@ -72,6 +81,10 @@ LIB_SCRIPT="${LIB_SCRIPT:-$SCRIPT_DIR/lib_update_all_clis.py}"
 TUI_SCRIPT="${TUI_SCRIPT:-$SCRIPT_DIR/tui_update_all_clis.py}"
 CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/tool_config.json}"
 CONFIG_LOCAL_FILE="${CONFIG_LOCAL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/config.local.json}"
+# Every lib subprocess reads these from the environment — export them here,
+# before the earliest lib calls (full_scan's scan-dirs runs long before the
+# main-stage export block below, which stays as a harmless duplicate).
+export LIB_SCRIPT TUI_SCRIPT CONFIG_FILE CONFIG_LOCAL_FILE
 
 CACHE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/cache.json"
 LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/logs"
@@ -116,9 +129,11 @@ SKIP_ORIGINS="${SKIP_ORIGINS:-}"
 QUIET=""; DRY_RUN=""; RESCAN=""; LIST_MODE=""; NO_SCAN=""
 LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8; NOTIFY=""
+SUMMARY_MODE="${UPDATE_ALL_CLIS_SUMMARY_MODE:-full}"
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
 SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 HISTORY_MODE=""; HISTORY_N=3
+INSIGHTS_MODE=""
 INCLUDE_QUARANTINED="${UAC_INCLUDE_QUARANTINED:-}"
 NO_PRECHECK="${UAC_NO_PRECHECK:-}"
 HOLD_ADD=""; HOLD_REMOVE=""; DOCTOR_MODE=""
@@ -126,8 +141,12 @@ HOLD="${HOLD:-}"
 CHANGELOG="${UPDATE_ALL_CLIS_CHANGELOG:-}"
 SELF_UPDATE="${UPDATE_ALL_CLIS_SELF_UPDATE:-}"
 # Live TUI dashboard for the update run: "auto" (on for interactive
-# terminals), "1" (forced), "0" (disabled). See _tui_wanted.
+# terminals), "1" (forced), "0" (disabled). Controls the Python executor's
+# renderer; see run_updates_python.
 TUI_MODE="${UAC_TUI:-auto}"
+# Executor escape hatch: UAC_EXECUTOR=bash forces the legacy in-shell
+# executor (which also still handles --dry-run and --trace).
+UAC_EXECUTOR="${UAC_EXECUTOR:-}"
 
 # Background-job bookkeeping for the cleanup trap (parallel updates + locks).
 _UAC_PIDS=()
@@ -220,8 +239,11 @@ while [[ $# -gt 0 ]]; do
     --debug-cache)     DEBUG_CACHE=1; shift ;;
     --suggest-known)   SUGGEST_KNOWN=1; shift ;;
     --notify)          NOTIFY=1; shift ;;
+    --notify=on-failure) NOTIFY="on-failure"; shift ;;
+    --summary=*)       SUMMARY_MODE="${1#*=}"; shift ;;
     --history)         HISTORY_MODE=1; shift ;;
     --history=*)       HISTORY_MODE=1; HISTORY_N="${1#*=}"; shift ;;
+    --insights)        INSIGHTS_MODE=1; shift ;;
     --include-quarantined) INCLUDE_QUARANTINED=1; shift ;;
     --no-precheck)     NO_PRECHECK=1; shift ;;
     --job-timeout=*)   UAC_JOB_TIMEOUT="${1#*=}"; shift ;;
@@ -263,6 +285,11 @@ if ! [[ "$UAC_JOB_TIMEOUT" =~ ^[0-9]+$ ]]; then
   echo "Invalid --job-timeout / UAC_JOB_TIMEOUT value (use seconds, 0 disables): $UAC_JOB_TIMEOUT" >&2
   exit 1
 fi
+case "$SUMMARY_MODE" in
+  full|failures) ;;
+  *) echo "Invalid --summary value (use full or failures): $SUMMARY_MODE" >&2; exit 1 ;;
+esac
+export UPDATE_ALL_CLIS_SUMMARY_MODE="$SUMMARY_MODE"
 if ! [[ "$UAC_RETRIES" =~ ^[0-9]+$ ]]; then
   echo "Invalid --retries / UAC_RETRIES value (use a non-negative integer, 0 disables): $UAC_RETRIES" >&2
   exit 1
@@ -276,14 +303,21 @@ fi
 # Desktop summary is opt-in only so the terminal never blocks/hangs.
 # Enable with --notify or UPDATE_ALL_CLIS_NOTIFY=1.
 # Scheduled LaunchAgent/systemd set UPDATE_ALL_CLIS_NO_NOTIFY=1.
+# --notify=on-failure / UPDATE_ALL_CLIS_NOTIFY=on-failure shows the dialog
+# only when at least one update step failed.
 # -------------------------------------------------------------------
 _want_notify_popup() {
   [[ "${UPDATE_ALL_CLIS_NO_NOTIFY:-}" == "1" ]] && return 1
   case "${UPDATE_ALL_CLIS_NOTIFY:-}" in
     1) return 0 ;;
     0) return 1 ;;
+    on-failure) (( UPDATE_FAIL > 0 )) && return 0; return 1 ;;
   esac
-  [[ -n "$NOTIFY" ]]
+  case "$NOTIFY" in
+    1) return 0 ;;
+    on-failure) (( UPDATE_FAIL > 0 )) && return 0; return 1 ;;
+  esac
+  return 1
 }
 
 # -------------------------------------------------------------------
@@ -300,9 +334,18 @@ _want_notify_popup() {
 # -------------------------------------------------------------------
 declare -a TOOLS_ARRAY=()
 declare -a _SCAN_ROWS=()
+# Newline-joined "dir|origin" keys of every row registered so far, so a
+# directory can't be scanned twice for the same origin (the same dir MAY
+# appear under two different origins deliberately — e.g. /usr/local/bin as
+# "manual" and, when brew isn't installed, "brew").
+_SCAN_ROW_KEYS=$'\n'
 
 _scan_row() {
   local dir="$1" origin="$2" mode="$3"
+  case "$_SCAN_ROW_KEYS" in
+    *$'\n'"${dir}|${origin}"$'\n'*) return 0 ;;
+  esac
+  _SCAN_ROW_KEYS+="${dir}|${origin}"$'\n'
   local exists=0
   [[ -d "$dir" ]] && exists=1
   _SCAN_ROWS+=("${dir}"$'\t'"${origin}"$'\t'"${mode}"$'\t'"${exists}")
@@ -314,15 +357,45 @@ _scan_row() {
 full_scan() {
   TOOLS_ARRAY=()
   _SCAN_ROWS=()
+  _SCAN_ROW_KEYS=$'\n'
   debug "Starting discovery scan (incremental: dirs whose mtime is unchanged are not re-listed)"
 
-  _scan_row "$HOME/.local/bin"             "uv/pip" "dir"
-  _scan_row "$HOME/.cargo/bin"             "cargo"  "dir"
-  _scan_row "$HOME/.deno/bin"              "deno"   "dir"
-  _scan_row "$HOME/.bun/bin"               "bun"    "dir"
-  _scan_row "$HOME/.bun/install/cache/bin" "bun"    "dir"
-  _scan_row "$HOME/.rbenv/shims"           "rbenv"  "dir"
-  _scan_row "$HOME/.pyenv/shims"           "pyenv"  "dir"
+  # brew's resolved prefix rows register BEFORE the config's static rows:
+  # on Intel Macs /usr/local/bin is both the brew bin dir (origin "brew")
+  # and a static "manual" row, and brew must win that attribution (first
+  # registered row wins; the old hardcoded order did the same).
+  if command -v brew >/dev/null 2>&1; then
+    local brew_prefix
+    brew_prefix=$(brew --prefix 2>/dev/null || true)
+    if [[ -n "$brew_prefix" ]]; then
+      # Cellar/opt is scanned one level deep (each formula's own bin dir);
+      # we only mtime-gate at the "opt" level (see incremental_scan_merge's
+      # docstring for why that's an acceptable trade-off vs a full walk).
+      _scan_row "$brew_prefix/opt" "brew" "tree"
+      # The public bin dir lives at the resolved prefix (/opt/homebrew on
+      # Apple Silicon, /usr/local on Intel, ~/.linuxbrew or
+      # /home/linuxbrew/.linuxbrew on Linux) — derive it rather than
+      # hardcoding one platform's path.
+      _scan_row "$brew_prefix/bin" "brew" "dir"
+    fi
+  else
+    # brew not on PATH: probe the standard install locations directly.
+    _scan_row "/opt/homebrew/bin" "brew" "dir"
+    _scan_row "/usr/local/bin" "brew" "dir"
+    _scan_row "/home/linuxbrew/.linuxbrew/bin" "brew" "dir"
+  fi
+
+  # Static scan directories come from the merged config's "scan_dirs"
+  # section (tool_config.json + config.local.json — users can extend
+  # discovery without editing this script). Dynamic manager-derived rows
+  # (npm/go prefixes, globs, sdkman, pnpm) are computed below.
+  local _cdir _corigin _cmode
+  while IFS=$'\t' read -r _cdir _corigin _cmode; do
+    [[ -n "$_cdir" ]] || continue
+    # Expand only a leading $HOME token — never eval config content.
+    _cdir="${_cdir/#\$HOME/$HOME}"
+    _scan_row "$_cdir" "$_corigin" "${_cmode:-dir}"
+  done < <(python3 "$LIB_SCRIPT" scan-dirs 2>/dev/null)
 
   # Combine npm calls into single subprocess for efficiency. `npm ls -g
   # --json` itself still runs every scan (it's a manager query, not a
@@ -339,8 +412,6 @@ full_scan() {
     _scan_row "$npm_prefix/bin" "npm" "dir"
     _scan_row "$npm_prefix/lib/node_modules/.bin" "npm" "dir"
   fi
-  _scan_row "$HOME/.npm-global/lib/node_modules/.bin" "npm" "dir"
-  _scan_row "$HOME/.npm-global/bin" "npm" "dir"
 
   if [[ -n "$npm_root" ]]; then
     local _npm_bin_dir="$npm_root/.bin"
@@ -368,30 +439,11 @@ full_scan() {
   fi
 
   local go_bin_dir=""
-  if command -v brew >/dev/null 2>&1; then
-    local brew_prefix
-    brew_prefix=$(brew --prefix 2>/dev/null || true)
-    if [[ -n "$brew_prefix" ]]; then
-      # Cellar/opt is scanned one level deep (each formula's own bin dir);
-      # we only mtime-gate at the "opt" level (see incremental_scan_merge's
-      # docstring for why that's an acceptable trade-off vs a full walk).
-      _scan_row "$brew_prefix/opt" "brew" "tree"
-    fi
-  fi
-  _scan_row "/opt/homebrew/bin" "brew" "dir"
-  _scan_row "/home/linuxbrew/.linuxbrew/bin" "brew" "dir"
-
   if command -v go >/dev/null 2>&1; then
     go_bin_dir="$(go env GOPATH 2>/dev/null)/bin"
     [[ -n "$go_bin_dir" ]] && _scan_row "$go_bin_dir" "go" "dir"
   fi
   [[ -n "${GOBIN:-}" ]] && _scan_row "$GOBIN" "go" "dir"
-  _scan_row "$HOME/go/bin" "go" "dir"
-
-  local conda_base
-  for conda_base in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/mambaforge" "$HOME/miniforge3" "$HOME/micromamba"; do
-    _scan_row "$conda_base/bin" "conda" "dir"
-  done
 
   if [[ -d "$HOME/.nvm/versions/node" ]]; then
     local nvm_bin
@@ -417,16 +469,6 @@ full_scan() {
   # "candidates" dir; adding/removing a candidate changes its mtime.
   _scan_row "$HOME/.sdkman/candidates" "sdkman" "sdkman"
 
-  _scan_row "$HOME/.local/share/venv" "uv/venv" "tree"
-
-  _scan_row "/usr/local/bin" "manual" "dir"
-
-  _scan_row "$HOME/.opencode/bin" "opencode" "dir"
-
-  _scan_row "$HOME/.grok/bin" "grok" "dir"
-
-  _scan_row "$HOME/bin" "manual" "dir"
-
   if [[ -n "${PNPM_HOME:-}" ]]; then
     _scan_row "$PNPM_HOME" "pnpm" "dir"
   else
@@ -437,26 +479,10 @@ full_scan() {
     _scan_row "$HOME/.local/share/pnpm" "pnpm" "dir"
   fi
 
-  # yarn global installs (`yarn global add`) default bin dir
-  _scan_row "$HOME/.yarn/bin" "yarn" "dir"
-
   local _npm_packages="$HOME/.npm-packages/bin"
   if [[ -z "$npm_prefix" ]] || [[ "${npm_prefix}/lib/node_modules/.bin" != "$_npm_packages" ]]; then
     _scan_row "$_npm_packages" "npm" "dir"
   fi
-
-  _scan_row "$HOME/.config/yarn/global/node_modules/.bin" "yarn" "dir"
-
-  _scan_row "$HOME/.dotnet/tools" "dotnet" "dir"
-
-  _scan_row "$HOME/.krew/bin" "krew" "dir"
-
-  _scan_row "$HOME/.local/share/mise/shims" "mise" "dir"
-  _scan_row "$HOME/.local/share/mise/installs" "mise" "tree"
-
-  _scan_row "/opt/local/bin" "manual" "dir"
-  _scan_row "$HOME/.wasmtime/bin" "manual" "dir"
-  _scan_row "$HOME/.wasmer/bin" "manual" "dir"
 
   # macOS: pip install --user lands binaries in ~/Library/Python/3.x/bin
   if [[ "$(uname)" == "Darwin" ]]; then
@@ -465,17 +491,6 @@ full_scan() {
       [[ -d "$_pyuser_bin" ]] && _scan_row "$_pyuser_bin" "pip" "dir"
     done
   fi
-
-  # Version managers and tool directories not covered above
-  _scan_row "$HOME/.volta/bin" "volta" "dir"
-  _scan_row "$HOME/.asdf/shims" "asdf" "dir"
-  _scan_row "$HOME/.proto/bin" "proto" "dir"
-  _scan_row "$HOME/.rye/shims" "rye" "dir"
-  _scan_row "$HOME/.local/share/rye/shims" "rye" "dir"
-  _scan_row "$HOME/.foundry/bin" "foundry" "dir"
-  _scan_row "$HOME/.aqua/bin" "aqua" "dir"
-  _scan_row "$HOME/.local/share/aquaproj-aqua/bin" "aqua" "dir"
-  _scan_row "$HOME/.local/share/nvim/mason/bin" "mason" "dir"
 
   [[ -d "$HOME/.fnm" ]] && TOOLS_ARRAY+=("fnm|fnm")
 
@@ -489,17 +504,27 @@ full_scan() {
   command -v tlmgr >/dev/null 2>&1 && TOOLS_ARRAY+=("tlmgr|tlmgr")
 
   if [[ -n "$SCAN_PATH" ]] && [[ -z "$NO_SCAN_PATH" ]]; then
-    local pdir
+    local pdir _prow _skip
     IFS=':' read -ra _path_dirs <<< "${PATH:-}"
     for pdir in "${_path_dirs[@]}"; do
       [[ -n "$pdir" ]] || continue
       case "$pdir" in
         /usr/bin|/bin|/sbin|/usr/sbin|/usr/libexec|/System/*|/nix/*|/run/current-system/sw/bin) continue ;;
-        "$HOME/bin"|"$HOME/.local/bin"|"$HOME/.cargo/bin"|"$HOME/.deno/bin"|"$HOME/.bun/bin"|"$HOME/.bun/install/cache/bin"|"$HOME/.rbenv/shims"|"$HOME/.pyenv/shims"|"$HOME/.opencode/bin"|"$HOME/.grok/bin"|"/opt/homebrew/bin"|"/home/linuxbrew/.linuxbrew/bin"|"/usr/local/bin"|"$HOME/go/bin"|"$HOME/.volta/bin"|"$HOME/.asdf/shims"|"$HOME/.proto/bin"|"$HOME/.rye/shims"|"$HOME/.local/share/rye/shims"|"$HOME/.foundry/bin"|"$HOME/.aqua/bin"|"$HOME/.local/share/aquaproj-aqua/bin"|"$HOME/.local/share/nvim/mason/bin"|"$HOME/.dotnet/tools"|"$HOME/.krew/bin"|"$HOME/.local/share/mise/shims"|"$HOME/.wasmtime/bin"|"$HOME/.wasmer/bin"|"$HOME/Library/pnpm"|"$HOME/.local/share/pnpm"|"$HOME/.local/share/pnpm/bin"|"$HOME/.yarn/bin"|"${PNPM_HOME:-/nonexistent-pnpm-home}") continue ;;
         "$HOME"/Library/Python/3.*/bin) continue ;;
       esac
-      [[ -n "${go_bin_dir:-}" ]] && [[ "$pdir" == "$go_bin_dir" ]] && continue
-      [[ -n "${GOBIN:-}" ]] && [[ "$pdir" == "$GOBIN" ]] && continue
+      # Any directory already registered as a scan row — static config rows
+      # AND dynamic manager-derived rows — is owned by that origin, so don't
+      # double-count it under the generic "path" origin. (This list used to
+      # be a second, manually-synced hardcoded copy of the scan dirs.)
+      _skip=0
+      for _prow in "${_SCAN_ROWS[@]:-}"; do
+        [[ -z "$_prow" ]] && continue
+        if [[ "${_prow%%$'\t'*}" == "${pdir%/}" ]]; then
+          _skip=1
+          break
+        fi
+      done
+      (( _skip )) && continue
       _scan_row "$pdir" "path" "dir"
     done
   fi
@@ -719,11 +744,27 @@ _run_one_emit_line_core() {
       return 3
       ;;
     held)
-      if [[ "$cmd" == "env" ]]; then
-        warn "held (env HOLD=): $name — remove from HOLD= to resume this run only"
-      else
-        warn "held (config): $name — remove from \"hold\" to resume updates"
-      fi
+      case "$cmd" in
+        env)
+          warn "held (env HOLD=): $name — remove from HOLD= to resume this run only"
+          ;;
+        major:*)
+          # cmd is major:<source>:<target|"unknown"> — a :major pin.
+          local _majrest="${cmd#major:}"
+          local _majsrc="${_majrest%%:*}"
+          local _majtgt="${_majrest#*:}"
+          if [[ "$_majtgt" == "unknown" ]]; then
+            warn "held (:major pin, latest version unverified): $name — staying held (fail-safe); --unhold to force"
+          elif [[ "$_majsrc" == "env" ]]; then
+            warn "held (env HOLD=, major upgrade to $_majtgt blocked): $name — remove from HOLD= to allow"
+          else
+            warn "held (major upgrade to $_majtgt blocked): $name — remove the \":major\" hold to allow, or upgrade manually"
+          fi
+          ;;
+        *)
+          warn "held (config): $name — remove from \"hold\" to resume updates"
+          ;;
+      esac
       return 3
       ;;
     uptodate)
@@ -939,34 +980,46 @@ run_updates_parallel() {
 }
 
 # -------------------------------------------------------------------
-# Live TUI executor (Feature: live dashboard).
+# Python executor (tui_update_all_clis.py) — the single update executor.
 #
-# When active, the update phase is delegated to tui_update_all_clis.py,
-# which runs the exact same plan with the same semantics (parallel cap,
-# per-origin lock serialization, per-job watchdog, exit-code conventions)
+# Every real (non-dry-run) update phase is delegated to
+# tui_update_all_clis.py, which runs the exact same plan with the same
+# semantics as the bash executor below (parallel cap, per-origin lock
+# serialization, per-job watchdog, retry/fix policy, exit-code conventions)
 # and writes result records in the same format run_updates_parallel's
-# *.result files use. Everything before (discovery, prechecks, planning)
+# *.result files use. On an interactive terminal it renders the live
+# dashboard; anywhere else its plain renderer prints the same lines the
+# bash executor would. Everything before (discovery, prechecks, planning)
 # and after (snapshots, run summary, history, notify, changelog) is
 # unchanged.
+#
+# The bash executor remains for: --dry-run (prints "would run" lines only),
+# --trace (bash -x is shell-only), and the UAC_EXECUTOR=bash escape hatch.
 # -------------------------------------------------------------------
-_tui_wanted() {
-  [[ "$TUI_MODE" == "0" ]] && return 1
-  # These modes own stdout in ways a full-screen dashboard would break.
-  [[ -n "$DRY_RUN" || -n "$QUIET" || -n "$TRACE" ]] && return 1
-  [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" ]] && return 1
-  [[ -f "$TUI_SCRIPT" ]] || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  if [[ "$TUI_MODE" == "1" ]]; then return 0; fi
-  [[ "$TUI_MODE" == "auto" && -t 1 ]]
+_bash_executor_wanted() {
+  [[ -n "$TRACE" ]] && return 0                       # bash -x tracing is shell-only
+  [[ "${UAC_EXECUTOR:-}" == "bash" ]] && return 0     # escape hatch
+  [[ -f "$TUI_SCRIPT" ]] || return 0                  # runner not installed
+  command -v python3 >/dev/null 2>&1 || return 0
+  return 1
 }
 
-run_updates_tui() {
+run_updates_python() {
   local _emit_file _results_file _rc=0
   _emit_file=$(mktemp)
   _results_file=$(mktemp)
   printf '%s\n' "$@" > "$_emit_file"
-  local _tui_fix="1"
-  [[ "$UAC_FIX" == "0" ]] && _tui_fix="0"
+  local _fix="1" _mode="auto" _quiet=""
+  [[ "$UAC_FIX" == "0" ]] && _fix="0"
+  [[ "$TUI_MODE" == "0" ]] && _mode="plain"
+  [[ "$TUI_MODE" == "1" ]] && _mode="live"
+  # Quiet suppresses every executor message in the shell (log/info/ok/warn
+  # all no-op), so it maps to the plain renderer's --quiet — never a
+  # dashboard the user asked not to see output from.
+  if [[ -n "$QUIET" ]]; then
+    _mode="plain"
+    _quiet="1"
+  fi
   python3 "$TUI_SCRIPT" \
     --emit-file "$_emit_file" \
     --results-file "$_results_file" \
@@ -974,12 +1027,14 @@ run_updates_tui() {
     --timeout "$UAC_JOB_TIMEOUT" \
     --retries "$UAC_RETRIES" \
     --retry-delay "$UAC_RETRY_DELAY" \
-    --fix "$_tui_fix" \
+    --fix "$_fix" \
+    --mode "$_mode" \
+    ${_quiet:+--quiet} \
     --skip "$SKIP" \
     --version-string "$UAC_VERSION" || _rc=$?
   # 130 = interrupted (Ctrl+C): the runner already reported it; don't warn.
   if (( _rc != 0 && _rc != 130 )); then
-    warn "TUI runner exited with status $_rc — results may be incomplete"
+    warn "update runner exited with status $_rc — results may be incomplete"
   fi
   # Ingest results exactly like run_updates_parallel ingests *.result files:
   # each line is "<ec>\x1e<record>" (record empty for skip/quarantined).
@@ -1133,6 +1188,11 @@ main() {
     exit 0
   fi
 
+  if [[ -n "$INSIGHTS_MODE" ]]; then
+    python3 "$LIB_SCRIPT" insights "$HISTORY_FILE"
+    exit 0
+  fi
+
   if [[ -n "$HOLD_ADD" ]]; then
     python3 "$LIB_SCRIPT" hold-add "$CONFIG_LOCAL_FILE" "$HOLD_ADD"
     exit $?
@@ -1195,12 +1255,7 @@ main() {
   local _prev_names_snap
   _prev_names_snap=$(mktemp)
   if [[ -f "$CACHE_FILE" ]]; then
-    python3 -c "
-import json
-for t in json.load(open('$CACHE_FILE')):
-    if 'name' in t:
-        print(t['name'])
-" > "$_prev_names_snap" 2>/dev/null || true
+    python3 "$LIB_SCRIPT" cache-names "$CACHE_FILE" > "$_prev_names_snap" 2>/dev/null || true
   fi
 
   ensure_cache
@@ -1216,16 +1271,7 @@ for t in json.load(open('$CACHE_FILE')):
       exit 0
     fi
     log "${BOLD}Discovered tools:${NC}"
-    python3 -c "
-import json, sys
-with open('$CACHE_FILE') as f:
-    data = json.load(f)
-tools = sorted([t for t in data if 'name' in t], key=lambda x: x['name'])
-meta = next((t for t in data if 'scanned_at' in t), None)
-for t in tools:
-    print(f\"  {t['name']}  [{t['origin']}]\")
-print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta else '?'}\")
-" 2>/dev/null
+    python3 "$LIB_SCRIPT" list-human "$CACHE_FILE" 2>/dev/null
     exit 0
   fi
 
@@ -1254,18 +1300,47 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   _precheck_file=$(mktemp)
   echo "{}" > "$_precheck_file"
   if [[ -n "$DRY_RUN" ]]; then
-    local _precheck_would
+    local _precheck_would _precheck_would_known
     _precheck_would=$(python3 "$LIB_SCRIPT" precheck-candidates 2>/dev/null || true)
     [[ -n "$_precheck_would" ]] && info "Would pre-check (dry-run, not executed): $_precheck_would"
+    _precheck_would_known=$(UAC_PRECHECK_SKIP="$SKIP" python3 "$LIB_SCRIPT" precheck-known-candidates "$CACHE_FILE" 2>/dev/null || true)
+    [[ -n "$_precheck_would_known" ]] && info "Would pre-check known tools (dry-run, not executed): $_precheck_would_known"
   elif [[ -n "$NO_PRECHECK" ]]; then
     debug "Pre-checks disabled (--no-precheck)"
   else
-    info "Pre-checking bulk origins for outdated packages..."
+    info "Pre-checking for outdated packages..."
     python3 "$LIB_SCRIPT" precheck > "$_precheck_file" 2>/dev/null || echo "{}" > "$_precheck_file"
-    # Per-origin "✓ x: already up to date (pre-check)" lines print later,
-    # when the run loop processes each synthetic "uptodate" emit-line.
+    # Second stage: known tools already at the latest version (reuses the
+    # bulk checks' captured outdated lists for npm/brew; uv checks PyPI).
+    # Fail-open like stage one: any error keeps the stage-one file.
+    local _precheck_known_tmp
+    _precheck_known_tmp=$(mktemp)
+    if UAC_PRECHECK_SKIP="$SKIP" python3 "$LIB_SCRIPT" precheck-known "$CACHE_FILE" > "$_precheck_known_tmp" 2>/dev/null && [[ -s "$_precheck_known_tmp" ]]; then
+      mv "$_precheck_known_tmp" "$_precheck_file"
+    else
+      rm -f "$_precheck_known_tmp"
+    fi
+    # "✓ x: already up to date (pre-check)" lines print later, when the run
+    # loop processes each synthetic "uptodate" emit-line.
   fi
   export UAC_PRECHECK_UPTODATE_FILE="$_precheck_file"
+
+  # Resolve "name:major" holds: a :major-pinned tool blocks only MAJOR
+  # upgrades. This stage compares installed vs latest (registry lookups for
+  # a handful of pinned tools at most) and writes {block:{name:target}}.
+  # Not a pre-check (it decides holds, not skips), so --no-precheck does
+  # not disable it. --dry-run runs no lookups; emit then treats every
+  # :major hold as fail-safe held (v1 behavior).
+  local _major_holds_file
+  _major_holds_file=$(mktemp)
+  if [[ -z "$DRY_RUN" ]]; then
+    python3 "$LIB_SCRIPT" resolve-major-holds "$CACHE_FILE" > "$_major_holds_file" 2>/dev/null \
+      || echo '{"block":{},"allow":[],"unknown":[]}' > "$_major_holds_file"
+    export UAC_MAJOR_HOLDS_FILE="$_major_holds_file"
+  else
+    rm -f "$_major_holds_file"
+    unset UAC_MAJOR_HOLDS_FILE
+  fi
 
   local emit_tmp
   emit_tmp=$(mktemp)
@@ -1291,7 +1366,7 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
       _parse_emit_line "$_qline"
       [[ "$EMIT_TYPE" == "quarantined" ]] && printf '%s\n' "$EMIT_NAME"
     done
-  } | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" > "$_quarantined_snap" 2>/dev/null || echo "[]" > "$_quarantined_snap"
+  } | python3 "$LIB_SCRIPT" lines-to-json > "$_quarantined_snap" 2>/dev/null || echo "[]" > "$_quarantined_snap"
 
   # Collect held names too (jobs pinned via the "hold" config or HOLD= env).
   local _held_snap
@@ -1303,7 +1378,10 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
       _parse_emit_line "$_hline"
       [[ "$EMIT_TYPE" == "held" ]] && printf '%s\n' "$EMIT_NAME"
     done
-  } | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" > "$_held_snap" 2>/dev/null || echo "[]" > "$_held_snap"
+  } | python3 "$LIB_SCRIPT" lines-to-json > "$_held_snap" 2>/dev/null || echo "[]" > "$_held_snap"
+
+  # Failed names are collected after the run (from the executor's result
+  # records) into _failed_snap — see below; both summaries consume it.
 
   log "${BOLD}=== Logging unknown tools ===${NC}"
   export UNKNOWN_LOG_FILE
@@ -1328,39 +1406,61 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "$CACHE_FILE" > "$_before_snap" 2>/dev/null || true
   fi
 
-  if _tui_wanted; then
-    run_updates_tui "${lines[@]:-}"
-  elif (( PARALLEL_JOBS < 2 )); then
+  if [[ -n "$DRY_RUN" ]]; then
+    # Dry-run only prints "would run" lines — no locking, no subprocesses
+    # beyond echos; deterministic plan order beats parallel subshells here.
     run_updates_sequential "${lines[@]:-}"
+  elif _bash_executor_wanted; then
+    if (( PARALLEL_JOBS < 2 )); then
+      run_updates_sequential "${lines[@]:-}"
+    else
+      run_updates_parallel "$PARALLEL_JOBS" "${lines[@]:-}"
+    fi
   else
-    run_updates_parallel "$PARALLEL_JOBS" "${lines[@]:-}"
+    run_updates_python "${lines[@]:-}"
   fi
 
   if [[ -n "$_emit_snap" ]]; then
     # "" = no cache reuse; "$_before_snap" = mtime gate, reuse pre-run
     # version for any tool whose binary mtime hasn't changed since then.
     python3 "$LIB_SCRIPT" snapshot-versions "$_emit_snap" "" "$_before_snap" > "$_after_snap" 2>/dev/null || true
+    # Failed job names for the summary's Failed section (result records are
+    # kind\x1ename\x1ecmd\x1eec\x1estart\x1eend; ec 0=ok, 3=skipped).
+    local _failed_snap
+    _failed_snap=$(mktemp)
+    {
+      local _rline _rec_ec
+      for _rline in "${_UAC_RESULT_LINES[@]:-}"; do
+        [[ -z "$_rline" ]] && continue
+        local _rest="${_rline#*"${_UAC_SEP}"}"
+        local _rname="${_rest%%"${_UAC_SEP}"*}"
+        _rest="${_rest#*"${_UAC_SEP}"}"
+        _rest="${_rest#*"${_UAC_SEP}"}"
+        _rec_ec="${_rest%%"${_UAC_SEP}"*}"
+        [[ "$_rec_ec" != "0" && "$_rec_ec" != "3" ]] && printf '%s\n' "$_rname"
+      done
+    } | python3 "$LIB_SCRIPT" lines-to-json > "$_failed_snap" 2>/dev/null || echo "[]" > "$_failed_snap"
     # Terminal version-change list (before → after). Same text as the
     # desktop/email summary so every run surfaces what actually moved.
     local _summary_out=""
-    _summary_out=$(python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" 2>/dev/null || true)
+    _summary_out=$(python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true)
     if [[ -n "$_summary_out" ]] && [[ -z "$QUIET" ]]; then
       log ""
       log "${BOLD}=== Packages updated ===${NC}"
-      # Skip the leading "update-all-clis" / "Steps: …" header — those are
-      # already covered by the run's own Done summary below.
-      printf '%s\n' "$_summary_out" | awk 'BEGIN{skip=1} /^Upgraded /{skip=0} !skip{print}' | while IFS= read -r _sline || [[ -n "$_sline" ]]; do
+      # Skip the leading "update-all-clis" / "Steps: …" header lines — those
+      # are already covered by the run's own Done summary below.
+      printf '%s\n' "$_summary_out" | tail -n +3 | while IFS= read -r _sline || [[ -n "$_sline" ]]; do
         log "$_sline"
       done
     fi
     if _want_notify_popup; then
-      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" 2>/dev/null || true
+      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true
     fi
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
       if [[ -n "$_summary_out" ]]; then
         printf '%s' "$_summary_out" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}"
       else
-        python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+        python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_failed_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
       fi
     fi
     # Update cache with new version information
@@ -1394,6 +1494,8 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
     rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
   fi
   rm -f "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_precheck_file"
+  [[ -n "${_major_holds_file:-}" ]] && rm -f "$_major_holds_file"
+  [[ -n "${_failed_snap:-}" ]] && rm -f "$_failed_snap"
 
   log ""
   log "${BOLD}=== Done! ===${NC}"
@@ -1401,13 +1503,11 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
 
   # Auto-tip: bulk-covered tools missing from known list
   if [[ -z "$DRY_RUN" ]]; then
-    local _known_candidates
-    _known_candidates=$(export CONFIG_FILE CONFIG_LOCAL_FILE; python3 "$LIB_SCRIPT" suggest-known-count "$CACHE_FILE" 2>/dev/null || echo "[]")
-    local _known_count
-    _known_count=$(echo "$_known_candidates" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
-    if [[ "$_known_count" -gt 0 ]]; then
-      local _known_sample
-      _known_sample=$(echo "$_known_candidates" | python3 -c "import json,sys; d=json.load(sys.stdin); print(', '.join(x[0] for x in d[:3]))" 2>/dev/null || true)
+    local _known_summary _known_count _known_sample
+    _known_summary=$(python3 "$LIB_SCRIPT" suggest-known-summary "$CACHE_FILE" 2>/dev/null || printf '0\t\n')
+    _known_count="${_known_summary%%$'\t'*}"
+    _known_sample="${_known_summary#*$'\t'}"
+    if [[ "$_known_count" =~ ^[0-9]+$ ]] && [[ "$_known_count" -gt 0 ]]; then
       warn "$_known_count tools updated via bulk but not individually tracked (e.g., $_known_sample)"
       log "  Run './update_all_clis.sh --suggest-known' to see all candidates."
     fi
@@ -1416,13 +1516,7 @@ print(f\"\nTotal: {len(tools)} tools  |  Scanned: {meta['scanned_at'] if meta el
   # Auto-tip: discovered tools with no update path at all
   if [[ -z "$DRY_RUN" ]] && [[ -f "$UNKNOWN_LOG_FILE" ]]; then
     local _unknown_info
-    _unknown_info=$(python3 -c "
-import json
-d = json.load(open('$UNKNOWN_LOG_FILE'))
-tools = [t['name'] for t in d.get('tools', {}).values() if not t.get('acknowledged')]
-print(len(tools))
-print(', '.join(sorted(tools)[:5]))
-" 2>/dev/null || echo "0")
+    _unknown_info=$(python3 "$LIB_SCRIPT" unknown-summary "$UNKNOWN_LOG_FILE" 2>/dev/null || echo "0")
     local _unknown_count _unknown_sample
     _unknown_count=$(echo "$_unknown_info" | head -1)
     _unknown_sample=$(echo "$_unknown_info" | tail -1)
@@ -1437,7 +1531,7 @@ print(', '.join(sorted(tools)[:5]))
   log "Run './update_all_clis.sh --list' to see all discovered tools."
 
   if [[ -n "$JSON_SUMMARY" ]]; then
-    python3 -c "import json; print(json.dumps({'ok': $UPDATE_OK, 'failed': $UPDATE_FAIL}))"
+    python3 "$LIB_SCRIPT" json-summary "$UPDATE_OK" "$UPDATE_FAIL"
   fi
 
   if [[ -n "$DRY_RUN" ]]; then
@@ -1449,4 +1543,8 @@ print(', '.join(sorted(tools)[:5]))
   exit 0
 }
 
-main
+# UAC_SOURCE_ONLY lets test harnesses source this file for its functions
+# (the executor parity test) without kicking off a full update run.
+if [[ -z "${UAC_SOURCE_ONLY:-}" ]]; then
+  main "$@"
+fi

@@ -27,6 +27,20 @@
         "description": "Shell command whose stdout decides whether this origin's bulk update is needed: exit 0 with empty (or '[]'/'{}') stdout means up to date and the update is skipped; any other result runs the update as normal."
       }
     },
+    "scan_dirs": {
+      "type": "array",
+      "description": "Static directories the discovery scan walks (dynamic manager-derived dirs — npm prefix, brew prefix, GOPATH, pipx/nvm globs, sdkman, pnpm — are computed by the script itself). dir may start with $HOME; mode is 'dir' (plain listing, default) or 'tree' (one level of */bin subdirectories). config.local.json entries merge on top (same dir: local wins).",
+      "items": {
+        "type": "object",
+        "required": ["dir", "origin"],
+        "additionalProperties": false,
+        "properties": {
+          "dir": {"type": "string", "minLength": 1},
+          "origin": {"type": "string", "minLength": 1},
+          "mode": {"type": "string", "enum": ["dir", "tree"]}
+        }
+      }
+    },
     "fix": {
       "type": "object",
       "additionalProperties": {

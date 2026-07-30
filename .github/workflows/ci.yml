@@ -16,7 +16,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck update_all_clis.sh install.sh scripts/ci_fixture.sh scripts/agentmail_send_update_summary.sh scripts/agentmail_daily_example.sh
+        run: shellcheck update_all_clis.sh install.sh scripts/ci_fixture.sh scripts/agentmail_send_update_summary.sh scripts/agentmail_daily_example.sh migration/update_ai_clis.sh migration/quit_office_apps.sh tests/executor_parity.sh
 
   fixture:
     runs-on: ubuntu-latest
@@ -47,3 +47,31 @@ jobs:
                   assert isinstance(v, str), f'{section}.{k} must be string'
           print('config schema: ok')
           "
+
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Syntax errors + pyflakes only (E9,F) — a stable, low-noise subset;
+      # the project intentionally has no formatter config.
+      - name: Ruff (E9,F)
+        uses: astral-sh/ruff-action@v3
+        with:
+          args: check --select E9,F lib_update_all_clis.py tui_update_all_clis.py tests/ scripts/generate_cli_report.py
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unit tests + shellcheck-clean shell, on the platform the tool is
+      # built for (brew, mas, launchd, osascript paths).
+      - name: Fixture smoke test and unit tests
+        run: bash scripts/ci_fixture.sh
+
+      # A real discovery scan + dry-run against the default scan paths —
+      # catches macOS-only path bugs (brew prefix, ~/Library dirs) that the
+      # ubuntu fixture can't. No updates are executed.
+      - name: Dry-run against real default scan paths
+        run: ./update_all_clis.sh --dry-run --quiet
