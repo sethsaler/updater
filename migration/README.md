@@ -2,7 +2,7 @@
 
 This folder is a **drop-in alternative** to running the full `update-all-clis` stack
 for day-to-day updates. It keeps coverage of your real long tail (AI / self-updating
-CLIs and a few `go install` tools) without the discovery engine, TUI, quarantine, or
+CLIs and a few `go install` tools) without the discovery engine, TUI, or
 ~8k LOC of orchestration.
 
 You can run this **alongside** the existing script while you evaluate it. Nothing here
@@ -177,7 +177,7 @@ know it, or install those via brew/mise instead.
 | Full filesystem discovery scan | You should install tools through a manager; mystery PATH bins are a smell |
 | Per-tool brew/npm/uv known duplicates | Redundant with bulk manager updates |
 | `gh auth refresh \|\| gh upgrade` | Auth refresh is not an update; use `brew upgrade gh` |
-| TUI / quarantine / retry-fix / doctor / changelog | Product features of the big script; re-add only if you miss them |
+| TUI / retry-fix / doctor / changelog | Product features of the big script; re-add only if you miss them |
 | `tlmgr` with no sudo | Still needs a manual elevated run on system TeX |
 
 ## Scheduling
@@ -209,7 +209,7 @@ No data migration is required. The big script’s cache under
 Stay on the main script if you regularly need:
 
 - live parallel TUI with per-job output
-- failure quarantine + auto-derived reinstall fixes
+- auto-derived reinstall fixes
 - run history / version before→after / changelog digest
 - doctor (broken symlinks, shadowed bins)
 - discovery of tools you did not declare

@@ -15,7 +15,7 @@ from tui_update_all_clis import (
     EC_SKIP, BaseRenderer, Executor, Job, SEP, build_frame, format_elapsed,
     job_detail, job_row, parse_emit_line, progress_bar, read_emit_file,
     select_visible, status_counts, strip_ansi, truncate,
-    ST_DONE, ST_FAILED, ST_HELD, ST_PENDING, ST_QUARANTINED, ST_RUNNING,
+    ST_DONE, ST_FAILED, ST_HELD, ST_PENDING, ST_RUNNING,
     ST_SKIPPED, ST_UPTODATE,
 )
 
@@ -89,9 +89,6 @@ class TestFormatting(unittest.TestCase):
         self.assertIn("HOLD=", job_detail(j))
         j.cmd = "config"
         self.assertIn("hold", job_detail(j))
-        j.status = ST_QUARANTINED
-        j.cmd = "3"
-        self.assertIn("3 consecutive", job_detail(j))
 
     def test_job_row_fits_width(self):
         j = Job(kind="bulk", name="a-very-long-tool-name-indeed", cmd="c", lock="c")
@@ -386,15 +383,6 @@ class TestExecutorInstantKinds(ExecutorTestBase):
         for ec, rec in parsed:
             self.assertEqual(ec, EC_SKIP)
             self.assertEqual(rec[0], "held")  # held jobs DO get a record
-
-    async def test_quarantined_no_record(self):
-        jobs = [parse_emit_line(make_emit_line("quarantined", "bad", "3", ""))]
-        ex, results = self.make_executor(jobs)
-        await ex.run()
-        self.assertEqual(jobs[0].status, ST_QUARANTINED)
-        ec, rec = self.parse_results(results)[0]
-        self.assertEqual(ec, EC_SKIP)
-        self.assertEqual(rec, [])
 
     async def test_uptodate_record_uses_duration(self):
         jobs = [parse_emit_line(make_emit_line("uptodate", "brew", "12.7", ""))]

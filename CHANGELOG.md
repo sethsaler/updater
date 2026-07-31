@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1
+
+**Failure quarantine removed — retries and fixes stay, failures stay visible**
+
+- **No more quarantine** — the mechanism that silently skipped a tool after 3 consecutive failed runs (`UAC_QUARANTINE_AFTER`, `--include-quarantined`, the synthetic `quarantined` emit-line kind, and the "Quarantined" run-summary section) is removed entirely. A tool that fails is no longer put on a permanent blacklist; it runs every time so you can keep trying to fix it. The existing retry-then-fix policy is unchanged: a failed update is retried up to `UAC_RETRIES` times (default 1), then a one-shot fix command (auto-derived force-reinstall or config `"fix"` entry) runs once. If it still fails, the job is reported as failed in the run summary and `history.jsonl` — never silently dropped — so you can investigate and address each failing tool directly.
+
 ## 0.11.0
 
 **One executor, fewer wasted updates, semver-aware holds, user-extensible discovery**

@@ -74,7 +74,6 @@ held${SEP}heldenv${SEP}env
 held${SEP}majheld${SEP}major:config:3.0.0
 held${SEP}majenv${SEP}major:env:2.0.0
 held${SEP}majunk${SEP}major:config:unknown
-quarantined${SEP}qtool${SEP}3
 uptodate${SEP}utool${SEP}2
 bulk${SEP}bulkok${SEP}true${SEP}grp-bulk
 known${SEP}locka${SEP}echo a-start >> \$UAC_T_LOCKLOG; sleep 1; echo a-end >> \$UAC_T_LOCKLOG${SEP}shared
@@ -84,7 +83,7 @@ EOF
 # -------------------------------------------------------------------------
 # Runner wrappers. Both take: <parallel> <quiet> <plan> <out> <results>
 # <tallies>; results are normalized to the Python executor's format
-# ("<ec>\x1e<record>", empty record for skip/quarantined) in plan order.
+# ("<ec>\x1e<record>", empty record for skip) in plan order.
 # -------------------------------------------------------------------------
 run_py_executor() {
   local par="$1" quiet="$2" plan="$3" out="$4" results="$5" tallies="$6" marker="$7"
@@ -143,7 +142,7 @@ run_bash_executor() {
     # The bash executor ingests its per-job *.result files in lexicographic
     # glob order (1, 10, 11, ..., 2, ...) — reproduce that order exactly:
     # walk 1-based plan indices sorted as strings, synthesizing the
-    # never-recorded skip/quarantined lines in place.
+    # never-recorded skip lines in place.
     local _rec_idx=0 _idx _kind _rec _rest _ec
     local -a _idxs=()
     for (( _idx = 1; _idx <= ${#_lines[@]}; _idx++ )); do _idxs+=("$_idx"); done
@@ -153,7 +152,7 @@ run_bash_executor() {
       [[ -z "$_idx" ]] && continue
       _kind="${_lines[$((_idx - 1))]%%"$SEP"*}"
       case "$_kind" in
-        skip|quarantined)
+        skip)
           # Instant kinds the bash executor never records; ec is always 3.
           printf '3%s\n' "$SEP" >> "$results"
           ;;
@@ -271,7 +270,7 @@ else
 fi
 
 # Expected tallies as a sanity anchor: good, flaky, badfix, utool, bulkok,
-# locka, lockb ok; nofix, fixfails, slow failed; skips/held/quarantined not counted.
+# locka, lockb ok; nofix, fixfails, slow failed; skips/held not counted.
 if [[ "$(cat "$WORK/py1.tally")" == "7 3" ]]; then
   ok "tallies are 7 ok / 3 failed as expected"
 else

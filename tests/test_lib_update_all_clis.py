@@ -11,7 +11,6 @@ from lib_update_all_clis import (
     validate_cache,
     format_history, group_history_by_run, historical_mean_durations,
     history_append, load_history_by_name, load_history_records,
-    quarantined_names,
     _stdout_signals_uptodate, precheck_candidate_origins, run_prechecks,
     run_known_prechecks, known_precheck_candidates,
     _known_pkg_from_cmd, _npm_outdated_names, _brew_outdated_names,
@@ -819,10 +818,9 @@ class TestHistoryAppend(unittest.TestCase):
         self.assertEqual(npm["status"], "fail")
         self.assertEqual(npm["kind"], "bulk")
 
-    def test_skip_and_quarantined_lines_ignored(self):
+    def test_skip_lines_ignored(self):
         lines = [
             "skip" + EMIT_SEP + "orphan" + EMIT_SEP + EMIT_SEP,
-            "quarantined" + EMIT_SEP + "badtool" + EMIT_SEP + "3" + EMIT_SEP,
             self._line("known", "foo", "echo foo", 0, 1, 2),
         ]
         appended = history_append(self.history_path, "run1", lines, {}, {})
@@ -911,33 +909,7 @@ class TestHistoricalMeanDurations(unittest.TestCase):
         self.assertNotIn("noduration", means)
 
 
-class TestQuarantinedNames(unittest.TestCase):
-    def test_threshold_zero_disables(self):
-        by_name = {"badtool": [{"status": "fail"}] * 5}
-        self.assertEqual(quarantined_names(by_name, 0), set())
-
-    def test_consecutive_failures_quarantines(self):
-        by_name = {"badtool": [{"status": "fail"}] * 3}
-        self.assertEqual(quarantined_names(by_name, 3), {"badtool"})
-
-    def test_not_enough_history_not_quarantined(self):
-        by_name = {"badtool": [{"status": "fail"}] * 2}
-        self.assertEqual(quarantined_names(by_name, 3), set())
-
-    def test_recent_success_clears_streak(self):
-        by_name = {"badtool": [{"status": "fail"}, {"status": "fail"}, {"status": "ok"}]}
-        self.assertEqual(quarantined_names(by_name, 3), set())
-
-    def test_only_last_threshold_records_considered(self):
-        # 5 fails then 3 successes: last 3 are ok, so not quarantined even
-        # though there's a long-ago failure streak.
-        by_name = {"badtool": [{"status": "fail"}] * 5 + [{"status": "ok"}] * 3}
-        self.assertEqual(quarantined_names(by_name, 3), set())
-        by_name2 = {"badtool": [{"status": "ok"}] + [{"status": "fail"}] * 3}
-        self.assertEqual(quarantined_names(by_name2, 3), {"badtool"})
-
-
-class TestCollectEmitLinesQuarantineAndOrdering(unittest.TestCase):
+class TestCollectEmitLinesHistoryOrdering(unittest.TestCase):
     def setUp(self):
         self.cfg = {"known": {"foo": "echo foo", "slow": "echo slow", "bad": "echo bad"},
                     "bulk": {}}
@@ -964,28 +936,6 @@ class TestCollectEmitLinesQuarantineAndOrdering(unittest.TestCase):
             for r in records:
                 f.write(json.dumps(r) + "\n")
 
-    def test_quarantined_job_becomes_quarantined_line(self):
-        self._write_history([
-            {"name": "bad", "run_id": f"r{i}", "status": "fail", "duration_s": 1}
-            for i in range(3)
-        ])
-        lines = collect_emit_lines(self.cache_path, self.cfg, None, None,
-                                    history_path=self.history_path, quarantine_after=3)
-        bad = next(l for l in lines if self.parts(l)[1] == "bad")
-        self.assertEqual(self.parts(bad)[0], "quarantined")
-        self.assertEqual(self.parts(bad)[2], "3")
-
-    def test_include_quarantined_bypasses_skip(self):
-        self._write_history([
-            {"name": "bad", "run_id": f"r{i}", "status": "fail", "duration_s": 1}
-            for i in range(3)
-        ])
-        lines = collect_emit_lines(self.cache_path, self.cfg, None, None,
-                                    history_path=self.history_path, quarantine_after=3,
-                                    include_quarantined=True)
-        bad = next(l for l in lines if self.parts(l)[1] == "bad")
-        self.assertEqual(self.parts(bad)[0], "known")
-
     def test_slowest_first_ordering(self):
         self._write_history([
             {"name": "slow", "run_id": "r1", "status": "ok", "duration_s": 50},
@@ -999,7 +949,7 @@ class TestCollectEmitLinesQuarantineAndOrdering(unittest.TestCase):
         self.assertLess(names.index("slow"), names.index("foo"))
         self.assertLess(names.index("foo"), names.index("bad"))
 
-    def test_no_history_file_is_stable_and_unquarantined(self):
+    def test_no_history_file_is_stable(self):
         lines = collect_emit_lines(self.cache_path, self.cfg, None, None,
                                     history_path="/nonexistent/history.jsonl")
         kinds = {self.parts(l)[0] for l in lines}
@@ -1414,20 +1364,6 @@ class TestCollectEmitLinesKnownPrecheck(unittest.TestCase):
         )
         self.assertEqual(lines[0].split(EMIT_SEP)[0], "held")
 
-    def test_quarantine_wins_over_known_precheck(self):
-        cache_path = self._cache([{"name": "cline", "origin": "npm"}])
-        history_path = os.path.join(self.dirpath if hasattr(self, "dirpath") else tempfile.mkdtemp(), "history.jsonl")
-        with open(history_path, "w") as f:
-            for _ in range(3):
-                f.write(json.dumps({"name": "cline", "status": "fail"}) + "\n")
-        cfg = {"known": {"cline": "npm update -g cline"}, "bulk": {}}
-        lines = collect_emit_lines(
-            cache_path, cfg, None, None,
-            history_path=history_path,
-            precheck_uptodate_known={"cline": 0.0},
-        )
-        self.assertEqual(lines[0].split(EMIT_SEP)[0], "quarantined")
-
     def test_bulk_and_known_maps_are_independent(self):
         # A known-tool entry named like an origin must not uptodate the bulk
         # line, and vice versa.
@@ -1729,7 +1665,7 @@ class TestRunSummaryModes(unittest.TestCase):
     def test_failures_mode(self):
         before, after = self._snaps()
         out = format_run_summary(before, after, 3, 1,
-                                 new_tools=["z"], quarantined=["q"], held=["h"],
+                                 new_tools=["z"], held=["h"],
                                  failed=["b"], mode="failures")
         self.assertIn("Failed (1):", out)
         self.assertIn("  b", out)
@@ -1738,7 +1674,6 @@ class TestRunSummaryModes(unittest.TestCase):
         self.assertIn("a: 1.0 → 2.0  [MAJOR UPGRADE]", out)
         self.assertIn("Already up to date: 3 (list omitted in failures mode)", out)
         self.assertNotIn("b, c, npm", out)
-        self.assertIn("Quarantined, skipped this run (1):", out)
         self.assertIn("Held (pinned in config), skipped this run (1):", out)
         self.assertIn("New installs added for future runs (1):", out)
 
@@ -2174,18 +2109,12 @@ class TestCollectEmitLinesHeld(unittest.TestCase):
         lines = collect_emit_lines(cache_path, cfg, None, None)
         self.assertTrue(lines[0].startswith(f"known{EMIT_SEP}claude"))
 
-    def test_held_overrides_quarantine(self):
-        dirpath = tempfile.mkdtemp()
-        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+    def test_held_overrides_precheck(self):
         cache_path = self._cache([{"name": "claude", "origin": "manual"}])
-        history_path = os.path.join(dirpath, "history.jsonl")
-        with open(history_path, "w") as f:
-            for _ in range(3):
-                f.write(json.dumps({"name": "claude", "status": "fail", "duration_s": 1}) + "\n")
         cfg = {"known": {"claude": "claude update"}, "bulk": {}}
         lines = collect_emit_lines(
             cache_path, cfg, None, None,
-            history_path=history_path, held_config={"claude"},
+            held_config={"claude"}, precheck_uptodate_known={"claude": 0.0},
         )
         parts = lines[0].split(EMIT_SEP)
         self.assertEqual(parts[0], "held")
@@ -2248,17 +2177,6 @@ class TestHistoryAppendHeld(unittest.TestCase):
         self.assertEqual(rec["status"], "held")
         self.assertTrue(rec["held"])
         self.assertEqual(rec["name"], "claude")
-
-    def test_held_records_dont_trigger_quarantine(self):
-        dirpath = tempfile.mkdtemp()
-        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
-        history_path = os.path.join(dirpath, "history.jsonl")
-        line = f"held{EMIT_SEP}claude{EMIT_SEP}config{EMIT_SEP}3{EMIT_SEP}100{EMIT_SEP}100"
-        for _ in range(3):
-            history_append(history_path, "run1", [line], {}, {})
-        by_name = load_history_by_name(history_path)
-        self.assertEqual(quarantined_names(by_name, 3), set())
-
 
 class TestDoctorBrokenSymlinks(unittest.TestCase):
     def test_detects_broken_symlink(self):

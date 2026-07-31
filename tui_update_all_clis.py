@@ -27,12 +27,12 @@ Usage:
 
 Emit-line format (one per line, fields separated by \\x1e):
     <kind>\\x1e<name>\\x1e<cmd>\\x1e<lock-group>
-    kind: known | bulk | skip | held | quarantined | uptodate
+    kind: known | bulk | skip | held | uptodate
 
 Results-file format (one per line):
     <ec>\\x1e<record>
     where record is "<kind>\\x1e<name>\\x1e<cmd>\\x1e<ec>\\x1e<start>\\x1e<end>"
-    for known/bulk/uptodate/held jobs and empty for skip/quarantined jobs —
+    for known/bulk/uptodate/held jobs and empty for skip jobs —
     mirroring the *.result files update_all_clis.sh's run_updates_parallel
     collects. Exit-code convention: 0 = ok, 3 = skipped (not counted),
     anything else = failed.
@@ -61,7 +61,6 @@ KIND_KNOWN = "known"
 KIND_BULK = "bulk"
 KIND_SKIP = "skip"
 KIND_HELD = "held"
-KIND_QUARANTINED = "quarantined"
 KIND_UPTODATE = "uptodate"
 
 # Kinds that produce a history record (mirrors update_all_clis.sh).
@@ -79,11 +78,10 @@ ST_DONE = "done"
 ST_FAILED = "failed"
 ST_SKIPPED = "skipped"
 ST_HELD = "held"
-ST_QUARANTINED = "quarantined"
 ST_UPTODATE = "uptodate"
 
 FINISHED_STATUSES = frozenset(
-    {ST_DONE, ST_FAILED, ST_SKIPPED, ST_HELD, ST_QUARANTINED, ST_UPTODATE}
+    {ST_DONE, ST_FAILED, ST_SKIPPED, ST_HELD, ST_UPTODATE}
 )
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -191,8 +189,6 @@ def job_detail(job: Job) -> str:
                 return "held (:major pin, target unverified)"
             return f"held (major upgrade to {tgt} blocked)"
         return 'held (config "hold")'
-    if job.status == ST_QUARANTINED:
-        return f"quarantined after {job.cmd} consecutive failures"
     return ""
 
 
@@ -251,8 +247,6 @@ def job_glyph(job: Job, frame_idx: int, style: Style) -> str:
         return style.red("✗")
     if st == ST_HELD:
         return style.yellow("‖")
-    if st == ST_QUARANTINED:
-        return style.yellow("!")
     if st == ST_SKIPPED:
         return style.dim("–")
     return style.dim("·")
@@ -518,10 +512,6 @@ class PlainRenderer(BaseRenderer):
             else:
                 self._print(s.yellow("!!") + f" held (config): {job.name} — "
                             'remove from "hold" to resume updates')
-        elif job.status == ST_QUARANTINED:
-            self._print(s.yellow("!!") + f" skipped (quarantined after {job.cmd} "
-                        f"consecutive failures): {job.name} — run with "
-                        "--include-quarantined to retry")
 
 
 class LiveRenderer(BaseRenderer):
@@ -746,9 +736,6 @@ class Executor:
                 if job.kind == KIND_HELD:
                     self._complete(job, ST_HELD, EC_SKIP,
                                    note="env" if job.cmd == "env" else "config")
-                    return
-                if job.kind == KIND_QUARANTINED:
-                    self._complete(job, ST_QUARANTINED, EC_SKIP)
                     return
                 if job.kind == KIND_UPTODATE:
                     # The cmd field carries the pre-check's duration; history

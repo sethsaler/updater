@@ -41,9 +41,6 @@
   #   --history[=N]     Show the last N runs from history.jsonl (default 3) and exit
   #   --insights        History analytics: slowest jobs, chronic failers, most-
   #                     frequently-updated tools, and suggestions; then exit
-#   --include-quarantined  Force quarantined tools/origins to run this run
-#                     (also: UAC_INCLUDE_QUARANTINED=1)
-#                     (quarantine threshold: UAC_QUARANTINE_AFTER, default 3, 0 disables)
   #   --no-precheck     Skip outdated pre-checks; always run every bulk update and
   #                     every known tool (also: UAC_NO_PRECHECK=1)
 #   --hold=a,b        Add tools/origins to the persistent hold list (config.local.json) and exit
@@ -92,10 +89,6 @@ UNKNOWN_LOG_FILE="${UNKNOWN_LOG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-a
 LOCK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/locks"
 HISTORY_FILE="${UPDATE_ALL_CLIS_HISTORY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/history.jsonl}"
 
-# Quarantine: a job (known tool or bulk origin) that failed its last N
-# consecutive appearances in history.jsonl is skipped by default. 0 disables.
-UAC_QUARANTINE_AFTER="${UAC_QUARANTINE_AFTER:-3}"
-
 # Per-job watchdog: an update command still running after this many seconds
 # is killed (whole process tree) and counted as failed, so one wedged update
 # (e.g. a cask upgrade waiting on an open app) can't stall the rest of the
@@ -134,7 +127,6 @@ REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
 SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 HISTORY_MODE=""; HISTORY_N=3
 INSIGHTS_MODE=""
-INCLUDE_QUARANTINED="${UAC_INCLUDE_QUARANTINED:-}"
 NO_PRECHECK="${UAC_NO_PRECHECK:-}"
 HOLD_ADD=""; HOLD_REMOVE=""; DOCTOR_MODE=""
 HOLD="${HOLD:-}"
@@ -244,7 +236,6 @@ while [[ $# -gt 0 ]]; do
     --history)         HISTORY_MODE=1; shift ;;
     --history=*)       HISTORY_MODE=1; HISTORY_N="${1#*=}"; shift ;;
     --insights)        INSIGHTS_MODE=1; shift ;;
-    --include-quarantined) INCLUDE_QUARANTINED=1; shift ;;
     --no-precheck)     NO_PRECHECK=1; shift ;;
     --job-timeout=*)   UAC_JOB_TIMEOUT="${1#*=}"; shift ;;
     --retries=*)       UAC_RETRIES="${1#*=}"; shift ;;
@@ -739,10 +730,6 @@ _run_one_emit_line_core() {
   local fix="${4:-}"
   case "$cmd_type" in
     skip) return 3 ;;
-    quarantined)
-      warn "skipped (quarantined after $cmd consecutive failures): $name — run with --include-quarantined to retry"
-      return 3
-      ;;
     held)
       case "$cmd" in
         env)
@@ -1037,7 +1024,7 @@ run_updates_python() {
     warn "update runner exited with status $_rc — results may be incomplete"
   fi
   # Ingest results exactly like run_updates_parallel ingests *.result files:
-  # each line is "<ec>\x1e<record>" (record empty for skip/quarantined).
+  # each line is "<ec>\x1e<record>" (record empty for skip).
   local _rline _ec _rec
   while IFS= read -r _rline || [[ -n "$_rline" ]]; do
     [[ -z "$_rline" ]] && continue
@@ -1245,8 +1232,6 @@ main() {
     export ONLY_ORIGINS
     export SKIP_ORIGINS
     export UPDATE_ALL_CLIS_HISTORY_FILE="$HISTORY_FILE"
-    export UAC_QUARANTINE_AFTER
-    export UAC_INCLUDE_QUARANTINED="$INCLUDE_QUARANTINED"
     export HOLD
     python3 "$LIB_SCRIPT" emit-json "$CACHE_FILE"
     exit 0
@@ -1284,8 +1269,6 @@ main() {
   export ONLY_ORIGINS
   export SKIP_ORIGINS
   export UPDATE_ALL_CLIS_HISTORY_FILE="$HISTORY_FILE"
-  export UAC_QUARANTINE_AFTER
-  export UAC_INCLUDE_QUARANTINED="$INCLUDE_QUARANTINED"
   export HOLD
 
   # -----------------------------------------------------------------
@@ -1355,20 +1338,7 @@ main() {
   done < "$emit_tmp"
   rm -f "$emit_tmp"
 
-  # Collect quarantined names from the plan for the run summary (jobs skipped
-  # this run because they failed their last $UAC_QUARANTINE_AFTER attempts).
-  local _quarantined_snap
-  _quarantined_snap=$(mktemp)
-  {
-    local _qline
-    for _qline in "${lines[@]:-}"; do
-      [[ -z "$_qline" ]] && continue
-      _parse_emit_line "$_qline"
-      [[ "$EMIT_TYPE" == "quarantined" ]] && printf '%s\n' "$EMIT_NAME"
-    done
-  } | python3 "$LIB_SCRIPT" lines-to-json > "$_quarantined_snap" 2>/dev/null || echo "[]" > "$_quarantined_snap"
-
-  # Collect held names too (jobs pinned via the "hold" config or HOLD= env).
+  # Collect held names (jobs pinned via the "hold" config or HOLD= env).
   local _held_snap
   _held_snap=$(mktemp)
   {
@@ -1443,7 +1413,7 @@ main() {
     # Terminal version-change list (before → after). Same text as the
     # desktop/email summary so every run surfaces what actually moved.
     local _summary_out=""
-    _summary_out=$(python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true)
+    _summary_out=$(python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true)
     if [[ -n "$_summary_out" ]] && [[ -z "$QUIET" ]]; then
       log ""
       log "${BOLD}=== Packages updated ===${NC}"
@@ -1454,13 +1424,13 @@ main() {
       done
     fi
     if _want_notify_popup; then
-      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true
+      python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true
     fi
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
       if [[ -n "$_summary_out" ]]; then
         printf '%s' "$_summary_out" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}"
       else
-        python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_failed_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
+        python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
       fi
     fi
     # Update cache with new version information
@@ -1493,7 +1463,7 @@ main() {
     fi
     rm -f "$_emit_snap" "$_before_snap" "$_after_snap"
   fi
-  rm -f "$_new_tools_snap" "$_quarantined_snap" "$_held_snap" "$_precheck_file"
+  rm -f "$_new_tools_snap" "$_held_snap" "$_precheck_file"
   [[ -n "${_major_holds_file:-}" ]] && rm -f "$_major_holds_file"
   [[ -n "${_failed_snap:-}" ]] && rm -f "$_failed_snap"
 

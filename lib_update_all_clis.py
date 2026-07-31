@@ -1282,7 +1282,6 @@ def default_history_path() -> str:
 
 
 HISTORY_MAX_LINES = 2000
-DEFAULT_QUARANTINE_AFTER = 3
 HISTORY_JOBS_PER_MEAN = 10
 
 
@@ -1335,26 +1334,6 @@ def historical_mean_durations(
     return means
 
 
-def quarantined_names(
-    by_name: dict[str, list[dict[str, Any]]],
-    threshold: int,
-) -> set[str]:
-    """Names whose last `threshold` consecutive history appearances all failed.
-
-    threshold <= 0 disables quarantine entirely (empty set).
-    """
-    if threshold <= 0:
-        return set()
-    quarantined: set[str] = set()
-    for name, recs in by_name.items():
-        if len(recs) < threshold:
-            continue
-        last = recs[-threshold:]
-        if all(r.get("status") == "fail" for r in last):
-            quarantined.add(name)
-    return quarantined
-
-
 def _order_by_history(lines: list[str], means: dict[str, float]) -> list[str]:
     """Order plan lines by historical mean duration, slowest first.
 
@@ -1381,8 +1360,6 @@ def collect_emit_lines(
     only_origins: Optional[str],
     skip_origins: Optional[str],
     history_path: Optional[str] = None,
-    quarantine_after: int = DEFAULT_QUARANTINE_AFTER,
-    include_quarantined: bool = False,
     precheck_uptodate: Optional[dict[str, float]] = None,
     held_config: Optional[set[str]] = None,
     held_adhoc: Optional[set[str]] = None,
@@ -1491,8 +1468,8 @@ def collect_emit_lines(
 
     # Pinned/held jobs: a known tool name or bulk origin listed in config's
     # "hold" array (persistent) or the one-run HOLD= env (ad hoc) becomes a
-    # synthetic "held" line instead of running. Applied before quarantine/
-    # precheck so a hold always wins regardless of history/outdated state.
+    # synthetic "held" line instead of running. Applied before precheck so a
+    # hold always wins regardless of history/outdated state.
     # The cmd field carries the hold's source ("config" or "env") so the
     # executors can phrase their message accordingly. A "name:major" hold
     # only becomes a held line when the resolve stage found a major upgrade
@@ -1533,29 +1510,10 @@ def collect_emit_lines(
                 transformed_held.append(line)
         lines = transformed_held
 
-    # Failure quarantine: replace known/bulk lines whose job name failed its
-    # last `quarantine_after` consecutive history appearances with a
-    # "quarantined" line (shell prints a warning and counts it as skipped).
-    by_name = load_history_by_name(history_path)
-    quarantined = set() if include_quarantined else quarantined_names(by_name, quarantine_after)
-    if quarantined:
-        transformed: list[str] = []
-        for line in lines:
-            parts = line.split(EMIT_SEP, 3)
-            kind = parts[0]
-            name = parts[1] if len(parts) > 1 else ""
-            if kind in ("known", "bulk") and name in quarantined:
-                transformed.append(f"quarantined{EMIT_SEP}{name}{EMIT_SEP}{quarantine_after}{EMIT_SEP}")
-            else:
-                transformed.append(line)
-        lines = transformed
-
     # Outdated pre-checks: a bulk origin whose `check` command reported
     # nothing to do — or a known tool already at the latest version — is
     # replaced with a synthetic "uptodate" line (the executor prints it as
-    # an instant ok, no update command runs). Applied after quarantine so a
-    # quarantined job still shows as quarantined, not up to date, if both
-    # would otherwise apply.
+    # an instant ok, no update command runs).
     if precheck_uptodate or precheck_uptodate_known:
         bulk_up = precheck_uptodate or {}
         known_up = precheck_uptodate_known or {}
@@ -1577,6 +1535,7 @@ def collect_emit_lines(
 
     # Slowest-first scheduling: order by historical mean duration (desc) so
     # the long pole (usually brew) starts first in a parallel run.
+    by_name = load_history_by_name(history_path)
     means = historical_mean_durations(by_name)
     lines = _order_by_history(lines, means)
 
@@ -1589,8 +1548,6 @@ def emit_lines(
     only_origins: Optional[str],
     skip_origins: Optional[str],
     history_path: Optional[str] = None,
-    quarantine_after: int = DEFAULT_QUARANTINE_AFTER,
-    include_quarantined: bool = False,
     precheck_uptodate: Optional[dict[str, float]] = None,
     held_config: Optional[set[str]] = None,
     held_adhoc: Optional[set[str]] = None,
@@ -1601,7 +1558,7 @@ def emit_lines(
 ) -> None:
     for line in collect_emit_lines(
         cache_path, cfg, only_origins, skip_origins,
-        history_path, quarantine_after, include_quarantined, precheck_uptodate,
+        history_path, precheck_uptodate,
         held_config, held_adhoc, precheck_uptodate_known,
         held_config_major, held_adhoc_major, major_hold_blocks,
     ):
@@ -1614,8 +1571,6 @@ def emit_plan_json(
     only_origins: Optional[str],
     skip_origins: Optional[str],
     history_path: Optional[str] = None,
-    quarantine_after: int = DEFAULT_QUARANTINE_AFTER,
-    include_quarantined: bool = False,
     precheck_uptodate: Optional[dict[str, float]] = None,
     held_config: Optional[set[str]] = None,
     held_adhoc: Optional[set[str]] = None,
@@ -1627,7 +1582,7 @@ def emit_plan_json(
     plan: list[dict[str, str]] = []
     for line in collect_emit_lines(
         cache_path, cfg, only_origins, skip_origins,
-        history_path, quarantine_after, include_quarantined, precheck_uptodate,
+        history_path, precheck_uptodate,
         held_config, held_adhoc, precheck_uptodate_known,
         held_config_major, held_adhoc_major, major_hold_blocks,
     ):
@@ -1857,7 +1812,7 @@ def snapshot_versions(
         if len(parts) < 3:
             continue
         kind, name = parts[0], parts[1]
-        if kind in ("skip", "quarantined", "held"):
+        if kind in ("skip", "held"):
             continue
         if kind == "known":
             known_tasks.append((name, "known"))
@@ -2240,14 +2195,13 @@ def history_append(
     """Append one JSONL record per executed (known/bulk) job to the history file.
 
     `result_lines` are shell-emitted "kind\\x1ename\\x1ecmd\\x1eec\\x1estart\\x1eend"
-    strings for every job actually run this pass (skip/quarantined jobs are not
+    strings for every job actually run this pass (skip jobs are not
     included by the caller). Prunes the file to the most recent `max_lines` lines.
     Returns the number of records appended.
 
-    "held" jobs are recorded too (unlike "quarantined", which isn't): they get
-    `status: "held"` (a status distinct from "ok"/"fail", so they never count
-    toward quarantine's consecutive-failure streak) plus `"held": true`, and
-    since the job never actually ran, no version lookup is attempted.
+    "held" jobs are recorded too: they get `status: "held"` (a status
+    distinct from "ok"/"fail") plus `"held": true`, and since the job
+    never actually ran, no version lookup is attempted.
     """
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     records: list[dict[str, Any]] = []
@@ -2400,7 +2354,6 @@ def format_run_summary(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
-    quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
     failed: Optional[list[str]] = None,
     mode: str = "full",
@@ -2452,14 +2405,6 @@ def format_run_summary(
         lines_out.append("  " + ", ".join(sorted(unchanged)) if unchanged else "  (none)")
 
     lines_out.append("")
-    quarantined = quarantined or []
-    lines_out.append(f"Quarantined, skipped this run ({len(quarantined)}):")
-    if quarantined:
-        lines_out.append("  " + ", ".join(sorted(quarantined)))
-    else:
-        lines_out.append("  (none)")
-
-    lines_out.append("")
     held = held or []
     lines_out.append(f"Held (pinned in config), skipped this run ({len(held)}):")
     if held:
@@ -2481,14 +2426,13 @@ def notify_macos_dialog(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
-    quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
     failed: Optional[list[str]] = None,
 ) -> None:
     if sys.platform != "darwin":
         return
     body = format_run_summary(
-        before, after, ok, fail, new_tools, quarantined, held, failed,
+        before, after, ok, fail, new_tools, held, failed,
         mode=_summary_mode_env(),
     ).rstrip("\n")
     if len(body) > 950:
@@ -2529,13 +2473,12 @@ def notify_linux(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
-    quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
     failed: Optional[list[str]] = None,
 ) -> None:
     if sys.platform == "linux" and shutil.which("notify-send"):
         body = format_run_summary(
-            before, after, ok, fail, new_tools, quarantined, held, failed,
+            before, after, ok, fail, new_tools, held, failed,
             mode=_summary_mode_env(),
         ).rstrip("\n")
         if len(body) > 500:
@@ -2557,12 +2500,11 @@ def notify_diff(
     ok: int,
     fail: int,
     new_tools: Optional[list[str]] = None,
-    quarantined: Optional[list[str]] = None,
     held: Optional[list[str]] = None,
     failed: Optional[list[str]] = None,
 ) -> None:
-    notify_macos_dialog(before, after, ok, fail, new_tools, quarantined, held, failed)
-    notify_linux(before, after, ok, fail, new_tools, quarantined, held, failed)
+    notify_macos_dialog(before, after, ok, fail, new_tools, held, failed)
+    notify_linux(before, after, ok, fail, new_tools, held, failed)
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -3248,9 +3190,8 @@ def doctor_chronic_failures(
 ) -> list[dict[str, Any]]:
     """Jobs with >= `min_failures` failures in their last `window` history records.
 
-    Surfaces failure-prone jobs even if they haven't (yet) hit the
-    consecutive-failure quarantine threshold (e.g. failing intermittently
-    rather than on every single run).
+    Surfaces failure-prone jobs (e.g. failing intermittently rather than
+    on every single run) so you can investigate and fix them.
     """
     by_name = load_history_by_name(history_path)
     out: list[dict[str, Any]] = []
@@ -3912,14 +3853,12 @@ def _cfg_with_legacy_base(args_base: str, do_validate: bool = True) -> dict[str,
 
 def _emit_kwargs(cfg: dict[str, Any]) -> dict[str, Any]:
     """Shared emit/emit-json argument bundle: origin filters, history,
-    quarantine, holds (plain + :major), and both pre-check maps."""
+    holds (plain + :major), and both pre-check maps."""
     hold_env_list = [s for s in os.environ.get("HOLD", "").split(",")]
     return {
         "only_origins": os.environ.get("ONLY_ORIGINS"),
         "skip_origins": os.environ.get("SKIP_ORIGINS"),
         "history_path": os.environ.get("UPDATE_ALL_CLIS_HISTORY_FILE") or default_history_path(),
-        "quarantine_after": int(os.environ.get("UAC_QUARANTINE_AFTER") or DEFAULT_QUARANTINE_AFTER),
-        "include_quarantined": os.environ.get("UAC_INCLUDE_QUARANTINED", "0") == "1",
         "precheck_uptodate": _load_precheck_uptodate_env(),
         "held_config": normalize_hold_entries(cfg.get("hold")) - normalize_hold_entries_major(cfg.get("hold")),
         "held_adhoc": _parse_csv(os.environ.get("HOLD")) - normalize_hold_entries_major(hold_env_list),
@@ -4128,7 +4067,6 @@ def _cmd_notify_diff(args: argparse.Namespace) -> int:
         _load_json(args.before), _load_json(args.after),
         int(args.ok), int(args.fail),
         _load_new_tools_arg(args.new_tools),
-        _load_new_tools_arg(args.quarantined),
         _load_new_tools_arg(args.held),
         _load_new_tools_arg(args.failed),
     )
@@ -4140,7 +4078,6 @@ def _cmd_run_summary(args: argparse.Namespace) -> int:
         _load_json(args.before), _load_json(args.after),
         int(args.ok), int(args.fail),
         _load_new_tools_arg(args.new_tools),
-        _load_new_tools_arg(args.quarantined),
         _load_new_tools_arg(args.held),
         _load_new_tools_arg(args.failed),
         mode=_summary_mode_env(),
@@ -4335,7 +4272,6 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("before"); p.add_argument("after")
         p.add_argument("ok"); p.add_argument("fail")
         p.add_argument("new_tools", nargs="?", default="")
-        p.add_argument("quarantined", nargs="?", default="")
         p.add_argument("held", nargs="?", default="")
         p.add_argument("failed", nargs="?", default="")
     p = _p("history", _cmd_history)

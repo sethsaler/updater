@@ -167,7 +167,6 @@ Override paths with `CONFIG_FILE`, `LIB_SCRIPT`, or `CONFIG_LOCAL_FILE` if you k
 ./update_all_clis.sh --insights        # history analytics: slowest jobs, chronic failers, churn leaders
 ./update_all_clis.sh --summary=failures  # collapse the up-to-date list; lead with failures
 ./update_all_clis.sh --notify=on-failure # desktop dialog only when at least one update failed
-./update_all_clis.sh --include-quarantined  # force-run tools/origins currently quarantined
 ./update_all_clis.sh --no-precheck    # always run every bulk update (skip outdated pre-checks)
 ./update_all_clis.sh --hold=claude,brew     # pin tools/origins (persists in config.local.json) and exit
 ./update_all_clis.sh --unhold=claude        # un-pin and exit
@@ -186,7 +185,7 @@ UAC_EXECUTOR=bash ./update_all_clis.sh   # legacy in-shell executor (escape hatc
 
 ### Retries and auto-fix (repair after failure)
 
-A failed update is no longer a dead end — and no longer invisible: known-tool commands in `tool_config.json` used to end in `|| true`, which masked every real failure as success; those masks are removed so failures actually surface (the existing quarantine still silences a tool after 3 consecutive failed runs). Both executors (shell and TUI) apply the same policy:
+A failed update is no longer a dead end — and no longer invisible: known-tool commands in `tool_config.json` used to end in `|| true`, which masked every real failure as success; those masks are removed so failures actually surface. Both executors (shell and TUI) apply the same policy:
 
 1. **Retry** — a real command failure (non-zero exit) is retried up to **`--retries=N`** times (`UAC_RETRIES`, default **1**, `0` disables), waiting **`--retry-delay=N`** seconds between attempts (`UAC_RETRY_DELAY`, default **10**).
 2. **Fix** — if every retry fails and the job has a *fix command*, that repair runs **once**. If it exits 0, the job counts as **ok** (`✓ tool (fixed via: ...)`); otherwise it stays failed. Disable with **`--no-fix`** / `UAC_FIX=0`.
@@ -285,7 +284,7 @@ Rules and notes:
 
 - The npm/brew lists are **only trusted when the bulk check produced a usable signal this run** (origin confirmed up to date, or a non-empty outdated list). A failed check (offline, `brew update` error) means an untrusted list — not a wrongly empty one.
 - Registry lookups (PyPI/crates.io) are concurrent and TTL-cached for 6h (`UAC_KNOWN_LATEST_TTL`, cache at `~/.config/update-all-clis/known_latest_cache.json`). Failures are cached as nulls so a git-installed tool doesn't cost a request every run; nulls never satisfy the equality check.
-- `--skip`ed tools are never candidates (a skipped tool can't surface as an up-to-date ok). Held/quarantined tools keep their status — those transforms win over the pre-check replacement.
+- `--skip`ed tools are never candidates (a skipped tool can't surface as an up-to-date ok). Held tools keep their status — that transform wins over the pre-check replacement.
 - Only update commands of the exact shapes `npm update/install -g <pkg>`, `brew upgrade <pkg>`, `uv tool upgrade <pkg>`, `cargo install <pkg>` are checked (same tokenization discipline as fix derivation). Self-updaters and everything else run unconditionally.
 - gem/dotnet/krew and the remaining managers have no known-tool check either — same verify-don't-guess rule as above.
 
@@ -302,8 +301,6 @@ Two scan modes: a plain directory listing (most bin dirs), and a "tree" mode for
 - **`ONLY_ORIGINS`** — comma-separated origins (and known tool names) to **restrict** what runs. When set, bulk updates run only for listed origins; known tools run only if their `origin` or `name` is listed.
 - **`SKIP_ORIGINS`** — comma-separated origins to skip for bulk updates; known tools whose `origin` is listed are skipped.
 - **`UPDATE_ALL_CLIS_HISTORY_FILE`** — path to the run-history JSONL file (default `~/.config/update-all-clis/history.jsonl`). See [Run history](#run-history).
-- **`UAC_QUARANTINE_AFTER`** — consecutive-failure threshold before a job is quarantined (default **3**; `0` disables quarantine).
-- **`UAC_INCLUDE_QUARANTINED`** — set to `1` to force quarantined jobs to run this pass (same as `--include-quarantined`).
 - **`UAC_NO_PRECHECK`** — set to `1` to skip outdated pre-checks entirely (same as `--no-precheck`).
 - **`UAC_RETRIES`** — how many times a failed update is retried (default **1**; `0` disables; same as `--retries=N`).
 - **`UAC_RETRY_DELAY`** — seconds between retries (default **10**; same as `--retry-delay=N`).
@@ -342,13 +339,7 @@ python3 lib_update_all_clis.py history ~/.config/update-all-clis/history.jsonl 5
 
 **Slowest-first scheduling** — when building the parallel-run plan, jobs are ordered by their historical mean duration (last ~10 runs per job), descending, so the long pole (usually `brew`) kicks off first instead of last. Jobs with no history yet run after the known-slow ones, in their otherwise-stable original order.
 
-**Failure quarantine** — a job (known tool or bulk origin) that failed its last **`UAC_QUARANTINE_AFTER`** (default **3**, `0` disables) consecutive appearances in history is skipped automatically, with a warning:
-
-```
-!! skipped (quarantined after 3 consecutive failures): sometool — run with --include-quarantined to retry
-```
-
-Force a quarantined job to run anyway with **`--include-quarantined`** (or `UAC_INCLUDE_QUARANTINED=1`); a subsequent success naturally clears the streak since quarantine state is derived purely from `history.jsonl` — there's no separate state file to reset. Quarantined jobs are also listed in the run summary (desktop dialog / `UPDATE_ALL_CLIS_SUMMARY_FILE`) so they stay visible even when skipped silently in a scheduled run.
+**Failure handling** — failed jobs are retried up to `UAC_RETRIES` times, then receive a one-shot fix attempt when a fix command is available. If they still fail, they're reported as failed in the run summary and history so you can investigate and fix them manually.
 
 ### Pin/hold tools
 
@@ -379,7 +370,7 @@ For a one-run, non-persistent hold, use `HOLD=` (like `SKIP=`, but visibly repor
 HOLD=claude ./update_all_clis.sh
 ```
 
-**Hold vs. `SKIP`/`SKIP_ORIGINS`:** `SKIP` is a per-run, silent exclusion — it never appears in the run summary and isn't persisted. A held job is **persistent** (via config, until you `--unhold`) or explicitly one-run (`HOLD=`), and always shows up: the shell prints `!! held (config): <name> — remove from "hold" to resume updates` (or `!! held (env HOLD=): <name> — …` for the ad hoc form), a held job is recorded in `history.jsonl` with `status: "held"` and `"held": true` (never counted toward quarantine's failure streak), and it appears in its own "Held" section of the run summary.
+**Hold vs. `SKIP`/`SKIP_ORIGINS`:** `SKIP` is a per-run, silent exclusion — it never appears in the run summary and isn't persisted. A held job is **persistent** (via config, until you `--unhold`) or explicitly one-run (`HOLD=`), and always shows up: the shell prints `!! held (config): <name> — remove from "hold" to resume updates` (or `!! held (env HOLD=): <name> — …` for the ad hoc form), a held job is recorded in `history.jsonl` with `status: "held"` and `"held": true`, and it appears in its own "Held" section of the run summary.
 
 ### Doctor
 
@@ -394,7 +385,7 @@ Checks (each is independent — one crashing doesn't prevent the rest from repor
 
 1. **Broken symlinks** — dead symlinks in every scanned bin directory (from the cache) plus every user-serviceable directory on `$PATH` (SIP/system dirs like `/usr/bin` and `/usr/sbin` are excluded — findings there wouldn't be actionable).
 2. **Shadowed duplicates** — a binary name whose cache entries resolve (via realpath) to **2+ genuinely different files**, so which copy runs depends on `$PATH` order. The same file discovered through several origins (e.g. an npm global seen by both the npm query and the `$PATH` scan) is *not* reported. Intentional shadows — e.g. a wrapper shim in `~/.local/bin` that sets env vars and `exec`s the managed copy — can be acknowledged with a top-level **`"doctor_ignore"`** array (usually in `config.local.json`); ignored names are listed informationally and don't affect the exit code.
-3. **Chronic failures** — jobs with 3+ failures in their last 10 `history.jsonl` records, surfaced even if they haven't (yet) hit the consecutive-failure quarantine threshold.
+3. **Chronic failures** — jobs with 3+ failures in their last 10 `history.jsonl` records, surfaced so you can investigate and fix them.
 4. **Config issues** — `hold` entries matching nothing; `check` entries for an origin with no corresponding `bulk` command. (`known` entries for tools that aren't installed are **informational only** — the config deliberately catalogs tools you might install, and absent ones are skipped.)
 5. **Cache health** — reuses `validate_cache()` (same as `--validate-cache`) rather than duplicating that logic. Cache *warnings* are informational; only cache errors count as findings.
 6. **Prune suggestions (informational)** — `known` entries whose binary is neither on `$PATH` nor in the latest discovery scan, i.e. tracked-but-nowhere tools worth reviewing for pruning. Like `not_installed`, these never affect the exit status.
@@ -603,7 +594,7 @@ bash tests/executor_parity.sh                          # bash↔python executor 
 bash scripts/ci_fixture.sh                             # both of the above + CLI smoke tests
 ```
 
-Tests cover: configuration loading and merging, validation, version caching, discovery path handling, cache operations, emit/plan generation (holds, quarantine, prechecks, :major pins), the known-tool up-to-date machinery, doctor, history, the changelog digest, and the executor (watchdog kills, retry/fix, lock-group serialization, renderers). The parity gate runs identical fake-job plans through the Python executor and the legacy bash executor and requires identical result records, tallies, lock-serialization witnesses, and — at `--parallel 1` — byte-identical stdout.
+Tests cover: configuration loading and merging, validation, version caching, discovery path handling, cache operations, emit/plan generation (holds, prechecks, :major pins), the known-tool up-to-date machinery, doctor, history, the changelog digest, and the executor (watchdog kills, retry/fix, lock-group serialization, renderers). The parity gate runs identical fake-job plans through the Python executor and the legacy bash executor and requires identical result records, tallies, lock-serialization witnesses, and — at `--parallel 1` — byte-identical stdout.
 
 CI runs all of this on ubuntu and macOS, plus shellcheck on every shell script (including `migration/`) and ruff (E9,F) on the Python files.
 
