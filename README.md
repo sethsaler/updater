@@ -14,7 +14,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 
 | Origin / Manager | Update command |
 |---|---|
-| npm global packages | `npm update -g` |
+| npm global packages | `npm update -g <pkg>` per outdated package (private/linked packages can't break the sweep) |
 | pnpm global packages | `pnpm update -g` |
 | Yarn global packages | `yarn global upgrade` |
 | Homebrew (macOS) | `brew update && brew upgrade` |
@@ -51,6 +51,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Tool | Update command |
 |------|---------------|
 | Cursor Agent | `agent update` |
+| Amp | `amp update` |
 | Atuin | `atuin update` |
 | bat | `brew upgrade bat` |
 | Browserbase (bb) | `npm update -g @browserbasehq/cli` |
@@ -67,6 +68,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | eza | `cargo install eza --locked` |
 | fd | `brew upgrade fd` |
 | FieldTheory | `npm update -g fieldtheory` |
+| FireConnect | `fireconnect upgrade` |
 | Firecrawl | `npm update -g firecrawl-cli` |
 | Flight Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/travel/flight-goat/cmd/flight-goat-pp-cli@latest` |
 | fzf | `brew upgrade fzf` |
@@ -74,21 +76,28 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Genspark | `npm update -g @genspark/cli` |
 | GitHub CLI (gh) | `gh auth refresh` / `gh upgrade` |
 | Goose | `goose update` |
+| herdr | `herdr update` |
 | Hermes | `hermes update` |
 | just | `cargo install just --locked` |
 | kanban | `npm update -g kanban` |
 | Kimi | `kimi update` |
 | lazygit | `brew upgrade lazygit` |
+| lildax | `npm update -g @opencode-ai/cli --prefix ~/.local` |
 | mcp-remote | `npm update -g mcp-remote` |
 | Mem0 | `npm update -g @mem0/cli` |
 | mise | `mise self-update` |
 | mmx | `npm update -g mmx-cli` |
 | Movie Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/media-and-entertainment/movie-goat/cmd/movie-goat-pp-cli@latest` |
+| Muse Code | `MUSE_LAUNCHER_INSTALL=1 muse` |
 | ntn | `ntn update` |
 | Ollama | `ollama update` |
 | 1Password CLI (op) | `op update` |
 | OpenClaw | `npm update -g openclaw` |
 | OpenCode | `opencode upgrade` |
+| Pi | `pi update` |
+| Pool | `pool update` |
+| pplx | `pplx update` |
+| Prime Agent | `prime-agent update` |
 | Printing Press | `go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest` |
 | Qwen Code | `qwen update` |
 | Readwise | `npm update -g @readwise/cli` |
