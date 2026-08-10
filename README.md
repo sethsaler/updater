@@ -27,7 +27,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Krew (kubectl plugins) | `kubectl krew upgrade` |
 | Mise (version manager) | `mise self-update` |
 | fnm (Node) | `fnm update` |
-| Bun | `bun update` |
+| Bun | vendor installer `curl -fsSL https://bun.com/install \| bash` (upgrades the runtime in place) + `bun update -g` (global packages) |
 | Deno | `deno upgrade` |
 | pyenv | `pyenv update` |
 | rbenv | `brew upgrade rbenv ruby-build` (no-op if not installed via Homebrew; see below) |
@@ -514,6 +514,8 @@ Edit [`tool_config.json`](tool_config.json) or your **`config.local.json`**:
 - **`scan_dirs`** — `{"dir": ..., "origin": ..., "mode": "dir"|"tree"}` entries for discovery. `$HOME` is expanded (a leading token only, never eval'd); `mode` defaults to `dir` (plain listing; `tree` walks one level of `*/bin` subdirs). `config.local.json` rows merge on top (local wins on the same `dir`), and registered dirs are automatically excluded from the generic `$PATH` scan — no second list to keep in sync.
 
 `lib_update_all_clis.py` validates every section (`known`/`bulk` command strings, `scan_dirs` row shapes) and the JSON schema covers them too.
+
+**Vendor install scripts work too.** `known`/`bulk` commands are executed via `bash -c`, so any vendor installer is a valid update command — e.g. `"bun": "curl -fsSL https://bun.com/install | bash"` re-runs Bun's official installer, which upgrades an existing installation in place. This covers tools that ship no self-update subcommand. Two rules of thumb: guard with `2>/dev/null || true` like the other entries so one flaky installer can't fail the run, and prefer installers that are non-interactive (all updates run with stdin closed — a prompt reads EOF instead of hanging).
 
 After a discovery scan, run the **suggest** command to see which discovered tools aren't yet covered:
 

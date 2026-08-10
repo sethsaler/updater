@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Bun runtime now actually updates** — the `bun` bulk command was `bun update`, which only updates project dependencies and never touched the runtime itself. It now re-runs Bun's official installer (`curl -fsSL https://bun.com/install | bash`), which upgrades an existing installation in place, followed by `bun update -g` for globally installed packages. This also demonstrates the general pattern: `known`/`bulk` commands run via `bash -c`, so any vendor install script (`curl … | bash`) is a valid update command for tools without a self-update subcommand (documented in the README's "Adding a new tool" section).
+
 ## 0.11.1
 
 **Failure quarantine removed — retries and fixes stay, failures stay visible**

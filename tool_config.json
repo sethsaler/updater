@@ -126,7 +126,7 @@
     "uv/pip": "uv self update && uv tool upgrade --all",
     "uv/venv": "uv self update && uv tool upgrade --all",
     "fnm": "fnm update 2>/dev/null || true",
-    "bun": "bun update 2>/dev/null || true",
+    "bun": "curl -fsSL https://bun.com/install | bash 2>/dev/null || true; bun update -g 2>/dev/null || true",
     "deno": "deno upgrade 2>/dev/null || true",
     "pyenv": "pyenv update 2>/dev/null || true",
     "rbenv": "brew upgrade rbenv ruby-build 2>/dev/null || true",
