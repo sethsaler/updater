@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Config refresh — 9 broken known-tool commands fixed, 8 new tools tracked** — `mimo` now re-runs the vendor installer (`mimo upgrade` fails on curl-channel installs with "unsupported update channel: curl"); `flora`/`bumblebee`/`goimports`/`gopls` get their real Go module paths (`go install flora@latest` etc. never resolved); `gh` is `brew upgrade gh` (was `gh auth refresh`, which refreshes tokens, not the binary); `devin update` is wrapped in `script -q /dev/null` because it needs a TTY (exit 130 otherwise); `Obsidian` and `uzu` are now brew-managed casks (`brew upgrade --greedy --cask obsidian|mirai` — Obsidian was adopted after the direct-download copy broke `brew upgrade`, and `uzu` is the Mirai app's CLI, renamed upstream from `uzu` to `mirai`, with `~/.local/bin/uzu` now a shadow symlink). New known entries: `agentmail`, `bigset`, `finaldraft`, `ghostty` (cask adopted), `gws`, `omp`, `prometheus`, `xurl`. Remaining path-origin discoveries without an update path were acked (`agy-ide`/`antigravity-ide`/`lms`/`ghostty`-era self-updating apps, brew `sbin` helpers, `rvictl`, backup files).
+
 - **Bun runtime now actually updates** — the `bun` bulk command was `bun update`, which only updates project dependencies and never touched the runtime itself. It now re-runs Bun's official installer (`curl -fsSL https://bun.com/install | bash`), which upgrades an existing installation in place, followed by `bun update -g` for globally installed packages. This also demonstrates the general pattern: `known`/`bulk` commands run via `bash -c`, so any vendor install script (`curl … | bash`) is a valid update command for tools without a self-update subcommand (documented in the README's "Adding a new tool" section).
 
 ## 0.11.1

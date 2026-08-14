@@ -51,31 +51,40 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Tool | Update command |
 |------|---------------|
 | Cursor Agent | `agent update` |
+| AgentMail | `npm update -g agentmail-cli` |
 | Amp | `amp update` |
 | Atuin | `atuin update` |
 | bat | `brew upgrade bat` |
 | Browserbase (bb) | `npm update -g @browserbasehq/cli` |
 | Browserbase Browse (browse) | `npm update -g @browserbasehq/browse-cli` |
+| Bigset | `npm update -g @adamexu/bigset` |
+| Bumblebee | `go install github.com/perplexityai/bumblebee/cmd/bumblebee@latest` |
 | Claude Code | `claude update` |
 | cline | `npm update -g cline` |
 | Codex CLI | `npm update -g codex-cli` |
 | Composio | `composio upgrade` |
 | dev-browser | `npm update -g dev-browser` |
-| Devin | `devin update` |
+| Devin | `script -q /dev/null devin update` (needs a TTY) |
 | ElevenLabs | `npm update -g @elevenlabs/cli` |
 | ESPN PP CLI | `go install github.com/mvanhorn/printing-press-library/library/media-and-entertainment/espn/cmd/espn-pp-cli@latest` |
 | expect-cli | `npm update -g expect-cli` |
 | eza | `cargo install eza --locked` |
 | fd | `brew upgrade fd` |
 | FieldTheory | `npm update -g fieldtheory` |
+| Final Draft | `npm update -g finaldraft` |
 | FireConnect | `fireconnect upgrade` |
 | Firecrawl | `npm update -g firecrawl-cli` |
 | Flight Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/travel/flight-goat/cmd/flight-goat-pp-cli@latest` |
+| Flora | `go install github.com/florafauna-ai/flora-cli/cmd/flora@latest` |
 | fzf | `brew upgrade fzf` |
 | Gemini CLI | `npm update -g @google/gemini-cli` |
 | Genspark | `npm update -g @genspark/cli` |
-| GitHub CLI (gh) | `gh auth refresh` / `gh upgrade` |
+| Ghostty | `brew upgrade --greedy --cask ghostty` |
+| GitHub CLI (gh) | `brew upgrade gh` |
+| Goimports | `go install golang.org/x/tools/cmd/goimports@latest` |
+| gopls | `go install golang.org/x/tools/gopls@latest` |
 | Goose | `goose update` |
+| Google Workspace CLI (gws) | `npm update -g @googleworkspace/cli` |
 | herdr | `herdr update` |
 | Hermes | `hermes update` |
 | just | `cargo install just --locked` |
@@ -85,11 +94,14 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | lildax | `npm update -g @opencode-ai/cli --prefix ~/.local` |
 | mcp-remote | `npm update -g mcp-remote` |
 | Mem0 | `npm update -g @mem0/cli` |
+| MiMo Code (mimo) | `curl -fsSL https://mimo.xiaomi.com/install \| bash` |
 | mise | `mise self-update` |
 | mmx | `npm update -g mmx-cli` |
 | Movie Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/media-and-entertainment/movie-goat/cmd/movie-goat-pp-cli@latest` |
 | Muse Code | `MUSE_LAUNCHER_INSTALL=1 muse` |
 | ntn | `ntn update` |
+| Obsidian | `brew upgrade --greedy --cask obsidian` |
+| Oh My Pi (omp) | `omp update` |
 | Ollama | `ollama update` |
 | 1Password CLI (op) | `op update` |
 | OpenClaw | `npm update -g openclaw` |
@@ -99,6 +111,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | pplx | `pplx update` |
 | Prime Agent | `prime-agent update` |
 | Printing Press | `go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest` |
+| Prometheus (Firecrawl) | `npm update -g @firecrawl/prometheus-cli` |
 | Qwen Code | `qwen update` |
 | Readwise | `npm update -g @readwise/cli` |
 | Recipe Goat PP CLI | `go install github.com/mvanhorn/printing-press-library/library/food-and-dining/recipe-goat/cmd/recipe-goat-pp-cli@latest` |
@@ -106,7 +119,9 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | Starship | `starship self-update` |
 | TinyFish | `npm update -g tinyfish` |
 | uv | `uv self update && uv tool upgrade --all` |
+| uzu (Mirai) | `brew upgrade --greedy --cask mirai` |
 | Warp | `warp-cli update` |
+| xurl | `npm update -g @xdevplatform/xurl` |
 | yazi | `brew upgrade yazi` |
 | zoxide | `zoxide update` / `zoxide self-update` |
 
