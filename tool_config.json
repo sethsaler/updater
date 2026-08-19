@@ -94,7 +94,7 @@
     "op": "op update 2>/dev/null",
     "openclaw": "npm update -g openclaw 2>/dev/null",
     "opencode": "opencode upgrade",
-    "pi": "pi update --self --no-approve 2>/dev/null",
+    "pi": "pi update --all --no-approve 2>/dev/null",
     "playwright": "npm update -g playwright 2>/dev/null",
     "pn": "npm update -g pn 2>/dev/null",
     "pnpx": "npm update -g pnpx 2>/dev/null",

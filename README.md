@@ -106,7 +106,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | 1Password CLI (op) | `op update` |
 | OpenClaw | `npm update -g openclaw` |
 | OpenCode | `opencode upgrade` |
-| Pi | `pi update` |
+| Pi | `pi update --all` (pi + extensions) |
 | Pool | `pool update` |
 | pplx | `pplx update` |
 | Prime Agent | `prime-agent update` |
