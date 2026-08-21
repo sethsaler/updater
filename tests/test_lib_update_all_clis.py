@@ -20,6 +20,7 @@ from lib_update_all_clis import (
     doctor_prune_suggestions,
     incremental_scan_merge, parse_scan_rows, _scan_dir_entries,
     normalize_hold_entries, edit_local_hold, format_run_summary,
+    format_run_summary_table,
     is_major_upgrade, leading_major,
     doctor_broken_symlinks, doctor_shadowed_duplicates,
     doctor_chronic_failures, doctor_config_issues, doctor_not_installed, doctor_report,
@@ -1682,6 +1683,89 @@ class TestRunSummaryModes(unittest.TestCase):
         out = format_run_summary(before, after, 4, 0, failed=[], mode="failures")
         self.assertIn("Failed (0):", out)
         self.assertIn("  (none)", out)
+
+
+class TestRunSummaryTable(unittest.TestCase):
+    """The colored per-package table (format_run_summary_table) shown on
+    interactive terminals; format_run_summary stays the plain contract."""
+
+    def _snaps(self):
+        before = {"known": {"a": "1.0", "b": "1.0", "c": "1.0", "f": "?"},
+                  "bulk": {"npm": "10.0"}}
+        after = {"known": {"a": "2.0", "b": "1.0", "c": "1.0", "f": "?"},
+                 "bulk": {"npm": "10.0"}}
+        return before, after
+
+    def test_upgraded_rows_show_before_after(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 3, 1, color=False)
+        self.assertIn("\u2713 Updated (1):", out)
+        self.assertRegex(out, r"a\s+1\.0\s+\u2192\s+2\.0")
+        self.assertIn("[MAJOR UPGRADE]", out)
+
+    def test_failed_rows_carry_versions(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 3, 1,
+                                       failed=["f", "missing"], color=False)
+        self.assertIn("\u2717 Failed (2):", out)
+        self.assertRegex(out, r"f\s+\?\s+\u2192\s+\?")
+        # Failed names absent from both snapshots still get a row.
+        self.assertRegex(out, r"missing\s+\?\s+\u2192\s+\?")
+
+    def test_failed_jobs_not_listed_as_up_to_date(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 3, 1, failed=["f"],
+                                       color=False)
+        self.assertIn("\u2713 Up to date (3):", out)
+        # f failed this run: it must not also appear under Up to date.
+        up_section = out.split("Up to date")[1]
+        self.assertRegex(up_section, r"\n\s+b\s")
+        self.assertNotRegex(up_section, r"\n\s+f\s")
+
+    def test_up_to_date_one_line_each(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 4, 0, color=False)
+        self.assertIn("\u2713 Up to date (4):", out)
+        self.assertRegex(out, r"\bb\s+1\.0")
+        self.assertRegex(out, r"\bnpm\s+10\.0")
+
+    def test_header_contract_matches_plain(self):
+        # update_all_clis.sh skips the first two summary lines (tail -n +3),
+        # so both formats must share them exactly.
+        before, after = self._snaps()
+        plain = format_run_summary(before, after, 3, 1).splitlines()[:2]
+        table = format_run_summary_table(before, after, 3, 1).splitlines()[:2]
+        self.assertEqual(plain, table)
+
+    def test_color_toggle(self):
+        before, after = self._snaps()
+        colored = format_run_summary_table(before, after, 3, 1)
+        plain = format_run_summary_table(before, after, 3, 1, color=False)
+        self.assertIn("\033[", colored)
+        self.assertNotIn("\033[", plain)
+
+    def test_failures_mode_collapses_up_to_date_and_leads_with_failed(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 3, 1, failed=["f"],
+                                       mode="failures", color=False)
+        self.assertIn("list omitted in failures mode", out)
+        self.assertNotIn("Up to date (", out)
+        self.assertLess(out.index("Failed"), out.index("Updated"))
+
+    def test_empty_sections_omitted(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 4, 0, color=False)
+        self.assertNotIn("Failed", out)
+        self.assertNotIn("Held", out)
+        self.assertNotIn("New installs", out)
+
+    def test_held_and_new_tools(self):
+        before, after = self._snaps()
+        out = format_run_summary_table(before, after, 3, 0, held=["h"],
+                                       new_tools=["z"], color=False)
+        self.assertIn("Held (1):", out)
+        self.assertIn("New installs added for future runs (1):", out)
+        self.assertIn("z", out)
 
 
 class TestInsights(unittest.TestCase):

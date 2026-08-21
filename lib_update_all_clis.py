@@ -2420,6 +2420,143 @@ def _summary_mode_env() -> str:
     return mode if mode in ("full", "failures") else "full"
 
 
+# ANSI codes for the colored terminal summary (format_run_summary_table).
+# Kept private to this module: the plain summary, result records, and every
+# other lib output stay byte-identical plain text.
+_SUMMARY_ANSI = {
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "green": "\033[0;32m",
+    "red": "\033[0;31m",
+    "yellow": "\033[1;33m",
+    "reset": "\033[0m",
+}
+
+
+def _clip(s: str, w: int) -> str:
+    return s if len(s) <= w else s[: max(0, w - 1)] + "\u2026"
+
+
+def format_run_summary_table(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ok: int,
+    fail: int,
+    new_tools: Optional[list[str]] = None,
+    held: Optional[list[str]] = None,
+    failed: Optional[list[str]] = None,
+    mode: str = "full",
+    color: bool = True,
+) -> str:
+    """Colored, aligned run summary for interactive terminals: one row per
+    package with its before -> after version, grouped by outcome.
+
+    Same data as format_run_summary (which remains the plain-text contract
+    for summary files, email, and non-terminals). The first two header lines
+    ("update-all-clis", "Steps: ...") are identical so update_all_clis.sh's
+    `tail -n +3` skip applies unchanged. Sections that are empty are omitted
+    (except Up to date in full mode, which is the inventory).
+    """
+    c = _SUMMARY_ANSI if color else {k: "" for k in _SUMMARY_ANSI}
+
+    failed_set = set(failed or [])
+    upgraded: list[tuple[str, str, str, bool]] = []
+    unchanged: list[tuple[str, str]] = []
+    for section in ("known", "bulk"):
+        names = set(before.get(section, {})) | set(after.get(section, {}))
+        for name in sorted(names):
+            b = before.get(section, {}).get(name, "?")
+            a = after.get(section, {}).get(name, "?")
+            if b == a:
+                # A job that failed this run is not "up to date" even if its
+                # version didn't move (both probes "?") — it gets the Failed
+                # section instead.
+                if name not in failed_set:
+                    unchanged.append((name, b))
+            else:
+                upgraded.append((name, b, a, bool(is_major_upgrade(b, a))))
+
+    failed_rows: list[tuple[str, str, str]] = []
+    for name in sorted(failed_set):
+        b = a = "?"
+        for section in ("known", "bulk"):
+            sec_b = before.get(section, {})
+            sec_a = after.get(section, {})
+            if name in sec_b or name in sec_a:
+                b, a = sec_b.get(name, "?"), sec_a.get(name, "?")
+                break
+        failed_rows.append((name, b, a))
+
+    new_tools = sorted(set(new_tools or []))
+    held = sorted(set(held or []))
+
+    # Column widths shared by every section (capped so one pathological
+    # version string can't push the table off-screen).
+    all_names = ([n for n, _, _, _ in upgraded] + [n for n, _ in unchanged]
+                 + [n for n, _, _ in failed_rows] + held + new_tools)
+    all_vers = ([v for _, v, _, _ in upgraded] + [v for _, _, v, _ in upgraded]
+                + [v for _, v in unchanged]
+                + [v for _, v, _ in failed_rows] + [v for _, _, v in failed_rows])
+    name_w = min(28, max([8] + [len(n) for n in all_names]))
+    ver_w = min(20, max([5] + [len(v) for v in all_vers]))
+
+    def ver_row(name: str, b: str, a: str) -> str:
+        return (f"  {_clip(name, name_w):<{name_w}}  "
+                f"{_clip(b, ver_w):>{ver_w}}  \u2192  {_clip(a, ver_w)}")
+
+    lines_out: list[str] = [
+        "update-all-clis",
+        f"Steps: {ok} ok, {fail} failed",
+        "",
+    ]
+
+    def section(title: str, rows: list[str]) -> None:
+        lines_out.append(title)
+        lines_out.extend(rows)
+        lines_out.append("")
+
+    fail_title = f"{c['red']}{c['bold']}\u2717 Failed ({len(failed_rows)}):{c['reset']}"
+    fail_rows = [f"{c['red']}{ver_row(n, b, a)}{c['reset']}" for n, b, a in failed_rows]
+    up_title = f"{c['green']}{c['bold']}\u2713 Updated ({len(upgraded)}):{c['reset']}"
+    up_rows = []
+    for n, b, a, major in upgraded:
+        row = (f"  {_clip(n, name_w):<{name_w}}  "
+               f"{c['dim']}{_clip(b, ver_w):>{ver_w}}{c['reset']}  \u2192  "
+               f"{c['green']}{c['bold']}{_clip(a, ver_w)}{c['reset']}")
+        if major:
+            row += f"  {c['yellow']}[MAJOR UPGRADE]{c['reset']}"
+        up_rows.append(row)
+
+    if mode == "failures":
+        if failed_rows:
+            section(fail_title, fail_rows)
+        if upgraded:
+            section(up_title, up_rows)
+        lines_out.append(f"{c['dim']}\u2713 Up to date: {len(unchanged)} "
+                         f"(list omitted in failures mode){c['reset']}")
+        lines_out.append("")
+    else:
+        if upgraded:
+            section(up_title, up_rows)
+        if failed_rows:
+            section(fail_title, fail_rows)
+        up_to_date_rows = [
+            f"  {_clip(n, name_w):<{name_w}}  {c['dim']}{_clip(v, ver_w)}{c['reset']}"
+            for n, v in unchanged
+        ]
+        section(f"{c['green']}{c['bold']}\u2713 Up to date ({len(unchanged)}):{c['reset']}",
+                up_to_date_rows or [f"  {c['dim']}(none){c['reset']}"])
+
+    if held:
+        section(f"{c['yellow']}{c['bold']}\u23ed Held ({len(held)}):{c['reset']}",
+                [f"  {c['yellow']}{_clip(n, name_w)}{c['reset']}" for n in held])
+    if new_tools:
+        section(f"New installs added for future runs ({len(new_tools)}):",
+                [f"  {_clip(n, name_w)}" for n in new_tools])
+
+    return "\n".join(lines_out).rstrip("\n") + "\n"
+
+
 def notify_macos_dialog(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -4074,14 +4211,18 @@ def _cmd_notify_diff(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_summary(args: argparse.Namespace) -> int:
-    sys.stdout.write(format_run_summary(
-        _load_json(args.before), _load_json(args.after),
-        int(args.ok), int(args.fail),
-        _load_new_tools_arg(args.new_tools),
-        _load_new_tools_arg(args.held),
-        _load_new_tools_arg(args.failed),
+    kwargs = dict(
+        before=_load_json(args.before), after=_load_json(args.after),
+        ok=int(args.ok), fail=int(args.fail),
+        new_tools=_load_new_tools_arg(args.new_tools),
+        held=_load_new_tools_arg(args.held),
+        failed=_load_new_tools_arg(args.failed),
         mode=_summary_mode_env(),
-    ))
+    )
+    if getattr(args, "color", False):
+        sys.stdout.write(format_run_summary_table(**kwargs))
+    else:
+        sys.stdout.write(format_run_summary(**kwargs))
     return 0
 
 
@@ -4274,6 +4415,10 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("new_tools", nargs="?", default="")
         p.add_argument("held", nargs="?", default="")
         p.add_argument("failed", nargs="?", default="")
+        if name == "run-summary":
+            p.add_argument("--color", action="store_true",
+                           help="colored per-package table for interactive "
+                                "terminals (summary files/email stay plain)")
     p = _p("history", _cmd_history)
     p.add_argument("history_path", nargs="?", default="")
     p.add_argument("n", nargs="?", type=int, default=3)

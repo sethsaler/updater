@@ -332,6 +332,28 @@ Two scan modes: a plain directory listing (most bin dirs), and a "tree" mode for
 - **`HOLD`** — comma-separated one-run ad hoc hold (same as `--hold=` but non-persistent; see [Pin/hold tools](#pinhold-tools)).
 - **`UPDATE_ALL_CLIS_CHANGELOG`** — set to `1` to enable the changelog digest (same as `--changelog`).
 
+### Run summary (per-package before → after table)
+
+After every real run the terminal prints a run summary where **each package gets a row with its version before and after the update**, grouped by outcome:
+
+```
+✓ Updated (3):
+  node       22.11.0  →  23.1.0  [MAJOR UPGRADE]
+  uv          0.5.4   →  0.5.9
+
+✗ Failed (1):
+  tlmgr          ?    →  ?
+
+✓ Up to date (28):
+  cargo      1.82.0
+  deno       2.1.4
+
+⏭ Held (2):
+  python
+```
+
+On an interactive terminal with color enabled the table is colored (green ✓/red ✗/yellow ⏭, dimmed before-versions); with `--no-color`/`NO_COLOR`/`TERM=dumb` — and everywhere the summary is consumed as a file (`UPDATE_ALL_CLIS_SUMMARY_FILE`, email, desktop dialog) — the original plain-text format is used unchanged. Versions are best effort (`--version` probes); tools that can't report one show `?`. A job that failed is listed under **Failed**, never under Up to date. `--summary=failures` collapses the up-to-date list to a count and leads with the failures.
+
 ### Desktop summary dialog (opt-in, non-blocking)
 
 On **macOS** (or Linux via `notify-send`), after a real update run (not `--dry-run`), the script can show a **summary** with ok/fail counts, known tools' versions before → after (best effort), and bulk origins' manager versions before → after.

@@ -1410,10 +1410,15 @@ main() {
         [[ "$_rec_ec" != "0" && "$_rec_ec" != "3" ]] && printf '%s\n' "$_rname"
       done
     } | python3 "$LIB_SCRIPT" lines-to-json > "$_failed_snap" 2>/dev/null || echo "[]" > "$_failed_snap"
-    # Terminal version-change list (before → after). Same text as the
+    # Terminal version-change list (before → after). Same data as the
     # desktop/email summary so every run surfaces what actually moved.
+    # Interactive terminals get the colored per-package table (--color);
+    # GREEN is empty under NO_COLOR/--no-color/TERM=dumb, which keeps those
+    # runs (and LaunchAgent/CI logs) on the plain format.
     local _summary_out=""
-    _summary_out=$(python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true)
+    local _summary_args=(run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap")
+    [[ -n "$GREEN" ]] && _summary_args+=(--color)
+    _summary_out=$(python3 "$LIB_SCRIPT" "${_summary_args[@]}" 2>/dev/null || true)
     if [[ -n "$_summary_out" ]] && [[ -z "$QUIET" ]]; then
       log ""
       log "${BOLD}=== Packages updated ===${NC}"
@@ -1427,7 +1432,9 @@ main() {
       python3 "$LIB_SCRIPT" notify-diff "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap" 2>/dev/null || true
     fi
     if [[ -n "${UPDATE_ALL_CLIS_SUMMARY_FILE:-}" ]]; then
-      if [[ -n "$_summary_out" ]]; then
+      # The file always gets the plain summary (it feeds email/desktop
+      # consumers), so reuse the capture only when it isn't colored.
+      if [[ -n "$_summary_out" ]] && [[ -z "$GREEN" ]]; then
         printf '%s' "$_summary_out" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}"
       else
         python3 "$LIB_SCRIPT" run-summary "$_before_snap" "$_after_snap" "$UPDATE_OK" "$UPDATE_FAIL" "$_new_tools_snap" "$_held_snap" "$_failed_snap" > "${UPDATE_ALL_CLIS_SUMMARY_FILE}" 2>/dev/null || true
