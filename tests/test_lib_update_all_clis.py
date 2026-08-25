@@ -2814,5 +2814,29 @@ class TestQwenKnown(unittest.TestCase):
         self.assertIn(("bulk", "npm"), kinds)
 
 
+class TestLooksLikeVersion(unittest.TestCase):
+    """Issue #16: probe output must look version-like or fall through to '?'."""
+
+    def _check(self, line):
+        from lib_update_all_clis import _looks_like_version
+        return _looks_like_version(line)
+
+    def test_plain_versions_pass(self):
+        for s in ("1.47.0", "v2.1.243", "2026.05.09-0afadcc", "omp/18.0.4",
+                  "gh version 2.98.0 (2026-08-20)", "devin 3000.5.20 (2d902011)"):
+            self.assertTrue(self._check(s), s)
+
+    def test_error_noise_rejected(self):
+        for s in ("[28119] Fatal error: TypeError: Invalid URL",
+                  "flag provided but not defined: -version",
+                  "Traceback (most recent call last):",
+                  "bash: foo: command not found"):
+            self.assertFalse(self._check(s), s)
+
+    def test_digitless_line_rejected(self):
+        self.assertFalse(self._check("a version string with no digits"))
+        self.assertFalse(self._check(""))
+
+
 if __name__ == "__main__":
     unittest.main()

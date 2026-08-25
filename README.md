@@ -352,7 +352,7 @@ After every real run the terminal prints a run summary where **each package gets
   python
 ```
 
-On an interactive terminal with color enabled the table is colored (green ✓/red ✗/yellow ⏭, dimmed before-versions); with `--no-color`/`NO_COLOR`/`TERM=dumb` — and everywhere the summary is consumed as a file (`UPDATE_ALL_CLIS_SUMMARY_FILE`, email, desktop dialog) — the original plain-text format is used unchanged. Versions are best effort (`--version` probes); tools that can't report one show `?`. A job that failed is listed under **Failed**, never under Up to date. `--summary=failures` collapses the up-to-date list to a count and leads with the failures.
+On an interactive terminal with color enabled the table is colored (green ✓/red ✗/yellow ⏭, dimmed before-versions); with `--no-color`/`NO_COLOR`/`TERM=dumb` — and everywhere the summary is consumed as a file (`UPDATE_ALL_CLIS_SUMMARY_FILE`, email, desktop dialog) — the original plain-text format is used unchanged. Versions are best effort (`--version` probes); tools that can't report one show `?`. In the colored table a job that failed is listed under **Failed**, never under Up to date; the plain full format shows failures only in the `Steps: N ok, M failed` count (use `--summary=failures` to lead with the failed names there). `--summary=failures` collapses the up-to-date list to a count and leads with the failures.
 
 ### Desktop summary dialog (opt-in, non-blocking)
 

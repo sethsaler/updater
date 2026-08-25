@@ -1620,6 +1620,19 @@ def list_json(cache_path: str) -> None:
     print(json.dumps(out, indent=2))
 
 
+# Issue #16: version probes capture whatever a tool's --version prints, but
+# some tools print error noise ("[28119] Fatal error: ...", "flag provided
+# but not defined: -version"). Require a digit and reject known error shapes
+# so those probes fall through to "?" like a tool that reports nothing.
+_VERSION_NOISE_RE = re.compile(
+    r"(?i)(fatal error|traceback \(most recent|panic:|command not found"
+    r"|flag provided but not defined|no such file or directory)")
+
+
+def _looks_like_version(line: str) -> bool:
+    return bool(line) and any(ch.isdigit() for ch in line) and not _VERSION_NOISE_RE.search(line)
+
+
 @lru_cache(maxsize=512)
 def probe_version(name: str) -> str:
     """Best-effort version string for a CLI on PATH."""
@@ -1638,7 +1651,7 @@ def probe_version(name: str) -> str:
             out = r.stdout or r.stderr
             if out:
                 line = out.strip().split("\n")[0].strip()
-                if line:
+                if _looks_like_version(line):
                     return line[:220]
         except (OSError, subprocess.TimeoutExpired):
             pass

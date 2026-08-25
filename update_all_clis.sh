@@ -95,6 +95,13 @@ HISTORY_FILE="${UPDATE_ALL_CLIS_HISTORY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/
 # run. 0 disables. Override per-run with --job-timeout=N.
 UAC_JOB_TIMEOUT="${UAC_JOB_TIMEOUT:-900}"
 
+# Pre-check watchdog (issue #15): the read-only outdated pre-checks run
+# before the executor, so the per-job watchdog doesn't cover them. A wedged
+# check (e.g. a hung `brew update`) is killed after this many seconds and
+# the run continues without pre-checks (fail-open, like any check error).
+# 0 disables. Override with UAC_PRECHECK_TIMEOUT=N.
+UAC_PRECHECK_TIMEOUT="${UAC_PRECHECK_TIMEOUT:-120}"
+
 # Retry-then-fix (Feature: fix failing packages): a failed update is retried
 # up to UAC_RETRIES times (UAC_RETRY_DELAY seconds apart); if it still fails
 # and a fix command exists (auto-derived force-reinstall, or config "fix"
@@ -111,8 +118,9 @@ CACHE_TTL_SECONDS=$((CACHE_TTL_HOURS * 3600))
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
-# Color output configuration
-if [[ -n "${NO_COLOR:-}" ]] || [[ "${TERM:-}" == "dumb" ]]; then
+# Color output configuration (issue #14: shell lines are also de-colored when
+# stdout is not a terminal, matching the executor's plain-output rule)
+if [[ -n "${NO_COLOR:-}" ]] || [[ "${TERM:-}" == "dumb" ]] || [[ ! -t 1 ]]; then
   GREEN='' YELLOW='' BLUE='' BOLD='' NC=''
 fi
 
@@ -1111,6 +1119,34 @@ _self_update() {
 }
 
 # -------------------------------------------------------------------
+# Pre-check watchdog wrapper (issue #15): bounded, fail-open.
+# -------------------------------------------------------------------
+_precheck_with_timeout() {
+  local out_file="$1"
+  if (( UAC_PRECHECK_TIMEOUT <= 0 )); then
+    python3 "$LIB_SCRIPT" precheck > "$out_file" 2>/dev/null || echo "{}" > "$out_file"
+    return 0
+  fi
+  python3 "$LIB_SCRIPT" precheck > "$out_file" 2>/dev/null &
+  local _pc_pid=$! _pc_waited=0
+  while kill -0 "$_pc_pid" 2>/dev/null; do
+    if (( _pc_waited >= UAC_PRECHECK_TIMEOUT )); then
+      _kill_tree "$_pc_pid"
+      wait "$_pc_pid" 2>/dev/null || true
+      warn "pre-checks timed out after ${UAC_PRECHECK_TIMEOUT}s — continuing without them (updates will run as before)"
+      echo "{}" > "$out_file"
+      return 0
+    fi
+    sleep 1
+    _pc_waited=$((_pc_waited + 1))
+  done
+  if ! wait "$_pc_pid" 2>/dev/null; then
+    echo "{}" > "$out_file"
+  fi
+  return 0
+}
+
+# -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
 main() {
@@ -1295,7 +1331,7 @@ main() {
     debug "Pre-checks disabled (--no-precheck)"
   else
     info "Pre-checking for outdated packages..."
-    python3 "$LIB_SCRIPT" precheck > "$_precheck_file" 2>/dev/null || echo "{}" > "$_precheck_file"
+    _precheck_with_timeout "$_precheck_file"
     # Second stage: known tools already at the latest version (reuses the
     # bulk checks' captured outdated lists for npm/brew; uv checks PyPI).
     # Fail-open like stage one: any error keeps the stage-one file.
