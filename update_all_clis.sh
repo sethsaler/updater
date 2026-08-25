@@ -128,7 +128,7 @@ SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 HISTORY_MODE=""; HISTORY_N=3
 INSIGHTS_MODE=""
 NO_PRECHECK="${UAC_NO_PRECHECK:-}"
-HOLD_ADD=""; HOLD_REMOVE=""; DOCTOR_MODE=""
+HOLD_ADD=""; HOLD_REMOVE=""; HOLD_ADD_SET=""; HOLD_REMOVE_SET=""; DOCTOR_MODE=""
 HOLD="${HOLD:-}"
 CHANGELOG="${UPDATE_ALL_CLIS_CHANGELOG:-}"
 SELF_UPDATE="${UPDATE_ALL_CLIS_SELF_UPDATE:-}"
@@ -241,8 +241,8 @@ while [[ $# -gt 0 ]]; do
     --retries=*)       UAC_RETRIES="${1#*=}"; shift ;;
     --retry-delay=*)   UAC_RETRY_DELAY="${1#*=}"; shift ;;
     --no-fix)          UAC_FIX=0; shift ;;
-    --hold=*)          HOLD_ADD="${1#*=}"; shift ;;
-    --unhold=*)        HOLD_REMOVE="${1#*=}"; shift ;;
+    --hold=*)          HOLD_ADD="${1#*=}"; HOLD_ADD_SET=1; shift ;;
+    --unhold=*)        HOLD_REMOVE="${1#*=}"; HOLD_REMOVE_SET=1; shift ;;
     --doctor)          DOCTOR_MODE=1; shift ;;
     --changelog)       CHANGELOG=1; shift ;;
     --self-update)     SELF_UPDATE=1; shift ;;
@@ -1180,12 +1180,15 @@ main() {
     exit 0
   fi
 
-  if [[ -n "$HOLD_ADD" ]]; then
+  # Presence (not value) gates these: an empty `--hold=` must reach the
+  # library's "No names given." error (exit 2) instead of falling through
+  # to a full update run.
+  if [[ -n "$HOLD_ADD_SET" ]]; then
     python3 "$LIB_SCRIPT" hold-add "$CONFIG_LOCAL_FILE" "$HOLD_ADD"
     exit $?
   fi
 
-  if [[ -n "$HOLD_REMOVE" ]]; then
+  if [[ -n "$HOLD_REMOVE_SET" ]]; then
     python3 "$LIB_SCRIPT" hold-remove "$CONFIG_LOCAL_FILE" "$HOLD_REMOVE"
     exit $?
   fi
