@@ -147,9 +147,9 @@
     "pipx": "pipx upgrade-all 2>/dev/null || true",
     "grok": "grok update 2>/dev/null || true",
     "rustup": "rustup update 2>/dev/null || true",
-    "gcloud": "gcloud components update --quiet 2>/dev/null || true",
+    "gcloud": "gcloud components update --quiet 2>/dev/null",
     "mas": "mas upgrade 2>/dev/null || true",
-    "tlmgr": "tlmgr update --self --all 2>/dev/null || true",
+    "tlmgr": "tlmgr update --self --all 2>/dev/null",
     "pip": "pip3 install --upgrade pip setuptools wheel 2>/dev/null || true",
     "asdf": "asdf update 2>/dev/null || true",
     "proto": "proto update 2>/dev/null || true",
@@ -157,7 +157,7 @@
     "rye": "rye self update 2>/dev/null || true",
     "foundry": "foundryup 2>/dev/null || true",
     "aqua": "aqua update 2>/dev/null || true",
-    "mason": "command -v nvim >/dev/null 2>&1 && nvim --headless \"+lua local ok,r=pcall(require,'mason-registry') if not ok then return end r.refresh() local ps={} for _,p in ipairs(r.get_installed_packages()) do table.insert(ps,p.name) end if #ps>0 then vim.cmd('MasonInstall '..table.concat(ps,' ')) end\" +qa 2>/dev/null || true",
+    "mason": "command -v nvim >/dev/null 2>&1 && nvim --headless \"+lua local ok,r=pcall(require,'mason-registry') if not ok then return end r.refresh() local ps={} for _,p in ipairs(r.get_installed_packages()) do table.insert(ps,p.name) end if #ps>0 then vim.cmd('MasonInstall '..table.concat(ps,' ')) end\" +qa 2>/dev/null",
     "path": ""
   },
   "check": {
