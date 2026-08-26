@@ -25,6 +25,8 @@ from lib_update_all_clis import (
     doctor_broken_symlinks, doctor_shadowed_duplicates,
     doctor_chronic_failures, doctor_config_issues, doctor_not_installed, doctor_report,
     doctor_has_findings, format_doctor_report,
+    known_bulk_redundant, known_bulk_redundant_entries, merge_pack_into_local,
+    suggest_known_prune,
     tag_in_range, tag_to_version, truncate_changelog_body,
     format_changelog_section, changed_tools_with_repos, build_changelog_digest,
 )
@@ -2836,6 +2838,100 @@ class TestLooksLikeVersion(unittest.TestCase):
     def test_digitless_line_rejected(self):
         self.assertFalse(self._check("a version string with no digits"))
         self.assertFalse(self._check(""))
+
+
+class TestKnownBulkRedundant(unittest.TestCase):
+    def test_manager_covered_known_is_redundant(self):
+        bulk = {"brew": "brew upgrade", "npm": "npm update -g"}
+        self.assertEqual(
+            known_bulk_redundant("fd", "brew upgrade fd", bulk), "brew")
+        self.assertEqual(
+            known_bulk_redundant("cline", "npm update -g cline", bulk), "npm")
+
+    def test_self_updater_not_redundant(self):
+        bulk = {"npm": "npm update -g"}
+        self.assertIsNone(
+            known_bulk_redundant("claude", "claude update", bulk))
+
+    def test_empty_bulk_origin_not_redundant(self):
+        bulk = {"go": ""}
+        self.assertIsNone(
+            known_bulk_redundant("gopls", "go install golang.org/x/tools/gopls@latest", bulk))
+
+    def test_policy_override_with_prefix_not_redundant(self):
+        bulk = {"npm": "npm update -g"}
+        cmd = "npm update -g @opencode-ai/cli --prefix $HOME/.local"
+        self.assertIsNone(known_bulk_redundant("lildax", cmd, bulk))
+
+    def test_known_bulk_redundant_entries_sorted(self):
+        cfg = {
+            "known": {
+                "bat": "brew upgrade bat",
+                "claude": "claude update",
+                "fd": "brew upgrade fd",
+            },
+            "bulk": {"brew": "brew upgrade", "npm": "npm update -g"},
+        }
+        entries = known_bulk_redundant_entries(cfg)
+        self.assertEqual([e["name"] for e in entries], ["bat", "fd"])
+        self.assertEqual(entries[0]["origin"], "brew")
+
+
+class TestSuggestKnownPrune(unittest.TestCase):
+    def test_suggest_known_prune_prints_redundant(self):
+        cfg = {
+            "known": {"bat": "brew upgrade bat", "claude": "claude update"},
+            "bulk": {"brew": "brew upgrade"},
+        }
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            suggest_known_prune(cfg)
+        out = buf.getvalue()
+        self.assertIn("bat", out)
+        self.assertNotIn("claude", out)
+
+
+class TestMergePack(unittest.TestCase):
+    def test_merge_pack_adds_missing_keys_local_wins(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        pack = os.path.join(dirpath, "pack.json")
+        local = os.path.join(dirpath, "local.json")
+        with open(pack, "w") as f:
+            json.dump({"known": {"claude": "claude update", "hermes": "hermes update"}}, f)
+        with open(local, "w") as f:
+            json.dump({"known": {"claude": "claude update --custom"}}, f)
+        merged = merge_pack_into_local(pack, local)
+        self.assertEqual(merged, ["hermes"])
+        with open(local) as f:
+            data = json.load(f)
+        self.assertEqual(data["known"]["claude"], "claude update --custom")
+        self.assertEqual(data["known"]["hermes"], "hermes update")
+
+
+class TestDoctorRedundantKnown(unittest.TestCase):
+    def test_doctor_lists_redundant_known_informationally(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        cache_path = os.path.join(dirpath, "cache.json")
+        with open(cache_path, "w") as f:
+            json.dump([{"name": "foo", "origin": "brew"}, {"scanned_at": "x", "count": 1}], f)
+        cfg = {
+            "known": {"bat": "brew upgrade bat"},
+            "bulk": {"brew": "brew upgrade"},
+        }
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = ""
+        try:
+            report = doctor_report(cache_path, cfg, history_path=None)
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertEqual(report["redundant_known"], ["bat"])
+        text = format_doctor_report(report)
+        self.assertIn("Redundant with bulk", text)
+        self.assertFalse(doctor_has_findings(report))
 
 
 if __name__ == "__main__":

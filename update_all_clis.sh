@@ -27,7 +27,8 @@
 #   --list --json     Machine-readable tool list (with --list)
 #   --report-unknown  Show tools discovered with no update path
 #   --ack-unknown=X   Dismiss a tool from the unknown report
-#   --suggest-known   Show tools updated via bulk but not in known list
+#   --suggest-known   List known entries redundant with bulk coverage (default prune mode)
+#   --suggest-known-add  Legacy: show bulk-covered tools missing from known
 #   --trace           Trace shell commands (bash -x)
 #   --dry-run         Show commands without running
 #   --json-plan       Print planned updates as JSON and exit
@@ -132,7 +133,7 @@ LIST_JSON=""; JSON_SUMMARY=""; TRACE=""
 SCAN_PATH=1; NO_SCAN_PATH=""; PARALLEL_JOBS=8; NOTIFY=""
 SUMMARY_MODE="${UPDATE_ALL_CLIS_SUMMARY_MODE:-full}"
 REPORT_UNKNOWN=""; ACK_UNKNOWN=""; HEALTH_CHECK=""
-SUGGEST_KNOWN=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
+SUGGEST_KNOWN=""; SUGGEST_KNOWN_ADD=""; JSON_PLAN=""; VERBOSE=""; VALIDATE_CACHE=""; DEBUG_CACHE=""
 HISTORY_MODE=""; HISTORY_N=3
 INSIGHTS_MODE=""
 NO_PRECHECK="${UAC_NO_PRECHECK:-}"
@@ -238,6 +239,7 @@ while [[ $# -gt 0 ]]; do
     --validate-cache)  VALIDATE_CACHE=1; shift ;;
     --debug-cache)     DEBUG_CACHE=1; shift ;;
     --suggest-known)   SUGGEST_KNOWN=1; shift ;;
+    --suggest-known-add) SUGGEST_KNOWN_ADD=1; shift ;;
     --notify)          NOTIFY=1; shift ;;
     --notify=on-failure) NOTIFY="on-failure"; shift ;;
     --summary=*)       SUMMARY_MODE="${1#*=}"; shift ;;
@@ -1202,7 +1204,14 @@ main() {
   if [[ -n "$SUGGEST_KNOWN" ]]; then
     export CONFIG_FILE
     export CONFIG_LOCAL_FILE
-    python3 "$LIB_SCRIPT" suggest-known "$CACHE_FILE"
+    python3 "$LIB_SCRIPT" suggest-known
+    exit 0
+  fi
+
+  if [[ -n "$SUGGEST_KNOWN_ADD" ]]; then
+    export CONFIG_FILE
+    export CONFIG_LOCAL_FILE
+    python3 "$LIB_SCRIPT" suggest-known --add "$CACHE_FILE"
     exit 0
   fi
 
@@ -1517,15 +1526,15 @@ main() {
   log "${BOLD}=== Done! ===${NC}"
   log "Summary: ${UPDATE_OK} ok, ${UPDATE_FAIL} failed"
 
-  # Auto-tip: bulk-covered tools missing from known list
+  # Auto-tip: known entries redundant with bulk coverage
   if [[ -z "$DRY_RUN" ]]; then
     local _known_summary _known_count _known_sample
-    _known_summary=$(python3 "$LIB_SCRIPT" suggest-known-summary "$CACHE_FILE" 2>/dev/null || printf '0\t\n')
+    _known_summary=$(python3 "$LIB_SCRIPT" suggest-known-prune-summary 2>/dev/null || printf '0\t\n')
     _known_count="${_known_summary%%$'\t'*}"
     _known_sample="${_known_summary#*$'\t'}"
     if [[ "$_known_count" =~ ^[0-9]+$ ]] && [[ "$_known_count" -gt 0 ]]; then
-      warn "$_known_count tools updated via bulk but not individually tracked (e.g., $_known_sample)"
-      log "  Run './update_all_clis.sh --suggest-known' to see all candidates."
+      warn "$_known_count known entries duplicate bulk coverage (e.g., $_known_sample)"
+      log "  Run './update_all_clis.sh --suggest-known' to review for pruning."
     fi
   fi
 
