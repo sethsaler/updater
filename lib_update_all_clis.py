@@ -731,6 +731,103 @@ def _known_pkg_from_cmd(cmd: str) -> Optional[tuple[str, str]]:
     return None
 
 
+# Known entries whose entire update is a single bulk-origin sweep (not per-package).
+_BULK_REDUNDANT_ORIGIN_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("mise", "self-update"), "mise"),
+    (("opencode", "upgrade"), "opencode"),
+    (("grok", "update"), "grok"),
+)
+
+
+def known_bulk_redundant(name: str, cmd: str, bulk: dict[str, Any]) -> Optional[str]:
+    """Return bulk origin name when a known entry duplicates bulk coverage."""
+    bulk = bulk or {}
+    head = _cmd_head(cmd).strip()
+    if not head:
+        return None
+
+    ext = _known_pkg_from_cmd(cmd)
+    if ext:
+        mgr, _pkg = ext
+        if str(bulk.get(mgr, "") or "").strip():
+            return mgr
+
+    toks = _fix_tokens(head) or []
+    for prefix, origin in _BULK_REDUNDANT_ORIGIN_PREFIXES:
+        if len(toks) >= len(prefix) and tuple(toks[: len(prefix)]) == prefix:
+            if str(bulk.get(origin, "") or "").strip():
+                return origin
+
+    if head.startswith("uv self update") and "uv tool upgrade" in head:
+        if str(bulk.get("uv", "") or "").strip():
+            return "uv"
+
+    return None
+
+
+def known_bulk_redundant_entries(cfg: dict[str, Any]) -> list[dict[str, str]]:
+    """Known tools whose commands duplicate a non-empty bulk origin."""
+    bulk = cfg.get("bulk", {}) or {}
+    known = cfg.get("known", {}) or {}
+    out: list[dict[str, str]] = []
+    for name in sorted(known):
+        cmd = known.get(name, "")
+        if not isinstance(cmd, str):
+            continue
+        origin = known_bulk_redundant(name, cmd, bulk)
+        if origin:
+            out.append({"name": name, "origin": origin, "cmd": cmd})
+    return out
+
+
+def merge_pack_into_local(pack_path: str, local_path: str) -> list[str]:
+    """Merge a pack file's ``known`` entries into a local config (local wins on key clash)."""
+    try:
+        with open(pack_path, encoding="utf-8") as f:
+            pack = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"Pack file not found: {pack_path}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in pack file {pack_path}: {e}")
+
+    known_pack = pack.get("known")
+    if not isinstance(known_pack, dict):
+        raise ValueError("pack file must contain a 'known' object")
+
+    data: dict[str, Any] = {}
+    if os.path.isfile(local_path):
+        try:
+            with open(local_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    local_known = data.get("known")
+    if not isinstance(local_known, dict):
+        local_known = {}
+    merged_keys: list[str] = []
+    for key, cmd in sorted(known_pack.items()):
+        if not isinstance(key, str) or not isinstance(cmd, str):
+            continue
+        if key in local_known:
+            continue
+        local_known[key] = cmd
+        merged_keys.append(key)
+    data["known"] = local_known
+
+    local_dir = os.path.dirname(local_path)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
+    tmp_path = local_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, local_path)
+    return merged_keys
+
+
 def _npm_outdated_map(stdout: str) -> dict[str, str]:
     """{name: wanted_version} from `npm outdated -g --parseable` output.
 
@@ -1954,7 +2051,34 @@ _TRACKABLE_ORIGINS = frozenset({
 })
 
 
-def suggest_known(cache_path: str, cfg: dict[str, Any]) -> None:
+def suggest_known_prune(cfg: dict[str, Any]) -> None:
+    """List known entries redundant with bulk coverage (exceptions-only hygiene)."""
+    redundant = known_bulk_redundant_entries(cfg)
+    if not redundant:
+        print("No known entries are redundant with bulk coverage.", file=sys.stderr)
+        return
+
+    by_origin: dict[str, list[dict[str, str]]] = {}
+    for entry in redundant:
+        by_origin.setdefault(entry["origin"], []).append(entry)
+
+    for origin in sorted(by_origin):
+        items = by_origin[origin]
+        print(f"  {origin} ({len(items)} redundant known entries):")
+        for entry in items:
+            cmd = entry["cmd"]
+            preview = (cmd[:60] + "…") if len(cmd) > 60 else cmd
+            print(f'    "{entry["name"]}"  # {preview}')
+        print()
+
+    print(f"Total: {len(redundant)} known entry/entries duplicate bulk coverage.")
+    print()
+    print("Remove these from tool_config.json or config.local.json — bulk already updates them.")
+    print("Optional: merge packs/ai-clis.json only adds exceptions (never bulk duplicates).")
+    print()
+
+
+def suggest_known_add(cache_path: str, cfg: dict[str, Any]) -> None:
     """Suggest tools covered by bulk but missing from the known list."""
     try:
         with open(cache_path, encoding="utf-8") as f:
@@ -3427,6 +3551,7 @@ def doctor_report(
         "config_issues": [],
         "not_installed": [],
         "prune_suggestions": [],
+        "redundant_known": [],
         "errors": [],
     }
 
@@ -3476,6 +3601,12 @@ def doctor_report(
         report["prune_suggestions"] = doctor_prune_suggestions(cache_path, cfg)
     except Exception as e:
         report["errors"].append(f"prune-suggestion check failed: {e}")
+
+    try:
+        report["redundant_known"] = [
+            e["name"] for e in known_bulk_redundant_entries(cfg)]
+    except Exception as e:
+        report["errors"].append(f"redundant-known check failed: {e}")
 
     return report
 
@@ -3559,6 +3690,14 @@ def format_doctor_report(report: dict[str, Any]) -> str:
             f"Not seen anywhere ({len(ps)}, informational — not on PATH and "
             "absent from the last scan; review for pruning):")
         lines.append("  " + ", ".join(ps))
+
+    rk = report.get("redundant_known", []) or []
+    if rk:
+        lines.append("")
+        lines.append(
+            f"Redundant with bulk ({len(rk)}, informational — bulk already "
+            "updates these; remove from known):")
+        lines.append("  " + ", ".join(rk))
 
     ig = report.get("ignored_shadows", []) or []
     if ig:
@@ -4265,7 +4404,32 @@ def _cmd_suggest(args: argparse.Namespace) -> int:
 
 
 def _cmd_suggest_known(args: argparse.Namespace) -> int:
-    suggest_known(args.cache_path, _cfg_with_legacy_base(args.base_config or ""))
+    cfg = _cfg_with_legacy_base(args.base_config or "")
+    if getattr(args, "add", False):
+        suggest_known_add(args.cache_path, cfg)
+    else:
+        suggest_known_prune(cfg)
+    return 0
+
+
+def _cmd_suggest_known_prune(args: argparse.Namespace) -> int:
+    suggest_known_prune(_cfg_with_legacy_base(args.base_config or ""))
+    return 0
+
+
+def _cmd_suggest_known_add(args: argparse.Namespace) -> int:
+    suggest_known_add(args.cache_path, _cfg_with_legacy_base(args.base_config or ""))
+    return 0
+
+
+def _cmd_merge_pack(args: argparse.Namespace) -> int:
+    merged = merge_pack_into_local(args.pack_path, args.config_local_file)
+    if merged:
+        print(f"Merged {len(merged)} known entries from {args.pack_path} into "
+              f"{args.config_local_file}: {', '.join(merged)}")
+    else:
+        print(f"No new known entries to merge from {args.pack_path} "
+              f"(all keys already present in {args.config_local_file}).")
     return 0
 
 
@@ -4348,11 +4512,20 @@ def _cmd_lines_to_json(args: argparse.Namespace) -> int:
 
 
 def _cmd_suggest_known_summary(args: argparse.Namespace) -> int:
-    # One-line "count<TAB>sample" for the shell's post-run auto-tip.
+    # One-line "count<TAB>sample" for the shell's post-run auto-tip (legacy add mode).
     cfg = _cfg_with_legacy_base(args.base_config or "", do_validate=False)
     candidates = suggest_known_count(args.cache_path, cfg)
     sample = ", ".join(str(c[0]) for c in candidates[:3] if c)
     print(f"{len(candidates)}\t{sample}")
+    return 0
+
+
+def _cmd_suggest_known_prune_summary(args: argparse.Namespace) -> int:
+    # One-line "count<TAB>sample" for redundant-known auto-tip.
+    cfg = _cfg_with_legacy_base(args.base_config or "", do_validate=False)
+    redundant = known_bulk_redundant_entries(cfg)
+    sample = ", ".join(e["name"] for e in redundant[:3])
+    print(f"{len(redundant)}\t{sample}")
     return 0
 
 
@@ -4442,12 +4615,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p = _p("new-tools", _cmd_new_tools)
     p.add_argument("prev_names_path", nargs="?", default="")
     p.add_argument("cache_path", nargs="?", default="")
-    for name, func in (("suggest", _cmd_suggest), ("suggest-known", _cmd_suggest_known),
+    for name, func in (("suggest", _cmd_suggest), ("suggest-known-add", _cmd_suggest_known_add),
                        ("suggest-known-count", _cmd_suggest_known_count),
                        ("log-unknowns", _cmd_log_unknowns)):
         p = _p(name, func)
         p.add_argument("cache_path")
         p.add_argument("base_config", nargs="?", default="")
+    p = _p("suggest-known", _cmd_suggest_known)
+    p.add_argument("cache_path", nargs="?", default="")
+    p.add_argument("base_config", nargs="?", default="")
+    p.add_argument("--add", action="store_true",
+                   help="legacy: suggest bulk-covered tools to add to known")
+    p = _p("suggest-known-prune", _cmd_suggest_known_prune)
+    p.add_argument("base_config", nargs="?", default="")
+    p = _p("merge-pack", _cmd_merge_pack)
+    p.add_argument("pack_path")
+    p.add_argument("config_local_file")
     p = _p("report-unknown", _cmd_report_unknown)
     p.add_argument("unknown_log", nargs="?", default="")
     p.add_argument("min_times", nargs="?", type=int, default=1)
@@ -4467,6 +4650,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _p("lines-to-json", _cmd_lines_to_json)
     p = _p("suggest-known-summary", _cmd_suggest_known_summary)
     p.add_argument("cache_path")
+    p.add_argument("base_config", nargs="?", default="")
+    p = _p("suggest-known-prune-summary", _cmd_suggest_known_prune_summary)
     p.add_argument("base_config", nargs="?", default="")
     p = _p("unknown-summary", _cmd_unknown_summary); p.add_argument("unknown_log")
     p = _p("json-summary", _cmd_json_summary)
