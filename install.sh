@@ -67,6 +67,7 @@ write_plist_daily() {
   local user="$1"
   local plist_dst="$2"
   local script_path="$3"
+  local sched_path="$4"
   cat > "$plist_dst" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -97,6 +98,8 @@ write_plist_daily() {
 	<dict>
 		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
 		<string>1</string>
+		<key>PATH</key>
+		<string>${sched_path}</string>
 	</dict>
 </dict>
 </plist>
@@ -108,6 +111,7 @@ write_plist_interval() {
   local plist_dst="$2"
   local script_path="$3"
   local sec="$4"
+  local sched_path="$5"
   cat > "$plist_dst" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -133,6 +137,8 @@ write_plist_interval() {
 	<dict>
 		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
 		<string>1</string>
+		<key>PATH</key>
+		<string>${sched_path}</string>
 	</dict>
 </dict>
 </plist>
@@ -143,6 +149,7 @@ write_plist_weekly() {
   local user="$1"
   local plist_dst="$2"
   local script_path="$3"
+  local sched_path="$4"
   cat > "$plist_dst" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -175,6 +182,8 @@ write_plist_weekly() {
 	<dict>
 		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
 		<string>1</string>
+		<key>PATH</key>
+		<string>${sched_path}</string>
 	</dict>
 </dict>
 </plist>
@@ -195,22 +204,28 @@ setup_launchd() {
   ask_frequency
   parse_frequency "$choice" || return 0
 
+  # Bake the install-time interactive PATH into the agent: launchd jobs
+  # otherwise run with a minimal system PATH and can't find brew, npm,
+  # cargo, and friends (scheduled runs fail with "command not found").
+  local sched_path="$PATH"
   case "$SCHEDULE_TYPE" in
     daily)
       info "Scheduling: daily at 8:00 AM"
-      write_plist_daily "$user" "$plist_dst" "$script_path"
+      write_plist_daily "$user" "$plist_dst" "$script_path" "$sched_path"
       ;;
     interval)
       local hours=$((INTERVAL_SEC / 3600))
       info "Scheduling: every ${hours} hours"
-      write_plist_interval "$user" "$plist_dst" "$script_path" "$INTERVAL_SEC"
+      write_plist_interval "$user" "$plist_dst" "$script_path" "$INTERVAL_SEC" "$sched_path"
       ;;
     weekly)
       info "Scheduling: weekly on Sunday at 8:00 AM"
-      write_plist_weekly "$user" "$plist_dst" "$script_path"
+      write_plist_weekly "$user" "$plist_dst" "$script_path" "$sched_path"
       ;;
   esac
 
+  # Unload first so re-running install refreshes an existing agent.
+  launchctl unload "$plist_dst" 2>/dev/null || true
   launchctl load "$plist_dst" 2>/dev/null || true
   info "LaunchAgent installed and loaded."
   info "  Label: com.${user}.update-all-clis"
@@ -238,6 +253,7 @@ Description=update-all-clis — update installed CLIs and package managers
 [Service]
 Type=oneshot
 Environment=UPDATE_ALL_CLIS_NO_NOTIFY=1
+Environment=PATH=${PATH}
 Environment=UPDATE_ALL_CLIS_SUMMARY_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/update-all-clis/last-run-summary.txt
 ExecStart=${script_path}
 StandardOutput=append:${LOG_DIR}/update-all-clis.log

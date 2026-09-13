@@ -678,6 +678,26 @@ class TestLogUnknowns(unittest.TestCase):
         import shutil
         shutil.rmtree(dirpath, ignore_errors=True)
 
+    def test_duplicate_origin_covered_name_is_not_logged(self):
+        dirpath = tempfile.mkdtemp()
+        cache_path = os.path.join(dirpath, "cache.json")
+        log_path = os.path.join(dirpath, "unknown.json")
+        with open(cache_path, "w") as f:
+            json.dump([
+                {"name": "fd", "origin": "brew"},
+                {"name": "fd", "origin": "path"},
+                {"name": "ghostty", "origin": "path"},
+                {"scanned_at": "2026-06-01T00:00:00Z", "count": 3},
+            ], f)
+        cfg = {"known": {}, "bulk": {"brew": "brew upgrade", "path": ""}}
+        log_unknowns(cache_path, cfg, log_path)
+        with open(log_path) as f:
+            data = json.load(f)
+        self.assertNotIn("fd", data["tools"])
+        self.assertIn("ghostty", data["tools"])
+        import shutil
+        shutil.rmtree(dirpath, ignore_errors=True)
+
     def test_empty_bulk_command_origin_is_logged(self):
         dirpath = tempfile.mkdtemp()
         cache_path = os.path.join(dirpath, "cache.json")
@@ -1591,6 +1611,54 @@ class TestScanDirsConfig(unittest.TestCase):
         rows = scan_dirs_config_rows(cfg)
         self.assertGreater(len(rows), 20)
         self.assertIn(("$HOME/.local/bin", "uv/pip", "dir"), rows)
+
+    def test_base_config_has_no_failure_masks(self):
+        # A trailing `|| true` forces exit 0, so the executor's retry/fix
+        # policy never engages and failures are counted as ok. Genuine
+        # fallbacks (`|| cargo update`, `|| zoxide self-update`) contain no
+        # `|| true` and are unaffected.
+        cfg = load_merge(os.path.join(REPO_ROOT, "tool_config.json"), None)
+        for section in ("known", "bulk"):
+            for name, cmd in cfg[section].items():
+                self.assertNotIn(
+                    "|| true", cmd,
+                    f"{section}.{name} masks failures with `|| true`")
+
+    def _run_npm_bulk_with_stub(self, fail_pkg):
+        # Run the repo's npm bulk command against a stub npm: `outdated`
+        # reports two packages, `update` fails only for `fail_pkg`.
+        import subprocess
+        d = tempfile.mkdtemp()
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        stub = os.path.join(d, "npm")
+        with open(stub, "w") as f:
+            f.write("#!/usr/bin/env bash\n"
+                    "if [[ \"${1:-}\" == \"outdated\" ]]; then\n"
+                    "  printf '/x/pkg-a:pkg-a@1.0.0\\n/x/pkg-b:pkg-b@2.0.0\\n'\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "if [[ \"${1:-}\" == \"update\" ]]; then\n"
+                    "  for a in \"$@\"; do\n"
+                    "    [[ \"$a\" == \"" + fail_pkg + "\" ]] && exit 1\n"
+                    "  done\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "exit 0\n")
+        os.chmod(stub, 0o755)
+        cfg = load_merge(os.path.join(REPO_ROOT, "tool_config.json"), None)
+        env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
+        proc = subprocess.run(["bash", "-c", cfg["bulk"]["npm"]],
+                              env=env, capture_output=True, text=True)
+        return proc.returncode
+
+    def test_npm_bulk_reports_package_failure(self):
+        # One failing package must fail the sweep (per-package isolation
+        # stays: both packages are still attempted).
+        self.assertEqual(self._run_npm_bulk_with_stub("pkg-b"), 1)
+
+    def test_npm_bulk_ok_when_all_packages_succeed(self):
+        self.assertEqual(self._run_npm_bulk_with_stub("__none__"), 0)
 
 
 class TestShellHelperFunctions(unittest.TestCase):

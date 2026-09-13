@@ -2195,16 +2195,29 @@ def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) ->
 
     existing_tools = existing.get("tools", {})
 
+    # A tool reachable from several scanned dirs holds one record per
+    # origin (e.g. fd under both brew and path). It has an update path when
+    # ANY of its records is known- or bulk-covered, so compute coverage per
+    # name first — otherwise the uncovered duplicate is falsely reported as
+    # having no update path at all.
+    covered: set[str] = set(known)
+    for t in tools:
+        name = t["name"]
+        if name in covered:
+            continue
+        origin = t.get("origin", "?")
+        if origin in bulk:
+            covered.add(name)
+            continue
+        inferred = _infer_origin_from_symlink(name, origin)
+        if inferred and inferred in bulk:
+            covered.add(name)
+
     for t in tools:
         name = t["name"]
         origin = t.get("origin", "?")
 
-        if name in known:
-            continue
-        if origin in bulk:
-            continue
-        inferred = _infer_origin_from_symlink(name, origin)
-        if inferred and inferred in bulk:
+        if name in covered:
             continue
 
         if name in existing_tools:

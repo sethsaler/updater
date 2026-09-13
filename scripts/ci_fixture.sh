@@ -57,4 +57,27 @@ python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py' -q
 # (at parallel=1) stdout for an identical plan.
 bash "$ROOT/tests/executor_parity.sh"
 
+# LaunchAgent plists must bake in a PATH: launchd/systemd jobs otherwise
+# run with a minimal system PATH and can't find brew, npm, cargo, etc.
+sed -n '/^write_plist_daily()/,/^}/p;/^write_plist_interval()/,/^}/p;/^write_plist_weekly()/,/^}/p' "$ROOT/install.sh" > "$td/plist_funcs.sh"
+bash -c "
+LOG_DIR='$td/logs'
+source '$td/plist_funcs.sh'
+write_plist_daily testuser '$td/t.plist' /fake/update_all_clis.sh '/opt/bin:/usr/bin:/bin'
+write_plist_interval testuser '$td/t.plist.i' /fake/update_all_clis.sh 21600 '/opt/bin:/usr/bin:/bin'
+write_plist_weekly testuser '$td/t.plist.w' /fake/update_all_clis.sh '/opt/bin:/usr/bin:/bin'
+"
+for p in "$td/t.plist" "$td/t.plist.i" "$td/t.plist.w"; do
+  grep -q "<key>PATH</key>" "$p" || { echo "ci_fixture: $p missing PATH key"; exit 1; }
+  grep -q "/opt/bin:/usr/bin:/bin" "$p" || { echo "ci_fixture: $p missing baked PATH"; exit 1; }
+done
+python3 -c "
+import plistlib
+for p in ('$td/t.plist', '$td/t.plist.i', '$td/t.plist.w'):
+    with open(p, 'rb') as f:
+        d = plistlib.load(f)
+    assert d['EnvironmentVariables']['PATH'] == '/opt/bin:/usr/bin:/bin', p
+print('plist PATH: ok')
+"
+
 echo "ci_fixture: ok"

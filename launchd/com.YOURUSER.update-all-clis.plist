@@ -39,10 +39,16 @@
 	<false/>
 
 	<!-- No GUI dialog for scheduled runs (manual runs use Terminal TTY) -->
+	<!-- PATH is required: launchd jobs otherwise run with a minimal system
+	     PATH and can't find brew, npm, cargo, etc. (install.sh bakes in your
+	     interactive PATH automatically; set it by hand when copying this
+	     template). -->
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>UPDATE_ALL_CLIS_NO_NOTIFY</key>
 		<string>1</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/Users/YOURUSER/.local/bin:/Users/YOURUSER/.cargo/bin:/Users/YOURUSER/go/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 </dict>
 </plist>
