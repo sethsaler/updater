@@ -5,14 +5,52 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
-# Cancel stale PR runs while preserving every main-branch verification.
+permissions:
+  contents: read
+
+# Every run gets its own group: newer commits never cancel running or queued work.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run_checks: ${{ steps.paths.outputs.run_checks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect documentation-only changes
+        id: paths
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # Always verify manual runs. An unavailable diff also runs all checks.
+          if [[ "$EVENT_NAME" == workflow_dispatch ]] ||
+             ! git rev-parse --verify "$BASE_SHA^{commit}" >/dev/null 2>&1 ||
+             ! git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"; then
+            echo 'run_checks=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run_checks=false
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              README.md|CHANGELOG.md|CLI_LAST_UPDATED.md|migration/README.md|docs/*.md) ;;
+              *) run_checks=true ;;
+            esac
+          done < "$RUNNER_TEMP/changed-paths"
+          echo "run_checks=$run_checks" >> "$GITHUB_OUTPUT"
+
   shellcheck:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_checks != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,62 +59,70 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Run ShellCheck
-        run: shellcheck update_all_clis.sh install.sh scripts/ci_fixture.sh scripts/agentmail_send_update_summary.sh scripts/agentmail_daily_example.sh migration/update_ai_clis.sh migration/quit_office_apps.sh tests/executor_parity.sh
+        run: bash scripts/verify.sh shellcheck
 
   fixture:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_checks != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Fixture smoke test and unit tests
-        run: bash scripts/ci_fixture.sh
+      # Preserve the fixture check name while keeping automatic runs lightweight.
+      - name: Fast unit tests
+        if: github.event_name != 'workflow_dispatch'
+        run: bash scripts/verify.sh unit
+
+      - name: Full fixture smoke test, unit tests, and executor parity
+        if: github.event_name == 'workflow_dispatch'
+        run: bash scripts/verify.sh fixture
 
   config-schema:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_checks != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Validate tool_config.json against schema
-        run: |
-          python3 -c "
-          import json
-          with open('tool_config.json') as f:
-              cfg = json.load(f)
-          with open('tool_config.schema.json') as f:
-              schema = json.load(f)
-          assert set(schema['required']).issubset(cfg.keys())
-          assert isinstance(cfg['known'], dict)
-          assert isinstance(cfg['bulk'], dict)
-          for section in ('known', 'bulk'):
-              for k, v in cfg[section].items():
-                  assert isinstance(v, str), f'{section}.{k} must be string'
-          print('config schema: ok')
-          "
+        run: bash scripts/verify.sh config-schema
 
   ruff:
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_checks != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # Syntax errors + pyflakes only (E9,F) — a stable, low-noise subset;
       # the project intentionally has no formatter config.
-      - name: Ruff (E9,F)
+      - name: Install Ruff
         uses: astral-sh/ruff-action@v3
         with:
-          args: check --select E9,F lib_update_all_clis.py tui_update_all_clis.py tests/ scripts/generate_cli_report.py
+          args: --version
+      - name: Ruff (E9,F)
+        run: bash scripts/verify.sh ruff
 
   macos:
+    # Native platform coverage is opt-in because macOS runners are expensive.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      # Unit tests + shellcheck-clean shell, on the platform the tool is
+      # Unit tests + fixture smoke tests on the platform the tool is
       # built for (brew, mas, launchd, osascript paths).
       - name: Fixture smoke test and unit tests
-        run: bash scripts/ci_fixture.sh
+        run: bash scripts/verify.sh fixture
 
       # A real discovery scan + dry-run against the default scan paths —
       # catches macOS-only path bugs (brew prefix, ~/Library dirs) that the
       # ubuntu fixture can't. No updates are executed.
       - name: Dry-run against real default scan paths
-        run: ./update_all_clis.sh --dry-run --quiet
+        run: bash scripts/verify.sh native
