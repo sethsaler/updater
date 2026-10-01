@@ -614,17 +614,31 @@ Last modified is the file timestamp of the binary on disk (when it was last inst
 
 ## Testing
 
-The project includes a comprehensive test suite:
+Run all checks with one command (Bash 3.2+, Python 3.11+, Git, ShellCheck, and Ruff must be on `PATH`):
+
+```bash
+# macOS prerequisites: brew install python shellcheck ruff
+# Ubuntu prerequisites: sudo apt-get install python3 shellcheck
+# Then install Ruff in your preferred Python environment: python3 -m pip install ruff
+bash scripts/verify.sh
+```
+
+This runs ShellCheck on every shell script, Ruff's existing E9,F rules, the lightweight configuration-shape check, all unit tests, executor parity, and CLI fixture smoke tests. On macOS it also runs the native discovery dry-run with isolated cache/config state. It never executes real tool updates. On Linux the command reports that native macOS discovery was not run; use a Mac or the manual workflow for that coverage. No formatter or separate type checker is configured in this repository.
+
+Individual checks are also available:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'   # 300+ unit tests
 bash tests/executor_parity.sh                          # bash↔python executor equivalence gate
 bash scripts/ci_fixture.sh                             # both of the above + CLI smoke tests
+bash scripts/verify.sh shellcheck                      # or ruff, config-schema, unit, fixture, native
 ```
 
 Tests cover: configuration loading and merging, validation, version caching, discovery path handling, cache operations, emit/plan generation (holds, prechecks, :major pins), the known-tool up-to-date machinery, doctor, history, the changelog digest, and the executor (watchdog kills, retry/fix, lock-group serialization, renderers). The parity gate runs identical fake-job plans through the Python executor and the legacy bash executor and requires identical result records, tallies, lock-serialization witnesses, and — at `--parallel 1` — byte-identical stdout.
 
-CI runs all of this on ubuntu and macOS, plus shellcheck on every shell script (including `migration/`) and ruff (E9,F) on the Python files.
+Automatic CI on pull requests and pushes to `main` runs fast Linux unit tests, ShellCheck, Ruff, and configuration checks. The existing `fixture` check name is preserved, but it runs only unit tests for automatic events. Documentation-only changes to the README, changelog, CLI report, migration README, or Markdown under `docs/` skip those jobs through a job-level gate; the workflow still runs and keeps the existing check names, so path-filtered required checks are not left pending. Unknown paths and changes to code, configuration, tests, or workflows run all automatic checks.
+
+For full cross-platform verification, open **Actions → CI → Run workflow** and select the branch to test. Manual dispatch always runs lint/config checks, the full Linux fixture/unit/parity suite, and the native macOS fixture and discovery dry-run, even for docs-only changes. This option becomes available on the default branch after the workflow change is merged and Actions is enabled for the repository. Manual GitHub runs still consume Actions minutes; local checks do not. These workflow changes do not enable Actions or cancel any existing work, and newer runs never cancel older running or queued runs.
 
 All tests should pass before making changes to the core logic.
 
