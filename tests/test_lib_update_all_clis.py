@@ -2993,7 +2993,12 @@ class TestDoctorRedundantKnown(unittest.TestCase):
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = ""
         try:
-            report = doctor_report(cache_path, cfg, history_path=None)
+            # Explicit nonexistent history path: doctor_report(None) falls
+            # back to the real user history file, whose contents would leak
+            # machine state into the assertions.
+            report = doctor_report(
+                cache_path, cfg,
+                history_path=os.path.join(dirpath, "history.jsonl"))
         finally:
             os.environ["PATH"] = old_path
         self.assertEqual(report["redundant_known"], ["bat"])

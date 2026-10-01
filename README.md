@@ -14,14 +14,14 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 
 | Origin / Manager | Update command |
 |---|---|
-| npm global packages | `npm update -g <pkg>` per outdated package (private/linked packages can't break the sweep) |
+| npm global packages | `npm update -g <pkg>` per outdated package (private/linked packages can't break the sweep; `MISSING` stale entries skipped) |
 | pnpm global packages | `pnpm update -g` |
 | Yarn global packages | `yarn global upgrade` |
 | Homebrew (macOS) | `brew update && brew upgrade` |
 | Ruby Gems | `gem update --user-install` |
 | Cargo (Rust) | `cargo install-update -a` |
 | Conda | `conda update --all` |
-| uv (Python) | `uv self update && uv tool upgrade --all` |
+| uv (Python) | `uv self update` + `uv tool upgrade <tool>` per tool (one broken tool can't sink the rest) |
 | Go tools | `go install golang.org/x/tools/gopls@latest` |
 | .NET tools | `dotnet tool update --global` |
 | Krew (kubectl plugins) | `kubectl krew upgrade` |
@@ -37,7 +37,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | gcloud (Google Cloud SDK) | `gcloud components update --quiet` |
 | mas (Mac App Store CLI) | `mas upgrade` |
 | tlmgr (TeX Live) | `tlmgr update --self --all` |
-| pip (macOS user installs) | `pip3 install --upgrade pip setuptools wheel` |
+| pip (macOS user installs) | `pip3 install --upgrade pip setuptools wheel` (skipped cleanly on PEP 668 externally-managed interpreters) |
 | asdf (version manager) | `asdf update` |
 | proto (version manager) | `proto update` |
 | Volta (Node) | `volta update` |
@@ -75,7 +75,6 @@ Base `tool_config.json` ships a **residual-shaped** `known` list (~35 entries): 
 | Muse Code | `MUSE_LAUNCHER_INSTALL=1 muse` |
 | ntn | `ntn update` |
 | Oh My Pi (omp) | `omp update` |
-| Ollama | `ollama update` |
 | 1Password CLI (op) | `op update` |
 | Pi | `pi update --all --no-approve` |
 | Pool | `pool update` |
@@ -90,7 +89,7 @@ Base `tool_config.json` ships a **residual-shaped** `known` list (~35 entries): 
 
 Optional overlay pack [`packs/ai-clis.json`](packs/ai-clis.json) carries the same exception set for `merge-pack` into `config.local.json` without forking the repo.
 
-Tools not found on your system are silently skipped. Unknown tools are skipped silently. The script never updates things it can't update.
+Tools not found on your system are silently skipped. Unknown tools are skipped silently. The script never updates things it can't update. (For that reason there is no `ollama` entry: `ollama` has no update subcommand — the macOS app updates itself, and a Homebrew-cask install is already covered by the `brew` bulk.)
 
 A tool being in `known` never suppresses its origin's bulk update: e.g. if you add `cline` to `known` with `npm update -g cline`, the origin's `npm update -g` bulk line **still runs once** to cover every *other* npm global that isn't individually tracked. (An earlier version of this script had a bug where the first `known` tool seen for an origin marked that origin's bulk update as already handled, so it silently never ran for origins — npm chief among them — that almost always have at least one `known` tool. Fixed; see the regression test `test_known_tool_does_not_suppress_origin_bulk`.)
 

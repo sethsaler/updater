@@ -22,7 +22,6 @@
     "movie-goat-pp-cli": "go install github.com/mvanhorn/printing-press-library/library/media-and-entertainment/movie-goat/cmd/movie-goat-pp-cli@latest 2>/dev/null",
     "muse": "MUSE_LAUNCHER_INSTALL=1 muse 2>/dev/null",
     "ntn": "ntn update 2>/dev/null",
-    "ollama": "ollama update 2>/dev/null",
     "omp": "omp update 2>/dev/null",
     "op": "op update 2>/dev/null",
     "pi": "pi update --all --no-approve 2>/dev/null",
@@ -37,7 +36,7 @@
     "zoxide": "zoxide update 2>/dev/null || zoxide self-update 2>/dev/null"
   },
   "bulk": {
-    "npm": "npm outdated -g --parseable 2>/dev/null | cut -d: -f2 | sed 's/@[^@]*$//' | sort -u | { fail=0; while read -r p; do npm update -g \"$p\" --no-fund --no-audit || fail=1; done; exit $fail; }",
+    "npm": "npm outdated -g --parseable 2>/dev/null | grep -v ':MISSING:' | cut -d: -f2 | sed 's/@[^@]*$//' | sort -u | { fail=0; while read -r p; do npm update -g \"$p\" --no-fund --no-audit || fail=1; done; exit $fail; }",
     "pnpm": "pnpm update -g 2>/dev/null",
     "yarn": "yarn global upgrade 2>/dev/null",
     "cargo": "cargo install-update -a 2>/dev/null || cargo update",
@@ -45,9 +44,9 @@
     "brew": "brew --repository >/dev/null && brew update && brew upgrade 2>&1 | grep -v 'Warning:' | head -200",
     "manual": "brew upgrade 2>/dev/null",
     "conda": "conda update --all -y 2>/dev/null",
-    "uv": "uv self update && uv tool upgrade --all",
-    "uv/pip": "uv self update && uv tool upgrade --all",
-    "uv/venv": "uv self update && uv tool upgrade --all",
+    "uv": "uv self update && { fail=0; for t in $(uv tool list 2>/dev/null | awk 'NF && $1 != \"-\" {print $1}'); do uv tool upgrade \"$t\" || fail=1; done; exit $fail; }",
+    "uv/pip": "uv self update && { fail=0; for t in $(uv tool list 2>/dev/null | awk 'NF && $1 != \"-\" {print $1}'); do uv tool upgrade \"$t\" || fail=1; done; exit $fail; }",
+    "uv/venv": "uv self update && { fail=0; for t in $(uv tool list 2>/dev/null | awk 'NF && $1 != \"-\" {print $1}'); do uv tool upgrade \"$t\" || fail=1; done; exit $fail; }",
     "fnm": "fnm update 2>/dev/null",
     "bun": "curl -fsSL https://bun.com/install | bash 2>/dev/null; bun update -g 2>/dev/null",
     "deno": "deno upgrade 2>/dev/null",
@@ -65,7 +64,7 @@
     "gcloud": "gcloud components update --quiet 2>/dev/null",
     "mas": "mas upgrade 2>/dev/null",
     "tlmgr": "tlmgr update --self --all 2>/dev/null",
-    "pip": "pip3 install --upgrade pip setuptools wheel 2>/dev/null",
+    "pip": "out=$(pip3 install --upgrade pip setuptools wheel 2>&1); rc=$?; if [ $rc -ne 0 ]; then if printf '%s' \"$out\" | grep -qi externally-managed; then echo 'pip: interpreter is externally managed (PEP 668) — nothing pip can update'; else printf '%s\\n' \"$out\" | tail -5; exit $rc; fi; fi",
     "asdf": "asdf update 2>/dev/null",
     "proto": "proto update 2>/dev/null",
     "volta": "volta update 2>/dev/null",
@@ -78,6 +77,10 @@
   "check": {
     "npm": "npm outdated -g --parseable",
     "brew": "brew update >/dev/null 2>&1 && brew outdated --quiet"
+  },
+  "fix": {
+    "amp": "curl -fsSL https://ampcode.com/install.sh | bash",
+    "composio": "curl -fsSL https://composio.dev/install | COMPOSIO_INSTALL_SHELL=none sh"
   },
   "scan_dirs": [
     {
