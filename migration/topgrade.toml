@@ -48,7 +48,7 @@ disable = [
 # Optional: quit early so later brew cask upgrades also see apps closed.
 # Comment out if you only want quit immediately before msupdate (the custom
 # command below always quits on its own).
-# "Quit Microsoft Office apps" = "/Users/sethsaler/Documents/GitHub/updater/migration/quit_office_apps.sh"
+# "Quit Microsoft Office apps" = "/Users/sethsaler/Developer/GitHub/updater/migration/quit_office_apps.sh"
 
 # ---------------------------------------------------------------------------
 # Custom steps that Topgrade may not enable by default on your install, but
@@ -58,7 +58,7 @@ disable = [
 [commands]
 # Replaces built-in microsoft_office: graceful quit → msupdate --install
 # Relaunch after: prefix with QUIT_OFFICE_RELAUNCH=1
-"Microsoft Office (quit apps + msupdate)" = "/Users/sethsaler/Documents/GitHub/updater/migration/quit_office_apps.sh --update"
+"Microsoft Office (quit apps + msupdate)" = "/Users/sethsaler/Developer/GitHub/updater/migration/quit_office_apps.sh --update"
 
 # pnpm / yarn globals (Topgrade's node step is npm-centric on many setups)
 "pnpm globals" = "command -v pnpm >/dev/null && pnpm update -g || true"
@@ -85,7 +85,7 @@ disable = [
 # Comment out if you prefer to run update_ai_clis.sh separately / on a schedule.
 # ---------------------------------------------------------------------------
 [post_commands]
-"AI / self-updating CLIs" = "~/Documents/GitHub/updater/migration/update_ai_clis.sh"
+"AI / self-updating CLIs" = "~/Developer/GitHub/updater/migration/update_ai_clis.sh"
 
 # Optional: email digest via existing Agent Mail helper after everything
-# "Email update summary" = "~/Documents/GitHub/updater/scripts/agentmail_send_update_summary.sh"
+# "Email update summary" = "~/Developer/GitHub/updater/scripts/agentmail_send_update_summary.sh"

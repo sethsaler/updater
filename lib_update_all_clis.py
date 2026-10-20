@@ -494,7 +494,10 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
         path = shutil.which(name)
         if not path or not os.path.islink(path):
             return None
-        target = os.path.realpath(path)
+        try:
+            target = os.path.realpath(path)
+        except OSError:
+            return None
         if "node_modules" in target:
             return _origin_from_target_path(target) or "npm"
         return None
@@ -505,7 +508,12 @@ def _infer_origin_from_symlink(name: str, origin: str) -> str | None:
         return None
     if not os.path.islink(path):
         return None
-    target = os.path.realpath(path)
+    # Root-owned 0700 symlinks (e.g. /usr/local/bin/1password-mcp) can't be
+    # read by the user; skip them rather than crash the whole emit.
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return None
     return _origin_from_target_path(target)
 
 
