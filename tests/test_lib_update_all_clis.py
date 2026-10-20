@@ -113,6 +113,19 @@ class TestInferOriginFromSymlink(unittest.TestCase):
     def test_known_pm_origin_untouched(self):
         self.assertIsNone(self.m._infer_origin_from_symlink("anything", "brew"))
 
+    def test_unreadable_symlink_returns_none(self):
+        self._make_symlink_tool("locked", "opt/locked")
+
+        def deny(_path):
+            raise PermissionError(13, "Permission denied")
+
+        orig = self.m.os.path.realpath
+        self.m.os.path.realpath = deny
+        try:
+            self.assertIsNone(self.m._infer_origin_from_symlink("locked", "path"))
+        finally:
+            self.m.os.path.realpath = orig
+
 
 class TestEmitReroutesNpmSymlinkFromUvDir(unittest.TestCase):
     """End-to-end through collect_emit_lines: a cache entry with origin
@@ -2012,6 +2025,20 @@ class TestScanDirEntries(unittest.TestCase):
 
     def test_missing_dir_returns_empty(self):
         self.assertEqual(_scan_dir_entries("/definitely/not/a/real/dir"), [])
+
+    def test_excludes_backups_and_versioned_copies_of_siblings(self):
+        dirpath = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(dirpath, ignore_errors=True))
+        for name in ("grok", "grok-1.0.64", "muse", "muse-bin-1.4.11-R6667.1",
+                     "omp", "omp.1792411245030.82188.0.bak", "tool.old",
+                     "python3.13", "solo-2.1.0"):
+            p = os.path.join(dirpath, name)
+            with open(p, "w") as f:
+                f.write("x")
+            os.chmod(p, 0o755)
+        names = sorted(_scan_dir_entries(dirpath))
+        # A versioned name with no unversioned sibling is a real tool.
+        self.assertEqual(names, ["grok", "muse", "omp", "python3.13", "solo-2.1.0"])
 
 
 class TestIncrementalScanMerge(unittest.TestCase):

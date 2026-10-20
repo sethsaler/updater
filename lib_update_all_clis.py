@@ -2871,22 +2871,53 @@ _SCAN_EXCLUDE_NAMES = frozenset({
 })
 
 
+# Leftovers self-updaters keep beside the live binary: backups
+# ("omp.1792411245030.82188.0.bak", "tool.old", "tool~") and versioned copies
+# ("grok-1.0.64" next to "grok", "muse-bin-1.4.11-R6667.1" next to "muse").
+_BACKUP_SUFFIX_RE = re.compile(r"(?i)(\.(bak|old|orig|backup|prev)(\.\d+)?|~)\Z")
+_VERSIONED_COPY_RE = re.compile(r"(?i)\A(.+?)[-_.]v?\d+(\.\d+)+([-_.+].*)?\Z")
+
+
+def _is_leftover_copy(name: str, siblings: set[str]) -> bool:
+    """True for backup files and versioned copies of a sibling binary.
+
+    A versioned name only counts as a leftover when its base (optionally
+    without a trailing "-bin") is also present, so genuinely versioned tool
+    names like "python3.13" with no unversioned sibling are kept.
+    """
+    if _BACKUP_SUFFIX_RE.search(name) or ".bak." in name.lower():
+        return True
+    m = _VERSIONED_COPY_RE.match(name)
+    if not m:
+        return False
+    base = m.group(1)
+    candidates = {base}
+    for suffix in ("-bin", "_bin"):
+        if base.endswith(suffix):
+            candidates.add(base[: -len(suffix)])
+    return any(c != name and c in siblings for c in candidates)
+
+
 def _scan_dir_entries(dir_path: str) -> list[str]:
     """Names of executable, non-hidden, non-excluded files directly in `dir_path`.
 
     Mirrors update_all_clis.sh's scan_dir(): only regular files (no
     subdirectories/symlinked dirs), executable, not dotfiles, not one of the
-    shared runtime/vcs binaries every manager drags in, not `git-*`.
+    shared runtime/vcs binaries every manager drags in, not `git-*`, and not
+    a self-updater's backup or versioned copy of a sibling binary.
     """
     try:
         entries = os.listdir(dir_path)
     except OSError:
         return []
+    siblings = set(entries)
     names: list[str] = []
     for name in entries:
         if name.startswith("."):
             continue
         if name in _SCAN_EXCLUDE_NAMES or name.startswith("git-"):
+            continue
+        if _is_leftover_copy(name, siblings):
             continue
         full = os.path.join(dir_path, name)
         try:
