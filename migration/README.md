@@ -139,8 +139,8 @@ Self-updaters and tools whose update is not “the package manager”:
 | `atuin` | `atuin update` |
 | `composio` | `composio upgrade` |
 | `devin` | `devin update` |
-| `goose` | `goose update` |
-| `grok` | `grok update` |
+| `goose` | Checks the latest stable version before running the standalone macOS updater and uses GitHub release attestations if the native verifier fails to initialize. |
+| `grok` | Uses `grok update --alpha` for an installed alpha build and `grok update` for a stable build. |
 | `hermes` | `hermes update` |
 | `kimi` | `kimi update` |
 | `mimo` | `mimo upgrade` |

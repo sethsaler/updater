@@ -298,6 +298,14 @@ class TestEmitLines(unittest.TestCase):
         lines = collect_emit_lines(self.cache_path, cfg, None, None)
         bulk = [l for l in lines if self.parts(l)[0] == "bulk" and self.parts(l)[1] == "npm"]
         self.assertEqual(len(bulk), 1)
+    def test_manager_binary_and_its_packages_get_separate_jobs(self):
+        with open(self.cache_path, "w") as cache:
+            json.dump([{"name": "npm", "origin": "brew"},
+                       {"name": "npm", "origin": "npm"}], cache)
+        config = {"known": {}, "bulk": {"brew": "brew upgrade", "npm": "npm update -g"}}
+        jobs = collect_emit_lines(self.cache_path, config, None, None)
+        self.assertEqual([self.parts(job)[1] for job in jobs], ["brew", "npm"])
+
     def test_skip_orphan_go(self):
         lines = collect_emit_lines(self.cache_path, self.cfg, None, None)
         self.assertTrue(any(self.parts(l)[0] == "skip" and self.parts(l)[1] == "orphan" for l in lines))
@@ -740,7 +748,7 @@ class TestRunSummary(unittest.TestCase):
         self.assertIn("a: 1.0 → 1.1", out)
         self.assertIn("New installs added for future runs (1):", out)
         self.assertIn("  mimo", out)
-        self.assertIn("Already up to date (2):", out)
+        self.assertIn("No detected version change (2):", out)
         self.assertIn("b, npm", out)
 
     def test_empty_sections(self):
@@ -748,7 +756,7 @@ class TestRunSummary(unittest.TestCase):
         out = format_run_summary({}, {}, 0, 0)
         self.assertIn("Upgraded (0):", out)
         self.assertIn("New installs added for future runs (0):", out)
-        self.assertIn("Already up to date (0):", out)
+        self.assertIn("No detected version change (0):", out)
 
 
 class TestDiffNewTools(unittest.TestCase):
@@ -790,11 +798,14 @@ class TestCachedVersions(unittest.TestCase):
                 {"name": "tool1", "origin": "npm", "version": "1.2.3"},
                 {"name": "tool2", "origin": "cargo", "version": "9.9", "pm_version": "1.75"},
                 {"name": "noversion", "origin": "npm"},
+                {"name": "unresolved", "origin": "bun", "version": "?", "pm_version": "?"},
                 {"scanned_at": "x", "count": 2},
             ], f)
         known, bulk = _load_cached_versions(cache_path)
         self.assertEqual(known.get("tool1"), "1.2.3")
         self.assertNotIn("noversion", known)
+        self.assertNotIn("unresolved", known)
+        self.assertNotIn("bun", bulk)
         self.assertEqual(bulk.get("cargo"), "1.75")
         # missing / none are no-ops
         self.assertEqual(_load_cached_versions("/nonexistent"), ({}, {}))
@@ -1644,12 +1655,22 @@ class TestScanDirsConfig(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(
             lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        outdated = {}
+        for name in ("pkg-a", "pkg-b"):
+            path = os.path.join(os.path.realpath(d), "lib", "node_modules", name)
+            os.makedirs(path)
+            with open(os.path.join(path, "package.json"), "w") as f:
+                json.dump({"name": name, "version": "1.0.0"}, f)
+            outdated[name] = {"current": "1.0.0", "wanted": "2.0.0", "latest": "2.0.0", "location": path}
+        with open(os.path.join(d, "outdated.json"), "w") as f:
+            json.dump(outdated, f)
         stub = os.path.join(d, "npm")
         with open(stub, "w") as f:
             f.write("#!/usr/bin/env bash\n"
+                    "if [[ \"${1:-}\" == \"prefix\" ]]; then echo \"$HOME\"; exit 0; fi\n"
                     "if [[ \"${1:-}\" == \"outdated\" ]]; then\n"
-                    "  printf '/x/pkg-a:pkg-a@1.0.0\\n/x/pkg-b:pkg-b@2.0.0\\n'\n"
-                    "  exit 0\n"
+                    "  cat \"$HOME/outdated.json\"\n"
+                    "  exit 1\n"
                     "fi\n"
                     "if [[ \"${1:-}\" == \"update\" ]]; then\n"
                     "  for a in \"$@\"; do\n"
@@ -1660,7 +1681,8 @@ class TestScanDirsConfig(unittest.TestCase):
                     "exit 0\n")
         os.chmod(stub, 0o755)
         cfg = load_merge(os.path.join(REPO_ROOT, "tool_config.json"), None)
-        env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
+        env = dict(os.environ, HOME=d, LIB_SCRIPT=os.path.join(REPO_ROOT, "lib_update_all_clis.py"),
+                   PATH=d + os.pathsep + os.environ.get("PATH", ""))
         proc = subprocess.run(["bash", "-c", cfg["bulk"]["npm"]],
                               env=env, capture_output=True, text=True)
         return proc.returncode
@@ -1734,17 +1756,16 @@ class TestRunSummaryModes(unittest.TestCase):
         out = format_run_summary(before, after, 3, 1)
         self.assertIn("Upgraded (1):", out)
         self.assertIn("a: 1.0 → 2.0  [MAJOR UPGRADE]", out)
-        self.assertIn("Already up to date (3):", out)
+        self.assertIn("No detected version change (3):", out)
         self.assertIn("b, c, npm", out)
         self.assertNotIn("Failed (", out)
 
     def test_full_mode_with_failed_names(self):
         before, after = self._snaps()
         out = format_run_summary(before, after, 3, 1, failed=["b"])
-        # Full mode keeps the up-to-date list; the Failed section only
-        # appears in failures mode.
-        self.assertIn("Already up to date (3):", out)
-        self.assertNotIn("Failed (", out)
+        self.assertIn("No detected version change (2):", out)
+        self.assertIn("  c, npm", out)
+        self.assertIn("Failed (1):\n  b", out)
 
     def test_failures_mode(self):
         before, after = self._snaps()
@@ -1756,7 +1777,7 @@ class TestRunSummaryModes(unittest.TestCase):
         # Upgrades (with MAJOR flag) survive; the up-to-date list collapses.
         self.assertIn("Upgraded (1):", out)
         self.assertIn("a: 1.0 → 2.0  [MAJOR UPGRADE]", out)
-        self.assertIn("Already up to date: 3 (list omitted in failures mode)", out)
+        self.assertIn("No detected version change: 2 (list omitted in failures mode)", out)
         self.assertNotIn("b, c, npm", out)
         self.assertIn("Held (pinned in config), skipped this run (1):", out)
         self.assertIn("New installs added for future runs (1):", out)
@@ -1799,16 +1820,16 @@ class TestRunSummaryTable(unittest.TestCase):
         before, after = self._snaps()
         out = format_run_summary_table(before, after, 3, 1, failed=["f"],
                                        color=False)
-        self.assertIn("\u2713 Up to date (3):", out)
-        # f failed this run: it must not also appear under Up to date.
-        up_section = out.split("Up to date")[1]
+        self.assertIn("\u2713 No detected version change (3):", out)
+        # A failed job must appear only in the Failed section.
+        up_section = out.split("No detected version change")[1]
         self.assertRegex(up_section, r"\n\s+b\s")
         self.assertNotRegex(up_section, r"\n\s+f\s")
 
     def test_up_to_date_one_line_each(self):
         before, after = self._snaps()
         out = format_run_summary_table(before, after, 4, 0, color=False)
-        self.assertIn("\u2713 Up to date (4):", out)
+        self.assertIn("\u2713 No detected version change (4):", out)
         self.assertRegex(out, r"\bb\s+1\.0")
         self.assertRegex(out, r"\bnpm\s+10\.0")
 
@@ -1832,7 +1853,7 @@ class TestRunSummaryTable(unittest.TestCase):
         out = format_run_summary_table(before, after, 3, 1, failed=["f"],
                                        mode="failures", color=False)
         self.assertIn("list omitted in failures mode", out)
-        self.assertNotIn("Up to date (", out)
+        self.assertNotIn("No detected version change (", out)
         self.assertLess(out.index("Failed"), out.index("Updated"))
 
     def test_empty_sections_omitted(self):

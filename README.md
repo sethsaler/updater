@@ -14,20 +14,25 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 
 | Origin / Manager | Update command |
 |---|---|
-| npm global packages | `npm update -g <pkg>` per outdated package (private/linked packages can't break the sweep; `MISSING` stale entries skipped) |
+| npm global packages | Checks registry packages in the active npm prefix, `~/.local`, `~/.npm-global`, `~/.npm-packages`, and installed nvm runtimes. Each update targets its owning prefix. |
 | pnpm global packages | `pnpm update -g` |
+| Headlong | Fast-forwards the clean, dedicated Headlong checkout from its configured upstream. Its linked commands share this update. |
+| Entire, Gemini API CLI, Superwhisper CLI | Checks standalone macOS installs against the vendor release. Verifies the archive checksum before replacing a binary. Entire preserves its release channel and updates its bundled Git helper. |
+| Jevgram | Checks the Git source recorded in its dedicated Python environment and updates both launchers together. |
+| Unsloth Studio | Checks releases compatible with Studio’s own Python and runs the vendor updater when Studio and its training workloads are idle. |
+| Standalone Open Interpreter | Uses the native `interpreter update` command for current installs and `interpreter update now` for the legacy layout. One update covers the release and its launchers. |
 | Yarn global packages | `yarn global upgrade` |
-| Homebrew (macOS) | `brew update && brew upgrade` |
-| Ruby Gems | `gem update --user-install` |
-| Cargo (Rust) | `cargo install-update -a` |
+| Homebrew (macOS) | Upgrade installed formulae and versioned casks, including casks with built-in auto-updaters. Running apps can defer a cask upgrade. |
+| Ruby Gems | Install the newest release compatible with the active Ruby and RubyGems for each gem in the user gem directory. |
+| Cargo (Rust) | `cargo install-update --all --git` for registry and Git installs. Install the helper once with `cargo install cargo-update --locked`. |
 | Conda | `conda update --all` |
-| uv (Python) | `uv self update` + `uv tool upgrade <tool>` per tool (one broken tool can't sink the rest) |
+| uv (Python) | Upgrade standalone uv, apply available patch releases to uv-managed CPython, and run `uv tool upgrade <tool>` for each installed tool with an available source. |
 | Go tools | `go install golang.org/x/tools/gopls@latest` |
 | .NET tools | `dotnet tool update --global` |
 | Krew (kubectl plugins) | `kubectl krew upgrade` |
 | Mise (version manager) | `mise self-update` |
 | fnm (Node) | `fnm update` |
-| Bun | vendor installer `curl -fsSL https://bun.com/install \| bash` (upgrades the runtime in place) + `bun update -g` (global packages) |
+| Bun | `bun upgrade` for the vendor-installed runtime and `bun update -g` when the global store contains packages. Package managers upgrade their own copies of Bun. |
 | Deno | `deno upgrade` |
 | pyenv | `pyenv update` |
 | rbenv | `brew upgrade rbenv ruby-build` (no-op if not installed via Homebrew; see below) |
@@ -37,7 +42,7 @@ Ships with [`update_all_clis.sh`](update_all_clis.sh), [`tool_config.json`](tool
 | gcloud (Google Cloud SDK) | `gcloud components update --quiet` |
 | mas (Mac App Store CLI) | `mas upgrade` |
 | tlmgr (TeX Live) | `tlmgr update --self --all` |
-| pip (macOS user installs) | `pip3 install --upgrade pip setuptools wheel` (skipped cleanly on PEP 668 externally-managed interpreters) |
+| pip user installs | Resolve pip-managed registry packages together in each installed user site with its matching interpreter. Direct-source installs keep their versions. Sites without a usable interpreter or with PEP 668 protection are deferred. |
 | asdf (version manager) | `asdf update` |
 | proto (version manager) | `proto update` |
 | Volta (Node) | `volta update` |
@@ -65,12 +70,13 @@ Base `tool_config.json` ships a **residual-shaped** `known` list (~35 entries): 
 | Flora | `go install github.com/florafauna-ai/flora-cli/cmd/flora@latest` |
 | Goimports | `go install golang.org/x/tools/cmd/goimports@latest` |
 | gopls | `go install golang.org/x/tools/gopls@latest` |
-| Goose | `goose update` |
+| Goose | Checks the stable release tag before downloading on standalone macOS installs. Uses `goose update` and, if its Sigstore provider fails to initialize, verifies the exact release workflow and tag with `gh attestation verify` before replacing the binary. |
+| Raft Computer | Checks the saved channel's active release and uses Raft’s unattended upgrade option. Older clients approve the exact target returned by Raft and verify the resulting version. |
 | herdr | `herdr update` |
 | Hermes | `hermes update` |
 | Kimi | `kimi update` |
 | lildax | `npm update -g @opencode-ai/cli --prefix ~/.local` (policy override) |
-| MiMo Code (mimo) | `curl -fsSL https://mimo.xiaomi.com/install \| bash` |
+| MiMo Code (mimo) | Checks the standalone install against the vendor's stable release version, then runs `mimo upgrade` when needed. |
 | Movie Goat PP CLI | `go install …/movie-goat/cmd/movie-goat-pp-cli@latest` |
 | Muse Code | `MUSE_LAUNCHER_INSTALL=1 muse` |
 | ntn | `ntn update` |
@@ -114,13 +120,16 @@ cd updater
 ./install.sh
 ```
 
-Or run directly (download all three files into the same directory):
+Or download the updater and its helpers into the current directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/update_all_clis.sh -o update_all_clis.sh
-curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/tool_config.json -o tool_config.json
-curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/lib_update_all_clis.py -o lib_update_all_clis.py
-curl -fsSL https://raw.githubusercontent.com/sethsaler/updater/main/tui_update_all_clis.py -o tui_update_all_clis.py
+for file in update_all_clis.sh tool_config.json lib_update_all_clis.py tui_update_all_clis.py \
+            scripts/update_packages.sh scripts/update_uv.py scripts/update_npm_globals.py \
+            scripts/update_user_packages.py scripts/update_goose.py scripts/update_raft.py \
+            scripts/update_entire.py scripts/update_jevgram.py scripts/update_unsloth.py \
+            scripts/update_standalone_release.py; do
+  curl -fsSL --create-dirs "https://raw.githubusercontent.com/sethsaler/updater/main/$file" -o "$file" || exit 1
+done
 chmod +x update_all_clis.sh
 ```
 
@@ -227,7 +236,7 @@ The updater includes several performance optimizations:
 - **Outdated pre-checks** — a bulk origin with a configured `check` command (see below) skips its update entirely when the check says nothing's outdated, and a known tool already at the latest version (npm/brew/uv/cargo signals) is skipped the same way
 - **mtime-gated post-run probing** — the post-update version snapshot only re-probes a tool/manager whose binary's mtime actually changed since the pre-run snapshot; everything else reuses the pre-run version string instead of spawning another `--version` call
 - **Incremental discovery scan** — directories are only re-listed when their mtime changed since the last scan (see below); `--rescan` forces a full walk
-- **Fewer `python3` spawns per run** — the per-job and single-instance locks used to each spawn a Python `fcntl.flock` coprocess; both are now a bash-native `mkdir` spin-lock (atomic on POSIX filesystems, no helper process, same stale-lock-steal and Ctrl+C-safe cleanup semantics). `--dry-run` also skips locking entirely now — it never mutates anything, so serializing "would-run" jobs against each other bought nothing but a lock round-trip per job.
+- **Single-instance updates** — a short-lived helper locks a file descriptor held by the shell for the run. The Python executor serializes jobs for the same package manager in-process. Dry-run jobs skip per-manager locks.
 
 Measured on this machine (warmed cache, `--no-scan`, ~96 planned jobs):
 
@@ -520,7 +529,7 @@ Version lines are **best effort**; some tools do not expose a parseable version 
 5. **`--no-scan`** — uses the existing cache when possible (see main script help for edge cases).
 6. **Deduplication** — one bulk command per origin (e.g. one `npm update -g` for all npm globals). Known tools get their own command when listed in merged config.
 7. **Execution** — the Python executor (see [The update executor](#the-update-executor-and-its-live-tui-dashboard)) runs the plan in parallel by default (8 concurrent jobs); **`--parallel=N`** adjusts concurrency. Every update command runs with **stdin redirected to `/dev/null`** (a command that tries to prompt reads EOF instead of waiting forever) and under a **per-job watchdog** (`--job-timeout=N` / `UAC_JOB_TIMEOUT`, default 900s, 0 disables): a job still running past the timeout has its whole process tree killed and is counted as failed — e.g. a `brew upgrade` cask waiting on an open app can't stall the rest of the run. Jobs sharing a manager lock group serialize in-process, so a wedged sibling is bounded by the same watchdog. A real command failure is retried and can trigger a one-shot repair (see [Retries and auto-fix](#retries-and-auto-fix-repair-after-failure)); a timeout is neither retried nor fixed.
-8. **Concurrency safety** — a **single-instance lock** (`mkdir`-based, with stale-lock detection) prevents overlapping runs (e.g. a LaunchAgent run and a manual run) from racing on the cache. **Ctrl+C** cleanly stops in-flight update jobs instead of orphaning `brew`/`npm`/`cargo`, and the shell's `EXIT`/`INT`/`TERM` trap plus the executor's own signal handling remove the lock directory and kill job process trees, so a crash never leaves a stale lock (or a wedged `brew`) behind for long.
+8. **Concurrency safety** — the kernel holds the single-instance lock while the updater scans or updates packages. An overlapping invocation reports that a run is active. The kernel releases the lock when the owner exits, including after a crash. On Ctrl+C the executor stops its update jobs.
 
 ## Adding a new tool (or a new scan directory)
 
@@ -532,7 +541,7 @@ Edit [`tool_config.json`](tool_config.json) or your **`config.local.json`**:
 
 `lib_update_all_clis.py` validates every section (`known`/`bulk` command strings, `scan_dirs` row shapes) and the JSON schema covers them too.
 
-**Vendor install scripts work too.** `known`/`bulk` commands are executed via `bash -c`, so any vendor installer is a valid update command — e.g. `"bun": "curl -fsSL https://bun.com/install | bash"` re-runs Bun's official installer, which upgrades an existing installation in place. This covers tools that ship no self-update subcommand. Do **not** append `|| true` to mask real failures — the executor retries, may run a one-shot fix, and records failed jobs in the run summary and `history.jsonl` while the rest of the run continues. You may redirect noisy stderr with `2>/dev/null` when the exit code still reflects success vs failure. Prefer installers that are non-interactive (all updates run with stdin closed — a prompt reads EOF instead of hanging).
+**Vendor install scripts work too.** `known`/`bulk` commands are executed via `bash -c`, so any vendor installer is a valid update command for tools with vendor-supported unattended installers. This covers tools that ship no self-update subcommand. Do **not** append `|| true` to mask real failures — the executor retries, may run a one-shot fix, and records failed jobs in the run summary and `history.jsonl` while the rest of the run continues. You may redirect noisy stderr with `2>/dev/null` when the exit code still reflects success vs failure. Prefer installers that are non-interactive (all updates run with stdin closed — a prompt reads EOF instead of hanging).
 
 After a discovery scan, run the **suggest** command to see which discovered tools aren't yet covered:
 

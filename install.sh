@@ -27,7 +27,7 @@ install_script() {
   chmod +x "$INSTALL_DIR/update_all_clis.sh"
   if [[ -d "$SCRIPT_DIR/scripts" ]]; then
     mkdir -p "$INSTALL_DIR/scripts"
-    for f in "$SCRIPT_DIR/scripts"/*.sh; do
+    for f in "$SCRIPT_DIR/scripts"/*.sh "$SCRIPT_DIR"/scripts/update_*.py; do
       [[ -f "$f" ]] || continue
       cp "$f" "$INSTALL_DIR/scripts/"
       chmod +x "$INSTALL_DIR/scripts/$(basename "$f")"

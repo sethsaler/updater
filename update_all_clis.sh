@@ -200,13 +200,12 @@ _cleanup() {
   done
   # Catch any background children not tracked in _UAC_PIDS.
   pkill -P $$ 2>/dev/null || true
-  # Remove the lock directory: releases the single-instance run.lockdir and
-  # any per-origin job lockdirs (mkdir-based; see _run_with_mkdir_lock).
-  if [[ -d "$LOCK_DIR" ]]; then
-    rm -rf "$LOCK_DIR" 2>/dev/null || true
-  fi
+  # File locks are released when their owning descriptor closes. Keep the
+  # lock files in place: a concurrent process can already have one open.
 }
-trap _cleanup EXIT INT TERM
+trap _cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # -------------------------------------------------------------------
 # Argument parsing
@@ -412,6 +411,7 @@ full_scan() {
   if [[ -n "$npm_prefix" ]]; then
     _scan_row "$npm_prefix/bin" "npm" "dir"
     _scan_row "$npm_prefix/lib/node_modules/.bin" "npm" "dir"
+    TOOLS_ARRAY+=("npm|npm")
   fi
 
   if [[ -n "$npm_root" ]]; then
@@ -465,6 +465,12 @@ full_scan() {
   local gem_home
   gem_home=$(gem env home 2>/dev/null || true)
   [[ -n "$gem_home" ]] && _scan_row "$gem_home/bin" "gem" "dir"
+  local user_gem_home
+  user_gem_home=$(ruby -rrubygems -e 'print Gem.user_dir' 2>/dev/null || true)
+  if [[ -n "$user_gem_home" && -d "$user_gem_home/specifications" ]] && command -v gem >/dev/null; then
+    _scan_row "$user_gem_home/bin" "gem" "dir"
+    TOOLS_ARRAY+=("gem|gem")
+  fi
 
   # sdkman's layout (candidates/*/current/bin/*) is gated at the top-level
   # "candidates" dir; adding/removing a candidate changes its mtime.
@@ -492,6 +498,14 @@ full_scan() {
       [[ -d "$_pyuser_bin" ]] && _scan_row "$_pyuser_bin" "pip" "dir"
     done
   fi
+  # Library-only user installs have no bin entry for directory discovery.
+  local user_site
+  for user_site in "$HOME"/Library/Python/3.*/lib/python/site-packages "$HOME"/.local/lib/python3.*/site-packages; do
+    if [[ -d "$user_site" ]]; then
+      TOOLS_ARRAY+=("pip|pip")
+      break
+    fi
+  done
 
   [[ -d "$HOME/.fnm" ]] && TOOLS_ARRAY+=("fnm|fnm")
 
@@ -671,6 +685,9 @@ run_update() {
   local attempt=0
   while :; do
     _run_cmd_once "$cmd"
+    if [[ -z "$QUIET" && "$_RUN_OUTPUT" == *"Deferred "* ]]; then
+      printf '%s\n' "$_RUN_OUTPUT" | sed -n 's/^Deferred /   Deferred /p'
+    fi
     if [[ -n "$_RUN_TIMED_OUT" ]]; then
       warn "$group timed out after ${UAC_JOB_TIMEOUT}s and was killed — it was probably waiting on something (e.g. an open app blocking a cask upgrade, or a prompt). Other updates were not blocked."
       [[ -z "$QUIET" ]] && echo "$_RUN_OUTPUT" | tail -3 | sed 's/^/   /'
@@ -783,43 +800,26 @@ _run_one_emit_line_core() {
   esac
 }
 
-# Acquire a per-origin lock with a bash-native `mkdir` spin-lock (mkdir is
-# atomic on POSIX filesystems, so this needs no `flock` binary and no helper
-# process/python spawn per job — unlike the old fcntl.flock coprocess this
-# replaced). Jobs sharing a lock_group (same package manager) serialize;
-# a lockdir older than the stale cap is assumed abandoned (crashed/killed
-# holder) and stolen rather than waited on forever. On interrupt, the
-# top-level `_cleanup` trap's `rm -rf "$LOCK_DIR"` sweeps up any lockdir left
-# behind mid-critical-section, so no extra bookkeeping is needed here.
-_UAC_LOCK_STALE_SECS=600
-_lockdir_age() {
-  local d="$1" mtime now
-  if [[ "$(uname)" == "Darwin" ]]; then
-    mtime=$(stat -f "%m" "$d" 2>/dev/null)
-  else
-    mtime=$(stat -c "%Y" "$d" 2>/dev/null)
-  fi
-  [[ -z "$mtime" ]] && { echo 0; return; }
-  now=$(date +%s)
-  echo $((now - mtime))
-}
+# Lock the caller's open file description. The short-lived helper exits
+# after acquiring it; bash keeps the descriptor open through the job.
+_lock_fd() {
+  local fd="$1" wait="$2"
+  python3 - "$fd" "$wait" <<'PYLOCK'
+import fcntl
+import sys
+import time
 
-_run_with_mkdir_lock() {
-  local lock_group="$1"; shift
-  local lock_dir="$LOCK_DIR/${lock_group}.lockdir"
-  local _waited=0 _ec=0
-  until mkdir "$lock_dir" 2>/dev/null; do
-    if [[ -d "$lock_dir" ]] && (( $(_lockdir_age "$lock_dir") > _UAC_LOCK_STALE_SECS )); then
-      rmdir "$lock_dir" 2>/dev/null || true
-      continue
-    fi
-    sleep 0.2
-    _waited=$((_waited + 1))
-    (( _waited > 1500 )) && break
-  done
-  _run_one_emit_line_core "$@" || _ec=$?
-  rmdir "$lock_dir" 2>/dev/null || true
-  return $_ec
+fd, wait = map(int, sys.argv[1:])
+deadline = time.monotonic() + wait
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(75)
+        time.sleep(0.2)
+PYLOCK
 }
 
 _run_one_emit_line() {
@@ -842,26 +842,20 @@ _run_one_emit_line() {
   fi
 
   if (( PARALLEL_JOBS >= 2 )) && [[ "$cmd_type" != "skip" ]] && [[ -n "$lock_group" ]]; then
-    mkdir -p "$LOCK_DIR"
-    if command -v flock >/dev/null 2>&1; then
-      # Bounded wait: if a sibling job sharing this lock is wedged, don't
-      # block behind it forever. The bound tracks the per-job watchdog
-      # (which kills a wedged holder anyway) plus slack; when the watchdog
-      # is disabled, fall back to a 1-hour cap. On lock timeout, proceed
-      # without the lock — same behavior as the mkdir fallback's cap.
-      local _lock_wait
-      if (( UAC_JOB_TIMEOUT > 0 )); then
-        _lock_wait=$((UAC_JOB_TIMEOUT + 60))
-      else
-        _lock_wait=3600
-      fi
-      { flock -x -w "$_lock_wait" 200 || warn "lock '$lock_group' busy after ${_lock_wait}s; running $name without it"
-        _run_one_emit_line_core "$cmd_type" "$name" "$cmd" "$fix"
-      } 200>"$LOCK_DIR/${lock_group}.lock"
-    else
-      _run_with_mkdir_lock "$lock_group" "$cmd_type" "$name" "$cmd" "$fix"
-      return $?
+    mkdir -p "$LOCK_DIR/jobs" || return 1
+    local lock_wait=3600
+    if (( UAC_JOB_TIMEOUT > 0 )); then
+      lock_wait=$((UAC_JOB_TIMEOUT + 60))
     fi
+    {
+      if ! _lock_fd 200 "$lock_wait"; then
+        warn "could not acquire lock '$lock_group' for $name"
+        return 1
+      fi
+      # The shell holds the lock through the function. Its children should
+      # never keep the descriptor (e.g. a package that restarts a daemon).
+      _run_one_emit_line_core "$cmd_type" "$name" "$cmd" "$fix" 200>&-
+    } 200>>"$LOCK_DIR/jobs/${lock_group}.lock"
   else
     _run_one_emit_line_core "$cmd_type" "$name" "$cmd" "$fix"
   fi
@@ -1238,6 +1232,23 @@ main() {
     exit $?
   fi
 
+  mkdir -p "$LOCK_DIR" || return 1
+  # Close the run-lock descriptor for child commands. Bash retains its own
+  # copy until the foreground operation returns or this shell terminates.
+  {
+    local lock_status=0
+    _lock_fd 201 0 || lock_status=$?
+    if (( lock_status == 75 )); then
+      echo "another update-all-clis run is in progress; exiting" >&2
+      return 0
+    elif (( lock_status != 0 )); then
+      return "$lock_status"
+    fi
+    _run_with_instance_lock 201>&-
+  } 201>>"$LOCK_DIR/run.lock"
+}
+
+_run_with_instance_lock() {
   if [[ -n "$DOCTOR_MODE" ]]; then
     ensure_cache
     export CONFIG_FILE
@@ -1249,28 +1260,6 @@ main() {
       python3 "$LIB_SCRIPT" doctor "$CACHE_FILE"
     fi
     exit $?
-  fi
-
-  # Single-instance lock for anything that scans/writes the cache or runs
-  # updates (read-only commands above already exited). Avoids overlapping runs
-  # (LaunchAgent + manual, or two terminals) clobbering each other's cache.
-  # A plain `mkdir` is atomic on POSIX filesystems, so this needs no helper
-  # process (the old approach spawned a python fcntl.flock coprocess and kept
-  # it alive for the whole run just to hold one lock). Non-blocking with a
-  # stale-lock steal: a lockdir older than the stale cap means a previous run
-  # crashed without cleaning up, so we reclaim it instead of refusing forever.
-  # Held until cleanup's `rm -rf "$LOCK_DIR"` removes it on exit.
-  mkdir -p "$LOCK_DIR"
-  local _run_lockdir="$LOCK_DIR/run.lockdir"
-  if ! mkdir "$_run_lockdir" 2>/dev/null; then
-    if [[ -d "$_run_lockdir" ]] && (( $(_lockdir_age "$_run_lockdir") > _UAC_LOCK_STALE_SECS )); then
-      rmdir "$_run_lockdir" 2>/dev/null || true
-      mkdir "$_run_lockdir" 2>/dev/null || true
-    fi
-  fi
-  if [[ ! -d "$_run_lockdir" ]]; then
-    warn "another update-all-clis run is in progress; exiting"
-    exit 0
   fi
 
   if [[ -n "$JSON_PLAN" ]]; then
@@ -1330,6 +1319,7 @@ main() {
   local _precheck_file
   _precheck_file=$(mktemp)
   echo "{}" > "$_precheck_file"
+  export UAC_PRECHECK_UPTODATE_FILE="$_precheck_file"
   if [[ -n "$DRY_RUN" ]]; then
     local _precheck_would _precheck_would_known
     _precheck_would=$(python3 "$LIB_SCRIPT" precheck-candidates 2>/dev/null || true)
@@ -1354,7 +1344,6 @@ main() {
     # "✓ x: already up to date (pre-check)" lines print later, when the run
     # loop processes each synthetic "uptodate" emit-line.
   fi
-  export UAC_PRECHECK_UPTODATE_FILE="$_precheck_file"
 
   # Resolve "name:major" holds: a :major-pinned tool blocks only MAJOR
   # upgrades. This stage compares installed vs latest (registry lookups for
@@ -1394,7 +1383,9 @@ main() {
     for _hline in "${lines[@]:-}"; do
       [[ -z "$_hline" ]] && continue
       _parse_emit_line "$_hline"
-      [[ "$EMIT_TYPE" == "held" ]] && printf '%s\n' "$EMIT_NAME"
+      if [[ "$EMIT_TYPE" == "held" ]]; then
+        printf '%s\n' "$EMIT_NAME"
+      fi
     done
   } | python3 "$LIB_SCRIPT" lines-to-json > "$_held_snap" 2>/dev/null || echo "[]" > "$_held_snap"
 
@@ -1455,7 +1446,9 @@ main() {
         _rest="${_rest#*"${_UAC_SEP}"}"
         _rest="${_rest#*"${_UAC_SEP}"}"
         _rec_ec="${_rest%%"${_UAC_SEP}"*}"
-        [[ "$_rec_ec" != "0" && "$_rec_ec" != "3" ]] && printf '%s\n' "$_rname"
+        if [[ "$_rec_ec" != "0" && "$_rec_ec" != "3" ]]; then
+          printf '%s\n' "$_rname"
+        fi
       done
     } | python3 "$LIB_SCRIPT" lines-to-json > "$_failed_snap" 2>/dev/null || echo "[]" > "$_failed_snap"
     # Terminal version-change list (before → after). Same data as the
