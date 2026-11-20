@@ -441,6 +441,10 @@ class PlainRenderer(BaseRenderer):
         self.out.write(text + "\n")
         self.out.flush()
 
+    def line_event(self, job: Job) -> None:
+        if job.last_line.startswith("Deferred "):
+            self._print(f"   {job.last_line}")
+
     def retry_event(self, job: Job, attempt: int, rc: int,
                     retry_delay: float, max_retries: int) -> None:
         # Same wording as the shell's run_update retry warning ({:g} so
@@ -717,38 +721,33 @@ class Executor:
             raise
 
     async def _run_one_inner(self, job: Job) -> None:
-        # Everything — including the instant kinds — goes through the
-        # semaphore. The shell executor forks every plan line in order and
-        # reaps them in order, so at parallel=1 its output and result
-        # records are in exact plan order; routing instant kinds through the
-        # same queue preserves that here. (skip lines still skip the group
-        # lock, mirroring the shell's `cmd_type != "skip"` lock condition.)
-        async with self.sem:
+        # At parallel=1 the semaphore preserves exact plan order. With
+        # multiple workers, a job waiting on its manager must not reserve
+        # a worker slot that an unrelated update could use.
+        lock = (self.group_locks.setdefault(job.lock, asyncio.Lock())
+                if self.parallel > 1 and job.kind != KIND_SKIP else contextlib.nullcontext())
+        async with lock, self.sem:
             if job.kind == KIND_SKIP:
                 self._complete(job, ST_SKIPPED, EC_SKIP)
                 return
-            # Jobs sharing a lock group (same package manager) serialize —
-            # the in-process equivalent of the shell's per-origin lockdirs.
-            lock = self.group_locks.setdefault(job.lock, asyncio.Lock())
-            async with lock:
-                # Instant kinds — no subprocess, same outcomes as the
-                # shell's _run_one_emit_line_core.
-                if job.kind == KIND_HELD:
-                    self._complete(job, ST_HELD, EC_SKIP,
-                                   note="env" if job.cmd == "env" else "config")
-                    return
-                if job.kind == KIND_UPTODATE:
-                    # The cmd field carries the pre-check's duration; history
-                    # wants start = end - int(duration), mirroring the shell.
-                    dur_int = int(_float_or_zero(job.cmd))
-                    job.end = time.time()
-                    job.start = job.end - dur_int
-                    self._complete(job, ST_UPTODATE, 0)
-                    return
-                if job.kind == KIND_KNOWN and job.name in self.skip:
-                    self._complete(job, ST_SKIPPED, EC_SKIP, note="--skip")
-                    return
-                await self._run_cmd(job)
+            # Instant kinds — no subprocess, same outcomes as the
+            # shell's _run_one_emit_line_core.
+            if job.kind == KIND_HELD:
+                self._complete(job, ST_HELD, EC_SKIP,
+                               note="env" if job.cmd == "env" else "config")
+                return
+            if job.kind == KIND_UPTODATE:
+                # The cmd field carries the pre-check's duration; history
+                # wants start = end - int(duration), mirroring the shell.
+                dur_int = int(_float_or_zero(job.cmd))
+                job.end = time.time()
+                job.start = job.end - dur_int
+                self._complete(job, ST_UPTODATE, 0)
+                return
+            if job.kind == KIND_KNOWN and job.name in self.skip:
+                self._complete(job, ST_SKIPPED, EC_SKIP, note="--skip")
+                return
+            await self._run_cmd(job)
 
     async def _run_cmd(self, job: Job) -> None:
         job.status = ST_RUNNING

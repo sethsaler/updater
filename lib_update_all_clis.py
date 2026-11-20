@@ -525,6 +525,9 @@ def _origin_from_target_path(target: str) -> str | None:
     discovered binary in a scanned PATH directory rides the right bulk
     update instead of being reported as unknown.
     """
+    headlong = os.path.join(os.environ.get("HEADLONG_HOME", os.path.expanduser("~/.headlong")), "app")
+    if os.path.dirname(target) in (os.path.join(headlong, "bin"), os.path.join(headlong, "tools")):
+        return "headlong"
     if "/uv/tools/" in target or ".local/share/uv" in target:
         return "uv"
     if "pipx/venvs" in target or ".pipx" in target:
@@ -552,6 +555,85 @@ def _origin_from_target_path(target: str) -> str | None:
     if ".dotnet" in target:
         return "dotnet"
     return None
+
+
+def _effective_origin(tool: dict[str, Any]) -> str:
+    name = tool["name"]
+    origin = tool.get("origin", "?")
+    # ~/.local/bin is shared by uv, npm, independent installers and user
+    # scripts. Its directory alone does not establish uv ownership.
+    if origin == "uv/pip" and tool.get("dir") == os.path.expanduser("~/.local/bin"):
+        path = os.path.join(tool["dir"], name)
+        if name in ("browser-use-terminal", "browser-use", "browser", "but"):
+            home = os.environ.get("BUT_HOME") or os.path.expanduser("~/.browser-use-terminal")
+            binary = os.path.join(home, "packages/standalone/current/bin/browser-use-terminal")
+            if os.access(binary, os.X_OK) and not os.path.islink(path):
+                # Each vendor launcher selects either the browser-use-terminal
+                # binary or its bundled TUI ("but") in this release directory.
+                try:
+                    with open(path, "rb") as f:
+                        script = f.read(16384)
+                    if (b'CURRENT="$BUT_HOME_DIR/packages/standalone/current"\n' in script
+                            and b'BUT_RELEASE_REPO:-browser-use/terminal' in script
+                            and script.rstrip().endswith((b'exec "$CURRENT/bin/but" "$@"',
+                                                          b'exec "$CURRENT/bin/browser-use-terminal" "$@"'))):
+                        return "browser-use-terminal"
+                except OSError:
+                    pass
+        if sys.platform == "darwin" and name in ("entire", "gemini-api", "superwhisper", "unsloth"):
+            if shutil.which(name) == path:
+                if name != "unsloth" and os.path.isfile(path) and not os.path.islink(path):
+                    return name
+                studio = os.environ.get("UNSLOTH_STUDIO_HOME") or os.environ.get("STUDIO_HOME") or "~/.unsloth/studio"
+                prefix = os.path.realpath(os.path.join(os.path.expanduser(studio), "unsloth_studio"))
+                if (name == "unsloth" and os.path.isfile(os.path.join(prefix, ".unsloth-studio-owned"))
+                        and os.path.realpath(path) == os.path.join(prefix, "bin", "unsloth")):
+                    return name
+        if name in ("jevgram", "jevgram-web"):
+            entry = os.path.expanduser(f"~/.local/share/jevgram/.venv/bin/{name}")
+            if os.access(entry, os.X_OK):
+                try:
+                    with open(path, "rb") as f:
+                        script = f.read(4096)
+                    if script.startswith(b"#!") and script.rstrip().endswith(f'\nexec "{entry}" "$@"'.encode()):
+                        return "jevgram"
+                except OSError:
+                    pass
+        if name in ("i", "interpreter", "codex-code-mode-host"):
+            # New standalone releases link their entrypoints into ~/.local/bin.
+            # The i alias can target either bin/interpreter or bin/i.
+            current = os.path.expanduser("~/.openinterpreter/packages/standalone/current")
+            targets = ("interpreter", "i") if name == "i" else (name,)
+            for target in targets:
+                binary = os.path.join(current, "bin", target)
+                try:
+                    if os.access(binary, os.X_OK) and os.path.samefile(path, binary):
+                        return "openinterpreter"
+                except OSError:
+                    pass
+            # Legacy releases install shell launchers for current/interpreter.
+            binary = os.path.join(current, "interpreter")
+            if name in ("i", "interpreter") and os.access(binary, os.X_OK):
+                try:
+                    if os.path.samefile(path, binary):
+                        return "openinterpreter"
+                    launcher = f'#!/bin/sh\nexec "{binary}" "$@"\n'.encode()
+                    with open(path, "rb") as f:
+                        if f.read(len(launcher) + 1) == launcher:
+                            return "openinterpreter"
+                except OSError:
+                    pass
+        if os.path.islink(path):
+            try:
+                target = _origin_from_target_path(os.path.realpath(path))
+            except OSError:
+                target = None
+            if target == "uv":
+                return origin
+            if target:
+                return target
+        return origin if name in ("uv", "uvx") else "path"
+    return _infer_origin_from_symlink(name, origin) or origin
 
 
 def _stdout_signals_uptodate(stdout: str) -> bool:
@@ -846,7 +928,7 @@ def _npm_outdated_map(stdout: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for line in (stdout or "").splitlines():
         line = line.strip()
-        if not line or ":" not in line:
+        if not line or line.startswith("# npm-global-prefixes ") or ":" not in line:
             continue
         fields = line.split(":")
         if len(fields) < 2 or not fields[1]:
@@ -1520,21 +1602,16 @@ def collect_emit_lines(
         name = t["name"]
         origin = t.get("origin", "?")
 
-        # Skip if already processed
-        if name in seen_names:
-            continue
-
         # Handle known tools
         if name in known_names:
-            if origin in skip or not origin_allowed_for_known(origin, name):
-                seen_names.add(name)
+            if name in seen_names or origin in skip or not origin_allowed_for_known(origin, name):
                 continue
             cmd = self_cmd[name]
             if not cmd or not cmd.strip():
                 seen_names.add(name)
                 continue
             seen_names.add(name)
-            write_line("known", name, cmd, origin)
+            write_line("known", name, cmd, _effective_origin(t))
             # NOTE: do NOT seen_bulk.add(origin) here. A known tool has its
             # own specific update command, but other, untracked globals from
             # the same origin (e.g. other npm -g packages) still need the
@@ -1544,9 +1621,7 @@ def collect_emit_lines(
             continue
 
         # Infer origin from symlink if possible
-        inferred = _infer_origin_from_symlink(name, origin)
-        if inferred:
-            origin = inferred
+        origin = _effective_origin(t)
 
         # Handle bulk origins
         if origin in bulk_origins:
@@ -1554,7 +1629,6 @@ def collect_emit_lines(
                 seen_names.add(name)
                 continue
             if not should_emit_bulk(origin):
-                seen_names.add(name)
                 continue
             cmd = bulk_origins[origin]
             if not cmd or not cmd.strip():
@@ -1568,8 +1642,9 @@ def collect_emit_lines(
             continue
 
         # Skip unknown tools
-        seen_names.add(name)
-        lines.append(f"skip{EMIT_SEP}{name}{EMIT_SEP}{EMIT_SEP}")
+        if name not in seen_names:
+            seen_names.add(name)
+            lines.append(f"skip{EMIT_SEP}{name}{EMIT_SEP}{EMIT_SEP}")
 
     # Pinned/held jobs: a known tool name or bulk origin listed in config's
     # "hold" array (persistent) or the one-run HOLD= env (ad hoc) becomes a
@@ -1637,6 +1712,21 @@ def collect_emit_lines(
             else:
                 transformed2.append(line)
         lines = transformed2
+
+    # uv/pip and uv/venv describe discovery locations. They can schedule
+    # the very same uv sweep. Deduplicate runnable jobs after filtering and
+    # holds, preserving separate jobs for local command or repair overrides.
+    uv_commands: set[tuple[str, str]] = set()
+    unique: list[str] = []
+    for line in lines:
+        fields = line.split(EMIT_SEP)
+        if fields[0] == "bulk" and fields[1] in _UV_ORIGINS:
+            key = (fields[2], fields[4])
+            if key in uv_commands:
+                continue
+            uv_commands.add(key)
+        unique.append(line)
+    lines = unique
 
     # Slowest-first scheduling: order by historical mean duration (desc) so
     # the long pole (usually brew) starts first in a parallel run.
@@ -1806,6 +1896,8 @@ def probe_bulk(origin: str) -> str:
         "mise": ("mise", "--version"),
         "pipx": ("pipx", "--version"),
         "grok": ("grok", "--version"),
+        "gemini-api": ("gemini-api", "--version"),
+        "superwhisper": ("superwhisper", "--version"),
         "asdf": ("asdf", "--version"),
         "proto": ("proto", "--version"),
         "volta": ("volta", "--version"),
@@ -1859,10 +1951,10 @@ def _load_cached_versions(cache_path: Optional[str]) -> tuple[dict[str, str], di
         if not isinstance(item, dict):
             continue
         name = item.get("name")
-        if name and item.get("version"):
+        if name and item.get("version") and item["version"] != "?":
             versions[str(name)] = str(item["version"])
         origin = item.get("origin")
-        if origin and item.get("pm_version"):
+        if origin and item.get("pm_version") and item["pm_version"] != "?":
             pm_versions[str(origin)] = str(item["pm_version"])
     return versions, pm_versions
 
@@ -1873,6 +1965,7 @@ def _load_cached_versions(cache_path: Optional[str]) -> tuple[dict[str, str], di
 # "manual", "sdkman") always get re-probed since there's nothing cheap to
 # gate on.
 _BULK_ORIGIN_BINARY = {
+    "gemini-api": "gemini-api", "superwhisper": "superwhisper",
     "brew": "brew", "npm": "npm", "pnpm": "pnpm", "yarn": "yarn",
     "cargo": "cargo", "gem": "gem", "pip": "pip3",
     "uv": "uv", "uv/pip": "uv", "uv/venv": "uv", "fnm": "fnm", "bun": "bun",
@@ -2213,17 +2306,18 @@ def log_unknowns(cache_path: str, cfg: dict[str, Any], unknown_log_path: str) ->
         name = t["name"]
         if name in covered:
             continue
-        origin = t.get("origin", "?")
+        origin = _effective_origin(t)
         if origin in bulk:
             covered.add(name)
-            continue
-        inferred = _infer_origin_from_symlink(name, origin)
-        if inferred and inferred in bulk:
-            covered.add(name)
+
+    # Preserve acknowledgement history, but stop advertising resolved entries.
+    for name in covered:
+        if name in existing_tools and not existing_tools[name].get("acknowledged"):
+            del existing_tools[name]
 
     for t in tools:
         name = t["name"]
-        origin = t.get("origin", "?")
+        origin = _effective_origin(t)
 
         if name in covered:
             continue
@@ -2519,6 +2613,8 @@ def format_run_summary(
     """Run summary text. mode="full" lists everything; mode="failures"
     leads with the failed jobs and collapses the (long) up-to-date name
     list to a count — for scheduled runs where only problems are news."""
+    failed = failed or []
+    failed_names = set(failed)
     upgraded: list[str] = []
     unchanged: list[str] = []
     for section in ("known", "bulk"):
@@ -2526,19 +2622,20 @@ def format_run_summary(
         for name in sorted(names):
             b = before.get(section, {}).get(name, "?")
             a = after.get(section, {}).get(name, "?")
+            if name in failed_names:
+                continue
             if b == a:
                 unchanged.append(name)
             else:
                 marker = "  [MAJOR UPGRADE]" if is_major_upgrade(b, a) else ""
                 upgraded.append(f"  {name}: {b} → {a}{marker}")
 
-    failed = failed or []
     lines_out: list[str] = [
         "update-all-clis",
         f"Steps: {ok} ok, {fail} failed",
     ]
 
-    if mode == "failures":
+    if failed or mode == "failures":
         lines_out.append("")
         lines_out.append(f"Failed ({len(failed)}):")
         lines_out.append("  " + ", ".join(sorted(failed)) if failed else "  (none)")
@@ -2557,9 +2654,9 @@ def format_run_summary(
 
     lines_out.append("")
     if mode == "failures":
-        lines_out.append(f"Already up to date: {len(unchanged)} (list omitted in failures mode)")
+        lines_out.append(f"No detected version change: {len(unchanged)} (list omitted in failures mode)")
     else:
-        lines_out.append(f"Already up to date ({len(unchanged)}):")
+        lines_out.append(f"No detected version change ({len(unchanged)}):")
         lines_out.append("  " + ", ".join(sorted(unchanged)) if unchanged else "  (none)")
 
     lines_out.append("")
@@ -2690,7 +2787,7 @@ def format_run_summary_table(
             section(fail_title, fail_rows)
         if upgraded:
             section(up_title, up_rows)
-        lines_out.append(f"{c['dim']}\u2713 Up to date: {len(unchanged)} "
+        lines_out.append(f"{c['dim']}\u2713 No detected version change: {len(unchanged)} "
                          f"(list omitted in failures mode){c['reset']}")
         lines_out.append("")
     else:
@@ -2702,7 +2799,7 @@ def format_run_summary_table(
             f"  {_clip(n, name_w):<{name_w}}  {c['dim']}{_clip(v, ver_w)}{c['reset']}"
             for n, v in unchanged
         ]
-        section(f"{c['green']}{c['bold']}\u2713 Up to date ({len(unchanged)}):{c['reset']}",
+        section(f"{c['green']}{c['bold']}\u2713 No detected version change ({len(unchanged)}):{c['reset']}",
                 up_to_date_rows or [f"  {c['dim']}(none){c['reset']}"])
 
     if held:

@@ -19,6 +19,8 @@ DRY_RUN=0
 NO_GO=0
 ONLY=""
 SKIP=""
+GOOSE_UPDATE_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/update_goose.py"
+export GOOSE_UPDATE_HELPER
 
 usage() {
   sed -n '2,16p' "$0" | tr -d '#'
@@ -45,8 +47,8 @@ SELF_UPDATERS=(
   "atuin|atuin update"
   "composio|composio upgrade"
   "devin|devin update"
-  "goose|goose update"
-  "grok|grok update"
+  "goose|if test -f \"\$GOOSE_UPDATE_HELPER\"; then python3 \"\$GOOSE_UPDATE_HELPER\"; else goose update; fi"
+  "grok|version=\$(grok --version) && case \"\$version\" in *\"[alpha]\"*) grok update --alpha ;; *) grok update ;; esac"
   "hermes|hermes update"
   "kimi|kimi update"
   "mimo|mimo upgrade"

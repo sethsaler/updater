@@ -435,6 +435,13 @@ class TestExecutorConcurrency(ExecutorTestBase):
         elapsed = time.monotonic() - start
         self.assertLess(elapsed, 1.2, f"3x sleep 0.5 in parallel took {elapsed:.2f}s")
 
+    async def test_waiting_on_manager_leaves_slot_for_another_manager(self):
+        jobs = [parse_emit_line(make_emit_line("known", name, cmd, group)) for name, cmd, group in [
+            ("first", "sleep 0.3", "same"), ("queued", "true", "same"), ("other", "true", "other")]]
+        ex, _ = self.make_executor(jobs, parallel=2)
+        await ex.run()
+        self.assertLess(jobs[2].completed_seq, jobs[0].completed_seq)
+
     async def test_parallel_cap_enforced(self):
         start = time.monotonic()
         jobs = [
